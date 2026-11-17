@@ -21,5 +21,15 @@ int main(int argc, char **argv) {
     while (nup_romfs_dir_next(node, &cur, &nm, &nl, &isdir, &s)) count++;
     printf("Shader/ entries %d (dir %d)\n", count, d);
     printf("nonexistent: %lld\n", (long long)nup_romfs_find(NUP_ROMFS_ROOT "/nope/x", 0, 0));
-    return 0;
+    int bad = 0;   /* each path again with every slash doubled, as the game names its voices (#10): the same node */
+    for (int i = 2; i < argc; i++) {
+        char p[1024], q[2100]; snprintf(p, sizeof p, NUP_ROMFS_ROOT "/%s", argv[i]);
+        size_t o = snprintf(q, sizeof q, NUP_ROMFS_ROOT "/");
+        for (const char *c = argv[i]; *c && o + 2 < sizeof q; c++) { if (*c == '/') q[o++] = '/'; q[o++] = *c; }
+        q[o] = 0;
+        const int64_t a = nup_romfs_find(p, 0, 0), b2 = nup_romfs_find(q, 0, 0);
+        if (a != b2) { printf("DOUBLE SLASH %s: %lld, not %lld\n", q, (long long)b2, (long long)a); bad++; }
+    }
+    printf("double slashes: %d of %d paths differ\n", bad, argc - 2);
+    return bad != 0;
 }

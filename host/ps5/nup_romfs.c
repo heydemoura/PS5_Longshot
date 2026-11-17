@@ -6,7 +6,8 @@
    2.85 GB unpacked). Plain files are read positionally from the package; a packed one is unpacked into memory when it
    is opened and kept while any handle has it open, and the most recent ones (up to 128 MiB) stay after that.
 
-   Paths are matched exactly, as the console's own romfs does (case-sensitive). */
+   Paths are matched exactly, as the console's own romfs does (case-sensitive), except that a run of slashes is one
+   slash, as on any file system: the game asks for its voices as content://Voice/Resource//Stream/<name>.bwav (#10). */
 #define _GNU_SOURCE
 #include "nup_romfs.h"
 
@@ -147,6 +148,16 @@ int64_t nup_romfs_find(const char *path, int *is_dir, uint64_t *size) {
     if (!nup_romfs_path(path)) return -1;
     const char *rel = path + ROOT_LEN;
     while (*rel == '/') rel++;
+    /* "a//b" is "a/b": the names in the table have single slashes, and the voices' paths have a double one (an exact
+       match missed every voice: no dialogue or narration on the console, while the PC's file system found them) */
+    char single[1024];
+    if (strstr(rel, "//") && strlen(rel) < sizeof single) {
+        size_t o = 0;
+        for (const char *p = rel; *p; p++)
+            if (*p != '/' || !o || single[o - 1] != '/') single[o++] = *p;
+        single[o] = 0;
+        rel = single;
+    }
     size_t n = strlen(rel);
     while (n && rel[n - 1] == '/') n--;
     uint32_t node;
