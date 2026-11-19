@@ -372,6 +372,9 @@ bool create_device() {
     optional(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME, dev.pipeline_library);
     bool module_id = false;   // (not a field of dev: vk_state.h is part of the translator's stamp)
     optional(VK_EXT_SHADER_MODULE_IDENTIFIER_EXTENSION_NAME, module_id);
+    bool cs_deriv_khr = false, mixed_fdot = false;
+    optional(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME, cs_deriv_khr);
+    optional(VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME, mixed_fdot);
     if (dev.pipeline_library) optional(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME, dev.graphics_pipeline_library);
     optional(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME, dev.custom_border_color);
     optional(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME, dev.dynamic_state3);
@@ -515,6 +518,10 @@ bool create_device() {
     // program's code: vk_programs.h. Nothing else uses it)
     VkPhysicalDeviceShaderModuleIdentifierFeaturesEXT module_idf{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MODULE_IDENTIFIER_FEATURES_EXT};
     if (module_id) *tail = &module_idf, tail = &module_idf.pNext;
+    VkPhysicalDeviceComputeShaderDerivativesFeaturesKHR cs_deriv{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COMPUTE_SHADER_DERIVATIVES_FEATURES_KHR};
+    if (cs_deriv_khr) *tail = &cs_deriv, tail = &cs_deriv.pNext;
+    VkPhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE mixed_dot_feat{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MIXED_FLOAT_DOT_PRODUCT_FEATURES_VALVE};
+    if (mixed_fdot) *tail = &mixed_dot_feat, tail = &mixed_dot_feat.pNext;
     if (dev.mesh_shader) *tail = &mesh, tail = &mesh.pNext;
     if (dev.null_descriptor) *tail = &robust2, tail = &robust2.pNext;
     if (dev.index_uint8) *tail = &u8, tail = &u8.pNext;

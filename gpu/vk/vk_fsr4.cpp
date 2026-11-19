@@ -1,3 +1,303 @@
+#ifdef __PROSPERO__
+// (longshot PS5 Stage 2) Native Vulkan AMD FSR 4.1.2 (Lite / INT8) static integration via Fsr411::Upscaler.
+// Uses pre-extracted RADV-verified SPIR-V shaders and weights bundled alongside the title under /app0/fsr4/<variant>.
+// No dynamic library loading (no dlopen on PS5) and no background loop unroller needed.
+#include "vk_fsr4.h"
+
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unistd.h>
+#include <vector>
+
+#include "fsr4/fsr411.h"
+#include "vk_gprof.h"
+#include "vk_internal.h"
+#include "vk_temporal.h"
+#include "vk_work.h"   // (last: barriers/commands recorded after this count toward work_epoch)
+
+namespace mkwvk {
+
+namespace {
+
+int env_switch(const char* name) {
+    const char* e = getenv(name);
+    return e && *e ? atoi(e) : -1;
+}
+
+std::atomic<int> g_why{-1};
+
+struct Runtime {
+    std::mutex mu;
+    bool tried = false;
+    bool ok = false;
+    std::string dir;
+    std::string variant;
+    bool mixed_float_dot = false;
+    bool subgroup_size_control = false;
+};
+
+Runtime& rt() {
+    static Runtime& r = *new Runtime;
+    return r;
+}
+
+struct State {
+    std::shared_ptr<Fsr411::Upscaler> upscaler;
+    uint32_t out_w = 0, out_h = 0;
+    bool ultra = false;
+    uint64_t evals = 0;
+    int told_resets = 0;
+};
+
+State& st() {
+    static State& s = *new State;
+    return s;
+}
+
+bool dir_has_assets(const std::string& d) {
+    if (d.empty()) return false;
+    const std::string init = d + "/t1080_m0/initializer.bin";
+    const std::string pp = d + "/t1080_m0/prepass_portable.spv";
+    return access(init.c_str(), R_OK) == 0 && access(pp.c_str(), R_OK) == 0;
+}
+
+std::vector<std::pair<std::string, std::string>> candidate_dirs() {
+    std::vector<std::pair<std::string, std::string>> out;
+    if (const char* e = getenv("RX_VK_FSR_DIR"); e && *e) {
+        out.emplace_back("custom", e);
+    }
+    const char* var = getenv("RX_VK_FSR4_VARIANT");
+    const bool want_int8 = var && (!strcmp(var, "int8") || !strcmp(var, "full") || !strcmp(var, "navi2"));
+    const std::string first_var = want_int8 ? "int8" : "lite";
+    const std::string second_var = want_int8 ? "lite" : "int8";
+    for (const std::string& v : {first_var, second_var}) {
+        out.emplace_back(v, "/app0/fsr4/" + v);
+        out.emplace_back(v, "/data/longshot/PPSA99025/fsr4/" + v);
+        out.emplace_back(v, "/data/eglantineps5/user/fsr4/" + v);
+    }
+    out.emplace_back("direct", "/app0/fsr4");
+    out.emplace_back("direct", "/data/longshot/PPSA99025/fsr4");
+    return out;
+}
+
+bool load() {
+    Runtime& r = rt();
+    std::lock_guard lk(r.mu);
+    if (r.tried) return r.ok;
+    r.tried = true;
+    const auto fail = [](FsrWhy why) {
+        g_why = why;
+        return false;
+    };
+
+    if (env_switch("RX_VK_FSR4") == 0) return fail(FSR_ENV_OFF);
+    if (!dev.device || !dev.physical) return fail(FSR_NO_MODEL);
+
+    for (const auto& [var, d] : candidate_dirs()) {
+        if (dir_has_assets(d)) {
+            r.variant = var;
+            r.dir = d;
+            break;
+        }
+    }
+    if (r.dir.empty()) {
+        logf("vk: AMD FSR 4: no asset set found under /app0/fsr4 or /data/longshot/PPSA99025/fsr4");
+        return fail(FSR_NO_LIBRARY);
+    }
+
+    const bool core_ok = dev.push_descriptor && vkCmdPushDescriptorSetKHR && dev.vk12.shaderInt8 &&
+                         dev.vk12.shaderFloat16 && dev.vk13.shaderIntegerDotProduct &&
+                         dev.vk12.vulkanMemoryModel && dev.vk12.vulkanMemoryModelDeviceScope;
+    if (!core_ok) {
+        logf("vk: AMD FSR 4: GPU lacks required Vulkan 1.3 INT8/FP16/dot-product/push-descriptor features "
+             "(push=%d int8=%d fp16=%d dot=%d mem=%d)",
+             (int)dev.push_descriptor, (int)dev.vk12.shaderInt8, (int)dev.vk12.shaderFloat16,
+             (int)dev.vk13.shaderIntegerDotProduct, (int)dev.vk12.vulkanMemoryModel);
+        return fail(FSR_NO_MODEL);
+    }
+
+    // Check optional extensions on physical device cleanly
+    uint32_t ext_n = 0;
+    vkEnumerateDeviceExtensionProperties(dev.physical, nullptr, &ext_n, nullptr);
+    std::vector<VkExtensionProperties> exts(ext_n);
+    if (ext_n) vkEnumerateDeviceExtensionProperties(dev.physical, nullptr, &ext_n, exts.data());
+    auto has_ext = [&](const char* name) {
+        for (const auto& e : exts)
+            if (!strcmp(e.extensionName, name)) return true;
+        return false;
+    };
+
+    const int portable_env = env_switch("RX_VK_FSR4_PORTABLE");
+    if (portable_env != 1 && has_ext(VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME)) {
+        VkPhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE mfd{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MIXED_FLOAT_DOT_PRODUCT_FEATURES_VALVE};
+        VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &mfd};
+        vkGetPhysicalDeviceFeatures2(dev.physical, &f2);
+        r.mixed_float_dot = (mfd.shaderMixedFloatDotProductFloat16AccFloat32 == VK_TRUE);
+    } else {
+        r.mixed_float_dot = false;
+    }
+
+    VkPhysicalDeviceSubgroupSizeControlProperties sc{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+    VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &sc};
+    vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+    r.subgroup_size_control = dev.vk13.subgroupSizeControl && sc.minSubgroupSize <= 32 &&
+                              sc.maxSubgroupSize >= 64 &&
+                              (sc.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT);
+
+    logf("vk: AMD FSR 4: native Vulkan (%s) ready at %s (mixed_float_dot=%d, subgroup_ctrl=%d)",
+         r.variant.c_str(), r.dir.c_str(), (int)r.mixed_float_dot, (int)r.subgroup_size_control);
+    r.ok = true;
+    g_why = FSR_OK;
+    return true;
+}
+
+void memory_barrier(VkCommandBuffer cmd, VkAccessFlags2 src_access, VkAccessFlags2 dst_access) {
+    VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    mb.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    mb.srcAccessMask = src_access;
+    mb.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    mb.dstAccessMask = dst_access;
+    VkDependencyInfo dep{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    dep.memoryBarrierCount = 1;
+    dep.pMemoryBarriers = &mb;
+    vkCmdPipelineBarrier2(cmd, &dep);
+}
+
+bool start() { return load(); }
+
+void release() {
+    State& s = st();
+    if (!s.upscaler) return;
+    std::shared_ptr<Fsr411::Upscaler> old = std::move(s.upscaler);
+    temporal_later([old] {});   // Release after in-flight frames retire
+    s.upscaler.reset();
+    s.out_w = s.out_h = 0;
+}
+
+int prepare(VkCommandBuffer, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, bool /*native_aa*/,
+            uint32_t* in_w, uint32_t* in_h, const char** why) {
+    if (!load()) {
+        if (why) *why = "FSR 4 unavailable";
+        return -1;
+    }
+    if (!Fsr411::Upscaler::SupportsOutput(ow, oh)) {
+        if (why) *why = "output resolution exceeds 7680x4320";
+        return 0;
+    }
+    State& s = st();
+    const bool ultra = rw > 0 && (float(ow) / float(rw)) >= 2.9f;
+    int made = 1;
+    if (!s.upscaler || s.out_w != ow || s.out_h != oh || s.ultra != ultra) {
+        release();
+        const Runtime& r = rt();
+        s.upscaler = std::make_shared<Fsr411::Upscaler>(dev.physical, dev.device, r.dir,
+                                                        r.mixed_float_dot, r.subgroup_size_control);
+        s.out_w = ow;
+        s.out_h = oh;
+        s.ultra = ultra;
+        made = 2;
+        logf("vk: AMD FSR 4 (%s): initialized context for output %ux%u (%s model)",
+             r.variant.c_str(), ow, oh, ultra ? "Ultra Performance m1" : "Quality/Balanced/Perf m0");
+    }
+    // Match fsr411.cpp mlsr.tex_size / max_render_size == (ow, oh)
+    *in_w = ow;
+    *in_h = oh;
+    return made;
+}
+
+bool evaluate(VkCommandBuffer cmd, const TemporalFrame& f) {
+    State& s = st();
+    if (!s.upscaler || !f.color.view || !f.depth.view || !f.motion.view || !f.output.view) return false;
+
+    Fsr411::Frame fr;
+    fr.cmdbuf = cmd;
+    fr.color = {f.color.image, f.color.view, f.color.width, f.color.height};
+    fr.depth = {f.depth.image, f.depth.view, f.depth.width, f.depth.height};
+    fr.motion = {f.motion.image, f.motion.view, f.motion.width, f.motion.height};
+    fr.output = {f.output.image, f.output.view, f.output.width, f.output.height};
+    fr.render_width = f.render_w;
+    fr.render_height = f.render_h;
+    fr.ultra_performance = s.ultra;
+    fr.jitter[0] = f.jitter[0];
+    fr.jitter[1] = f.jitter[1];
+    fr.motion_scale[0] = 1.0f;
+    fr.motion_scale[1] = 1.0f;
+    fr.pre_exposure = 1.0f;
+    fr.sharpness = 0.0f;   // Sharpness row sharpens later at present
+    fr.sharpen = false;
+    fr.reset = f.reset;
+    fr.auto_exposure = true;
+
+    memory_barrier(cmd, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT);
+    bool ok = false;
+    {
+        GprofSpan timed(cmd, "fsr4 Fsr411::Record");
+        ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);
+        ok = s.upscaler->Record(fr);
+        note_work();
+    }
+    memory_barrier(cmd, VK_ACCESS_2_SHADER_WRITE_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+
+    if (!ok) {
+        logf("vk: AMD FSR 4: Record failed: %s", s.upscaler->Error().c_str());
+        return false;
+    }
+    if (s.evals++ == 0 || (f.reset && s.told_resets < 20)) {
+        s.told_resets++;
+        logf("vk: AMD FSR 4 (%s): %ux%u -> %ux%u, jitter %+.3f %+.3f px, depth %s%s",
+             s.upscaler->Describe().c_str(), f.render_w, f.render_h, f.output.width, f.output.height,
+             f.jitter[0], f.jitter[1], f.depth_reversed ? "reversed" : "linear",
+             f.reset ? " (history reset)" : "");
+    }
+    return true;
+}
+
+uint64_t memory() {
+    State& s = st();
+    return s.upscaler ? s.upscaler->MemoryBytes() : 0;
+}
+
+/// Fsr411 shaders take linear HDR colour with auto exposure (dlss_prep kSquare=1 -> dlss_out kSquare=0)
+bool hdr() { return true; }
+
+const TemporalEngine kEngine{.name = "AMD FSR 4",
+                             .short_name = "FSR",
+                             .start = start,
+                             .prepare = prepare,
+                             .evaluate = evaluate,
+                             .release = release,
+                             .memory = memory,
+                             .hdr = hdr,
+                             .fsr_depth = true,
+                             .retry = false};
+
+}   // namespace
+
+FsrWhy fsr4_why() {
+    if (!fsr4_built()) return FSR_NOT_BUILT;
+    static const bool env_off = env_switch("RX_VK_FSR4") == 0;
+    if (env_off) return FSR_ENV_OFF;
+    const int cached = g_why.load(std::memory_order_relaxed);
+    return cached >= 0 ? (FsrWhy)cached : FSR_OK;
+}
+
+bool fsr4_built() { return true; }
+const TemporalEngine* fsr4_engine() { return &kEngine; }
+void fsr4_probe() {
+    if (fsr4_why() != FSR_OK || g_why.load(std::memory_order_relaxed) >= 0 || !dev.device) return;
+    load();
+}
+void fsr4_close() {}
+bool fsr4_wants_descriptor_buffer() { return false; }
+
+}   // namespace mkwvk
+#else
 // (longshot) AMD FSR 4, one of the temporal upscaler's engines (vk_fsr4.h). The frame chain it draws with is
 // vk_temporal.cpp's, the same as NVIDIA DLSS's: the colour as the game's network samples it, the depth, the motion (the
 // camera's and the skinned draws' own) and the camera jitter. Here are AMD's library, the upscale context and its dispatch.
@@ -1244,3 +1544,4 @@ bool fsr4_wants_descriptor_buffer() { return false; }
 #endif
 
 }  // namespace mkwvk
+#endif
