@@ -225,7 +225,7 @@ def stage(system, a):
     os.makedirs(os.path.join(top, "app"))
     for f in ("app.py", "pipeline.py"):
         shutil.copy2(os.path.join(HERE, f), os.path.join(top, "app", f))
-    shutil.copy2(os.path.join(ROOT, "assets", "longshot.png"), os.path.join(top, "app", "longshot.png"))
+    shutil.copy2(os.path.join(ROOT, "ps5", "sce_sys", "icon0.png"), os.path.join(top, "app", "longshot.png"))
     shutil.copytree(a.kit, os.path.join(top, "kit"))
     native_parts(system, vulkan, a.cache, top, os.path.join(top, "kit"))
     shutil.copy2(os.path.join(ROOT, "LICENSE"), os.path.join(top, "LICENSE"))
@@ -256,7 +256,7 @@ def appimage(top, ver, a):
     with open(os.path.join(appdir, "longshot-ps5-builder.desktop"), "w") as f:
         f.write("[Desktop Entry]\nType=Application\nName=Longshot PS5 Builder\nComment=Builds the PS5 title folder of Longshot from "
                 "your own copy of the game\nExec=longshot-ps5-builder\nIcon=longshot-ps5-builder\nCategories=Game;Utility;\nTerminal=false\n")
-    shutil.copy2(os.path.join(ROOT, "assets", "longshot.png"), os.path.join(appdir, "longshot-ps5-builder.png"))
+    shutil.copy2(os.path.join(ROOT, "ps5", "sce_sys", "icon0.png"), os.path.join(appdir, "longshot-ps5-builder.png"))
     shutil.copy2(os.path.join(appdir, "longshot-ps5-builder.png"), os.path.join(appdir, ".DirIcon"))
     tool = fetch("appimagetool", a.cache)
     os.chmod(tool, 0o755)

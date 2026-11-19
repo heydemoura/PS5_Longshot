@@ -4951,7 +4951,9 @@ void draw_startup(ui::Ctx& c) {
     for (int i = 40; i >= 1; i--) c.d->AddCircleFilled(ImVec2(cx, top + lh * 0.5f + 70 * s), h * 0.021f * i, ui::rgba(46, 33, 18, 4), 128);
     float aspect = 1;
     ImTextureData* logo = ui::logo(&aspect);
-    if (logo) c.d->AddImage(logo->GetTexRef(), ImVec2(cx - lh * aspect * 0.5f, top), ImVec2(cx + lh * aspect * 0.5f, top + lh));
+    if (logo)   // (rounded: the PS5's logo is the console icon, an opaque square; a see-through logo's corners are empty anyway)
+        c.d->AddImageRounded(logo->GetTexRef(), ImVec2(cx - lh * aspect * 0.5f, top), ImVec2(cx + lh * aspect * 0.5f, top + lh),
+                             ImVec2(0, 0), ImVec2(1, 1), IM_COL32_WHITE, lh * 0.18f);
     float y = top + lh + 16 * s;
     ui::spaced(c, c.f.heading, 42 * k, ImVec2(cx, y), ui::rgba(246, 232, 204), "LONGSHOT", 6 * k);
     ui::flourish(c, cx - 190 * k, cx + 190 * k, y + 66 * k, ui::kAccent);

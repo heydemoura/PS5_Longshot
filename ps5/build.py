@@ -232,7 +232,8 @@ def main():
     os.makedirs(os.path.join(OUT, "obj"), exist_ok=True)
     rt64 = rtgen.write(os.path.join(OUT, "rt64"))
     gen_dir = os.path.join(OUT, "gen")
-    logo_rgba.write(os.path.join(gen_dir, "longshot_logo.h"))
+    # (the start-up screen shows the title's console icon, the one on the home screen, not the PC build's logo)
+    logo_rgba.write(os.path.join(gen_dir, "longshot_logo.h"), os.path.join(ROOT, "ps5", "sce_sys", "icon0.png"))
     ui_fonts.write(os.path.join(gen_dir, "ui_fonts.cpp"))
     if a.kit and not os.path.exists(os.path.join(GEN, "a64_suyu.h")):
         # (no lift here: rt64/a64.h, which the runtime includes, includes the lift's two headers. a64_suyu.h is a64-kit's own,

@@ -1,7 +1,7 @@
 <h1 align="center">
   <br>
   <a>
-  <img src="assets/longshot.png" alt="Longshot" width="200">
+  <img src="ps5/sce_sys/icon0.png" alt="Longshot" width="200">
 </a>
 
   <br>
