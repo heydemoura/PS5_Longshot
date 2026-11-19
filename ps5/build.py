@@ -160,6 +160,9 @@ def jobs_for(rt64, gen_dir):
         out.append((os.path.join(imgui, *f.split("/")), os.path.join(OUT, "obj", "vk_imgui_" + os.path.basename(f)[:-4] + ".o"),
                     vfl + imgui_fl, imgui_digest))
     out.append((os.path.join(gen_dir, "ui_fonts.cpp"), os.path.join(OUT, "obj", "vk_ui_fonts.o"), COMMON + ["-O0", "-w"], ""))
+    # (the start-up screen's logo, gen/longshot_logo.h, is in vk_imgui.cpp's key: a new picture compiles it again)
+    logo_h = os.path.join(gen_dir, "longshot_logo.h")
+    logo_digest = hashlib.sha1(open(logo_h, "rb").read()).hexdigest() if os.path.exists(logo_h) else ""
     for s in upstream.vk_sources():
         if os.path.basename(s) == "vk_ngx_msvc_rt.cpp":
             continue
@@ -172,7 +175,8 @@ def jobs_for(rt64, gen_dir):
             (["-DHOOKSHOT_MIHAWKGEN", "-I" + os.path.join(MIHAWKGEN, "framegen", "include")]
              if HAS_MIHAWKGEN and os.path.basename(s) == "vk_framegen.cpp" else [])
         out.append((s, os.path.join(OUT, "obj", "vk_" + rel + ".o"), fl,
-                    lib_digest if lib else vk_digest + (imgui_digest if os.path.basename(s) in ("vk_imgui.cpp", "vk_menu.cpp") else "")))
+                    lib_digest if lib else vk_digest + (imgui_digest if os.path.basename(s) in ("vk_imgui.cpp", "vk_menu.cpp") else "") +
+                    (logo_digest if os.path.basename(s) == "vk_imgui.cpp" else "")))
     # (Lossless Scaling's frame generation from the player's own Lossless.dll: third_party/lsfg, PS5SX2's port as it is, and
     # gpu/vk/lsfg, its three files changed for Longshot, found first: their names are the same)
     for lsfg_dir in (os.path.join(VK, "lsfg"), LSFG):
