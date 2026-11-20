@@ -52,6 +52,7 @@
 
 #include "vk_paths.h"
 #include "vk_internal.h"
+#include "storage_binding.h"   // (longshot: where a storage buffer binding starts)
 #include "flat_map.h"
 #include "vk_jobs.h"
 #include "vk_draw.h"
@@ -795,8 +796,16 @@ namespace {
 uint64_t stage_storage_base(const NvnState& s, const Stage& st, uint32_t binding) {
     if (binding >= st.info.storage_buffers_descriptors.size()) return 0;
     const auto& d = st.info.storage_buffers_descriptors[binding];
-    return stage_cbuf_word(s, st, d.cbuf_index, d.cbuf_offset) |
-           (uint64_t)stage_cbuf_word(s, st, d.cbuf_index, d.cbuf_offset + 4) << 32;
+    const uint64_t address = stage_cbuf_word(s, st, d.cbuf_index, d.cbuf_offset) |
+                             (uint64_t)stage_cbuf_word(s, st, d.cbuf_index, d.cbuf_offset + 4) << 32;
+    // (longshot) Where the binding starts, not the address as given (storage_binding.h): a handle program's offsets are the
+    // translation's, counted from the address rounded down to the binding's alignment, the rest of the address in them.
+    // Read from the address as given, a table whose buffer does not start on that boundary was read that rest too far.
+    // On the PS5 (256 bytes, vk_main.cpp) OoT's lights buffer is at ..000 on one frame and ..040 on the next: the
+    // table of their shadow maps was read 0x40 bytes on every other frame (floats for handles, every shadow map bound
+    // as nothing), and what is lit through it, the water and the window glass, went light and dark frame by frame.
+    // At a PC's 16 or 64 bytes those addresses have no rest and nothing showed
+    return storage_binding_start(address, storage_binding_align());
 }
 uint32_t stage_storage_word(uint64_t base, uint32_t offset) {
     uint32_t v = 0;

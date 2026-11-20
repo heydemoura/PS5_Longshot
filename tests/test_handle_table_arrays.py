@@ -53,6 +53,7 @@ def main():
     texture_pass = (root / 'gpu/vk/eden/shader_recompiler/ir_opt/texture_pass.cpp').read_text(encoding='utf-8')
     shader = (root / 'gpu/vk/vk_shader.cpp').read_text(encoding='utf-8')
     draw = (root / 'gpu/vk/vk_draw.cpp').read_text(encoding='utf-8')
+    binding_h = (root / 'gpu/vk/storage_binding.h').read_text(encoding='utf-8')
 
     extracted = '\n'.join([
         'namespace Shader {',
@@ -63,6 +64,7 @@ def main():
         block(texture_pass, 'size_t HandleOperands(HandleOp op)'),
         block(texture_pass, 'void TrimTrailingTees(std::vector<u32>& code)'),
         '}',
+        block(binding_h, 'constexpr uint64_t storage_binding_start('),
         block(shader, 'uint64_t stage_storage_base('),
         block(shader, 'uint32_t stage_storage_word('),
         block(shader, 'uint32_t stage_handle(const NvnState& s, const Stage& st, uint32_t program, uint32_t element)'),
@@ -97,6 +99,8 @@ uint32_t stage_cbuf_word(const NvnState&, const Stage&, uint32_t index, uint32_t
  ++cbuf_reads; return index == 3 && offset / 4 < 64 ? bank[offset / 4] : 0;
 }
 bool env_on(const char*) { return false; }
+uint64_t binding_align = 16;   // (vk_internal.h's storage_binding_align: the device's, 256 on the console)
+uint64_t storage_binding_align() { return binding_align; }
 void ub_read(uint64_t addr, void* out, size_t n) {
  ++memory_reads; uint32_t v = addr >= 0x10000 && addr < 0x10000 + 4096 ? memory[(addr - 0x10000) / 4] : 0; std::memcpy(out, &v, n);
 }
@@ -149,6 +153,23 @@ int main() {
  u32 none[4]{1, 1, 1, 1};
  stage_handles(s, st, 9, 4, none);
  eq(none[0] | none[3], 0, "an unknown program gives no handles");
+ // a buffer that does not start on the binding's alignment: the translation counts its offsets from the address rounded
+ // down, the rest of the address in the offset. The table at 0x10040, bound from 0x10000 at 256 bytes: entry k's handle
+ // at 0x40 + 96k + 4 of the binding
+ binding_align = 256;
+ bank[4] = 0x10040;
+ for (u32 k = 0; k < 8; k++) memory[(96 * k + 4) / 4] = 0xdead;
+ for (u32 k = 0; k < 8; k++) memory[(0x40 + 96 * k + 4) / 4] = 0x200 + k;
+ st.info.handle_programs = {{u32(Op::Index), u32(Op::Immediate), 96, u32(Op::Mul), u32(Op::Immediate), 0x44, u32(Op::Add),
+                             u32(Op::Storage), 0}};
+ stage_handles(s, st, 0, 8, out);
+ for (u32 k = 0; k < 8; k++) eq(out[k], 0x200 + k, "a table off the binding's alignment, entry k");
+ // at 16 bytes that address is on the boundary: the offsets are from the address itself
+ binding_align = 16;
+ st.info.handle_programs = {{u32(Op::Index), u32(Op::Immediate), 96, u32(Op::Mul), u32(Op::Immediate), 4, u32(Op::Add),
+                             u32(Op::Storage), 0}};
+ stage_handles(s, st, 0, 8, out);
+ for (u32 k = 0; k < 8; k++) eq(out[k], 0x200 + k, "the same table at 16 bytes, entry k");
  if (!failures) std::cout << "handle table checks passed\n";
  return failures ? 1 : 0;
 }
