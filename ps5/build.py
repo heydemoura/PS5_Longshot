@@ -211,7 +211,8 @@ def compile_one(job):
     r = subprocess.run(cc_wrapper(cxx) + flags + ["-c", src, "-o", obj], capture_output=True, text=True,
                        env=dict(os.environ, PS5_PAYLOAD_SDK=SDK, PS5_CLANG=os.environ.get("PS5_CLANG") or shutil.which("clang")))
     if r.returncode:
-        return src, (r.stdout + r.stderr)[-4000:], time.time() - t
+        # (a compiler the system killed, for want of memory, says nothing: without the exit code the empty text read as success)
+        return src, (r.stdout + r.stderr)[-4000:] or "the compiler ended with %d and no message" % r.returncode, time.time() - t
     with open(stamp, "w") as f:
         f.write(key)
     return src, None, time.time() - t
