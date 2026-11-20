@@ -48,6 +48,8 @@ static int logged;
 void logf(const char *, ...) { ++logged; }
 static int faults_noted;
 void note_driver_fault() { ++faults_noted; }   /* (vk_draw.cpp: the preparation's watchdog counts them) */
+struct PipelineKeyLog { explicit PipelineKeyLog(VkPipeline *) {} };   /* (vk_draw.cpp's logs the pipeline's program only with
+                                                                          LONGSHOT_RADV_SHADER_LOG=1: nothing here) */
 static void fault_now() { *(volatile int *)0x40 = 1; }
 VkResult vkCreateComputePipelines(uintptr_t device, VkPipelineCache cache, unsigned count,
                                   const VkComputePipelineCreateInfo *ci, const void *allocator, VkPipeline *out) {

@@ -18,7 +18,7 @@ def main():
     p.add_argument("--cxx", default="g++")
     a = p.parse_args()
     source = (ROOT / "gpu" / "vk" / "vk_draw.cpp").read_text(encoding="utf-8")
-    draw = block(source, "void draw(")
+    draw = block(source, "#else\nvoid draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {")   # (the PC's draw(): on the PS5 one wraps draw_body, the same body, in a std::bad_alloc catch)
     streams = draw.index("for (uint32_t b = 0; b < 16; b++)")
     if draw.index("vertex_set_same(") > streams:
         raise SystemExit("vertex streams are looked up before checking the set already bound")

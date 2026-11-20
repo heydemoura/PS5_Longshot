@@ -315,7 +315,25 @@ static const char *log_level_tag(int level) {
     }
 }
 
+/* (longshot) HOS_QUIET_STATS=1: the host's periodic statistics and per-call traces in play left out before they are formatted
+   (the virtual cores' counts, the NVN events' calls, the recordings' counts, present intervals, vibration counts): with the
+   renderer's (RX_VK_QUIET_STATS) most of the PS5's 33000 lines in 45 minutes. Warnings and errors always written */
+static int log_left_out(int level, const char *fmt) {
+    static int quiet = -1;
+    if (quiet < 0) {
+        const char *e = getenv("HOS_QUIET_STATS");
+        quiet = e && atoi(e) != 0;
+    }
+    if (!quiet || level <= HOS_LOG_WARN || !fmt) return 0;
+    static const char *const periodic[] = {"vcores: %lld takes", "nvn: CommandBufferWaitEvent #", "nvn: CommandBufferSignalEvent #",
+                                           "nvn: %llu recordings made", "vi: present intervals", "hid: %lld vibration values"};
+    for (size_t i = 0; i < sizeof periodic / sizeof periodic[0]; i++)
+        if (!strncmp(fmt, periodic[i], strlen(periodic[i]))) return 1;
+    return 0;
+}
+
 static void hos_vlog(int level, const char *fmt, va_list ap) {
+    if (log_left_out(level, fmt)) return;
     char buf[1024], line[1100];
     vsnprintf(buf, sizeof buf, fmt, ap);
     if (!strncmp(buf, HOS_REPORT_DEVICE_LOST_PREFIX, sizeof HOS_REPORT_DEVICE_LOST_PREFIX - 1))

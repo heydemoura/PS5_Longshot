@@ -69,7 +69,9 @@
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 #ifdef __PROSPERO__
-extern "C" uint64_t hos_ps5_direct_room(void);   // (host/ps5/win32_ps5.c: the title's free direct memory in all)
+extern "C" uint64_t hos_ps5_direct_room(void);
+extern "C" void hos_ps5_klog_now(const char* fmt, ...);
+extern thread_local uint32_t ps5_new_wait_ms;   // (vk_main.cpp ps5_new_waits)   // (host/ps5/win32_ps5.c: the title's free direct memory in all)
 #endif
 
 namespace mkwvk {
@@ -735,7 +737,12 @@ VkPipelineLayout bc_layout = VK_NULL_HANDLE;
 VkPipeline bc_pipe = VK_NULL_HANDLE;
 VkPipeline bc7_pipe = VK_NULL_HANDLE;
 bool bc7_ok = true;   // (false once BC7 is unsupported or its pipeline could not be made: BC3 from then on)
+#ifdef __PROSPERO__
+// (PS5) one layer: uploads encode one layer a run (RX_VK_BC_LAYERS, 1), so the other seven held ~140 MB for nothing
+constexpr uint32_t kBcDim = 2048, kBcLayers = 1;   // the scratch: the largest level a BC texture may have
+#else
 constexpr uint32_t kBcDim = 2048, kBcLayers = 8;   // the scratch: the largest level a BC texture may have
+#endif
 /// (longshot) RX_VK_ASTC_BC7=1: big ASTC textures as BC7 instead of BC3. Both are 8 bits a texel; BC7's mode 6 keeps
 /// the colours' gradients and alpha much better (the encoder is host_shaders/bc7_encoder.comp).
 bool bc7_enabled() {
@@ -1548,7 +1555,31 @@ bool upload_inner(Texture& tex, const Ranges* dirty);
 bool upload(Texture& tex, const Ranges* dirty) {
     const auto t0 = std::chrono::steady_clock::now();
     up_route = UP_CPU;
+#ifdef __PROSPERO__
+    // (PS5) An upload that finds no memory leaves the texture as it is and tries again 30 frames on. The title ended with a
+    // std::bad_alloc nothing caught (2026-11-18, 9 min in, 120 MiB free in 323 pieces, the largest 4 MiB): a texture's
+    // storage copied as submitted (memory_as_submitted) on the presentation thread. Its wait for memory is 1 s, not
+    // operator new's 10, so a frame is not held long; the texture cache frees memory meanwhile
+    bool ok = false;
+    {
+        struct Wait {
+            uint32_t was = ps5_new_wait_ms;
+            Wait() { ps5_new_wait_ms = 1000; }
+            ~Wait() { ps5_new_wait_ms = was; }
+        } wait;
+        try {
+            ok = upload_inner(tex, dirty);
+        } catch (const std::bad_alloc&) {
+            tex.mem_retry_frame = frame_no + 30;
+            static std::atomic<int> told{0};
+            if (told++ < 40)   // (straight to the kernel log: nothing that allocates)
+                hos_ps5_klog_now("[ps5] texture upload: no memory: %ux%u x%u NVN %#x (%llu KB) left for 30 frames",
+                                 tex.width, tex.height, tex.layers, tex.nvn_format, (unsigned long long)(tex.guest_size >> 10));
+        }
+    }
+#else
     const bool ok = upload_inner(tex, dirty);
+#endif
     const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
     frame_upload_ns.fetch_add(ns, std::memory_order_relaxed);
     std::lock_guard lk(up_mu);
@@ -2809,6 +2840,7 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
     // (longshot) a BC3 image whose last upload failed waits before the next try: its upload stages the whole ASTC source (some
     // 200 MB for a terrain array), not to be repeated every submission while the memory it needs is not there
     if (tex->bc && !tex->uploaded && tex->bc_retry_frame > frame_no) return tex;
+    if (tex->mem_retry_frame > frame_no) return tex;   // (PS5: its last upload found no memory, upload)
     const auto up0 = std::chrono::steady_clock::now();
     const bool up_ok = upload(*tex, partial || sparse_written ? &dirty : nullptr);
     {   // (an upload over 15 ms: what it was, 60 of them)
@@ -2842,14 +2874,18 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
                 uint64_t part = 0, nz = 0, readable = 0;
                 for (const auto& r : dirty) part += r.second - r.first;
                 if (partial) {   // (what the CPU wrote: how much of it is not zero, and in which levels)
-                    std::vector<uint8_t> b;
+                    // (in 4 KB pieces: a copy of the whole range, a log line's, threw std::bad_alloc on the PS5 and ended
+                    // the title, 2026-11-18 13:43)
+                    uint8_t b[4096];
                     char lv[96] = "";
                     int lvn = 0;
                     for (const auto& r : dirty) {
-                        b.resize((size_t)(r.second - r.first));
-                        if (!host->gpu_read(tex->gpu + r.first, b.data(), b.size())) continue;
-                        readable += b.size();
-                        for (uint8_t c : b) nz += c != 0;
+                        for (uint64_t at = r.first; at < r.second; at += sizeof b) {
+                            const size_t n = (size_t)std::min<uint64_t>(sizeof b, r.second - at);
+                            if (!host->gpu_read(tex->gpu + at, b, n)) continue;
+                            readable += n;
+                            for (size_t k = 0; k < n; k++) nz += b[k] != 0;
+                        }
                         for (uint32_t l = 0; l < tex->levels && lvn < 90; l++) {
                             const uint64_t lo = host->tex_level_offset(&tex->d, l);
                             const uint64_t hi = l + 1 < tex->levels ? host->tex_level_offset(&tex->d, l + 1) : tex->guest_size;
@@ -2871,6 +2907,8 @@ Texture* texture_touch(Texture* tex, bool for_sampling) {
         tex->upload_gen = gen;
         tex->gpu_written = false;
         tex->released = false;
+    } else if (tex->mem_retry_frame > frame_no) {
+        // (PS5) no memory for it: not marked uploaded, so it is made 30 frames on (upload)
     } else if (tex->bc) {
         // (longshot) a BC3 image holds nothing until its encode has run. Marked uploaded as the others are, its blocks as the
         // memory had them were drawn as coloured noise, and never made again unless the game wrote its memory: the path, the
@@ -4284,7 +4322,21 @@ uint64_t linux_pressure_shortfall(uint64_t* seq) {
     return linux_shortfall_bytes.load(std::memory_order_acquire);
 }
 
+#ifdef __PROSPERO__
+size_t program_drop_compute_modules();   // (vk_progcache.cpp)
+#endif
 void texture_frame(uint64_t completed) {
+#ifdef __PROSPERO__
+    {   // (PS5) compute programs' shader modules let go once their pipeline is built (vk_progcache.cpp)
+        static uint64_t calls = 0, dropped = 0;
+        if (++calls % 600 == 0) {
+            const size_t n = program_drop_compute_modules();
+            dropped += n;
+            if (n) logf("vk: programs: %zu compute shader modules let go (%llu in all; RX_VK_KEEP_MODULES=1 keeps them)", n,
+                        (unsigned long long)dropped);
+        }
+    }
+#endif
     const TraceTimer timed{st_texture_frame_ns};   // (longshot: the frame trace's tex_frame_ms)
     upload_frame_report();
     frame_upload_ns.store(0, std::memory_order_relaxed);
@@ -4681,8 +4733,16 @@ void texture_frame(uint64_t completed) {
     // for a second goes, not only what is over the renderer's own share. Leaving Hyrule Castle Town the town's 1.25 GB of
     // textures waited their turn under a loading screen while the game's next page found no memory
     static std::atomic<uint64_t> ps5_shed_frames{0};
+    static uint64_t ps5_short_at = 0;   // (the last pass that found memory short: the restore below waits 300 presents past it)
+    bool ps5_short = false;
     if (hos_ps5_direct_room() < ps5_tex_reserve()) {
         budget = 0;
+        ps5_short = true, ps5_short_at = frame_no;
+        // (and the render-target pool given back, and the textures' half-empty 32 MB blocks compacted now: at the 2026-11-18
+        // crash the pool could hold 256 MB and the blocks 2065 MB for 1653 MB of images)
+        pool_pressed = true;
+        compact.pressed = true;
+        if (compact.next_check > frame_no + vram_compact::rest(true)) compact.next_check = frame_no + vram_compact::rest(true);
         const uint64_t n = ++ps5_shed_frames;
         if (n == 1 || n % 600 == 0)
             logf("vk: memory short (%llu MB free): textures unused for a second go (%llu frames of it so far)",
@@ -4899,7 +4959,15 @@ void texture_frame(uint64_t completed) {
         logf("vk: finalized textures the GPU drew once, kept for being made again: %zu (%llu KB):%s", finalized_kept_n,
              (unsigned long long)(finalized_kept >> 10), n ? line : "");
     }
+#ifdef __PROSPERO__
+    // (PS5) memory short: a texture unused for 8 presents goes, not 30 (RX_VK_PS5_SHORT_UNUSED); it comes back from guest
+    // memory when drawn again
+    static const uint64_t short_unused =
+        getenv("RX_VK_PS5_SHORT_UNUSED") ? (uint64_t)std::max(1, atoi(getenv("RX_VK_PS5_SHORT_UNUSED"))) : 8;
+    const uint64_t need_unused = sweep ? std::max<uint64_t>(120, min_unused) : ps5_short ? std::min(min_unused, short_unused) : min_unused;
+#else
     const uint64_t need_unused = sweep ? std::max<uint64_t>(120, min_unused) : min_unused;
+#endif
     const uint64_t need_dead = dead_targets ? std::min(need_unused, dead_min_unused) : need_unused;
     static uint64_t n_dead, b_dead, dead_logged_at;
     // (longshot) the textures to go are chosen first and destroyed after; the write-backs among them go to the GPU in a few
@@ -5015,7 +5083,8 @@ void texture_frame(uint64_t completed) {
     // (PS5) the textures made small while memory was short, made again at their own size while more than the reserve and a
     // quarter is free (ps5_tex_reserve): the most recently used first, two every ten presents. Not one the game has finalized
     // (its memory may hold something else by now), one the GPU wrote, or one recorded work may still read
-    if (hos_ps5_direct_room() > ps5_tex_reserve() / 4 * 5) {
+    // (and not until 300 presents with memory never short: made again at once they took it under the reserve again)
+    if (hos_ps5_direct_room() > ps5_tex_reserve() / 4 * 5 && frame_no > ps5_short_at + 300) {
         int n = 0;
         for (auto it = order.rbegin(); it != order.rend() && n < 2; ++it) {
             Texture* tex = it->second;

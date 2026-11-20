@@ -94,8 +94,12 @@ std::map<uint64_t, uint64_t> value_rec;     // submission value (or a recording'
 uint64_t rec_part_next = 0;                 // (the recordings begun so far; replay_mu)
 std::map<uint64_t, uint64_t> part_rec;      // (rec_map_mu)
 std::condition_variable rec_map_cv;         // (a part has been submitted: wait_recorded_part)
-std::unordered_map<uint64_t, uint64_t> q_last;   // queue -> its last submission's value (sync_order_mu)
-std::map<uint64_t, uint64_t> value_queue;   // a submission's value -> its queue (sync_order_mu)
+// (ps5-overlap) q_last and value_queue have a lock of their own, taken inside sync_order_mu by the submit that writes them:
+// sync_order_mu is held for a whole replay (16-20 ms a frame on PS5), and a game thread's nvnQueueFenceSync (fence_q) waited
+// behind it only to read one entry
+std::mutex qmap_mu;
+std::unordered_map<uint64_t, uint64_t> q_last;   // queue -> its last submission's value (qmap_mu)
+std::map<uint64_t, uint64_t> value_queue;   // a submission's value -> its queue (qmap_mu)
 std::atomic<uint64_t> pushed{0};
 std::atomic<uint64_t> q_values{0};   // the fence values handed out (a submit or a present takes one each)
 ::mkwvk::rec::DrainingMutex replay_mu;   // one replay at a time (the game submits from several threads; RX_VK_RECORDER=defer: what
@@ -174,7 +178,15 @@ struct Recording {
 };
 // (24: the event waits cut a frame's command buffers into pieces, each with recordings of its own, and with 16 the
 // replay waited ~1.5 ms a frame for a slot the GPU still had)
-constexpr int kRecordings = 48;   // (test: 24 before; with RX_VK_BATCH the ring came round to held submits once a frame)
+constexpr int kRecordings = 128;   // (the most slots: recordings_n() of them are used)
+/// (ps5-overlap) The recording slots in use, RX_VK_RECORDINGS=<8-128> (default 48; 24 before that: with RX_VK_BATCH the ring
+/// came round to held submits once a frame). A slot reused waits for its last submission (recording_wait): on PS5, ~2,000
+/// draws a frame in parts of ~120, the replay waited 3.6 ms a frame there with 48. A slot's stream and descriptor pools are
+/// made at its first use, so slots never reached cost only their command pools and fence
+int recordings_n() {
+    static const int n = getenv("RX_VK_RECORDINGS") ? std::clamp(atoi(getenv("RX_VK_RECORDINGS")), 8, kRecordings) : 48;
+    return n;
+}
 Recording recordings[kRecordings];
 uint64_t rec_end_pos[kRecordings];   // (RX_VK_RECORDER_OWN: the recorder ring's position after each slot's last end, vk_recorder.h)
 int recording_index = 0;
@@ -806,7 +818,7 @@ void occ_take(NvnState& s, DrawArgs& da, bool dry) {
 Recording& begin_recording(uint64_t value) {
     occ_collect();
     Recording& r = recordings[recording_index];
-    recording_index = (recording_index + 1) % kRecordings;
+    recording_index = (recording_index + 1) % recordings_n();
     if (r.value) {
         PROF(PROF_SLOTWAIT);
         const auto t0 = std::chrono::steady_clock::now();
@@ -842,9 +854,9 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     const bool uploads = texture_uploads_recorded();
     gprof_submitted(r.slot, uploads);
     gpu_time_end(r);
-    vkEndCommandBuffer(r.upload);
-    vkEndCommandBuffer(r.cmd);
-    rec_end_pos[r.slot] = rec::produced();   // (the ends waited for the recorder: it is past this)
+    rec::end_deferred(r.upload);   // (ps5-overlap: RX_VK_RECORDER_END=1, packets; else the waits and the calls, as before)
+    rec::end_deferred(r.cmd);
+    rec_end_pos[r.slot] = rec::produced();   // (the ends are run by the recorder before it gets past this)
     VkSemaphoreSubmitInfo signal{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
     signal.semaphore = timeline;
     signal.value = signal_at ? signal_at : r.value;
@@ -2091,7 +2103,7 @@ void par_worker_main() {
 /// A recording slot for a segment a worker records (its command buffer only: uploads go to the shared one)
 Recording& begin_segment_recording(uint64_t value) {
     Recording& r = recordings[recording_index];
-    recording_index = (recording_index + 1) % kRecordings;
+    recording_index = (recording_index + 1) % recordings_n();
     if (r.value) {
         PROF(PROF_SLOTWAIT);
         recording_wait(r);
@@ -2104,7 +2116,8 @@ Recording& begin_segment_recording(uint64_t value) {
     vkBeginCommandBuffer(r.cmd, &bi);
     r.value = value;
     r.part = 0;   // (a parallel replay's segment: it writes nothing back itself, and its submit is not on the recordings' timeline)
-    memory_recording_part(++rec_part_next);   // (a number of its own all the same: what it reads in place comes after the parts before it)
+    memory_recording_part(++rec_part_next, false);   // (a number of its own all the same: what it reads in place comes after the parts before it;
+                                                     // no recording is mapped to it: its writes in place keep the whole submission's wait)
     return r;
 }
 
@@ -2347,6 +2360,22 @@ const uint8_t* replay_handle(VkCommandBuffer& cmd, const uint8_t* h, bool may_st
         si.commandBufferInfoCount = n;
         si.pCommandBufferInfos = cb;
         std::lock_guard lk(dev.present_mu);
+        // (ps5-overlap) into the held batch, in order after what is held (the recording before the segments among it), as
+        // submit_recording holds a recording's: on amdgpu each vkQueueSubmit2 pays for all imported host memory again, and a
+        // submit a segment took the PS5's queue submit from ~3 to 15.5 ms a frame on 3 threads. Its slot is waited for by its
+        // batch (recording_wait). RX_VK_PARALLEL_BATCH=0: one submit a segment, as before
+        static const bool seg_batch = !getenv("RX_VK_PARALLEL_BATCH") || atoi(getenv("RX_VK_PARALLEL_BATCH")) != 0;
+        if (seg_batch && batch_on()) {
+            if (pend.cbs.empty()) batch_next++, pend_since = std::chrono::steady_clock::now(), pend.reflex = reflex_frame();
+            for (uint32_t i = 0; i < n; i++) pend.cbs.push_back(cb[i]);
+            pend_held.store(true, std::memory_order_release);
+            j->r->batch = batch_next;
+            j->r->submitted = true;
+            static const size_t cap = getenv("RX_VK_BATCH_MAX") ? (size_t)std::max(1, atoi(getenv("RX_VK_BATCH_MAX"))) : 32;
+            if (pend.cbs.size() >= cap) flush_reason = FR_CAP, queue_flush_locked();
+            if (!pend.cbs.empty() && batch_gpu_idle()) flush_reason = FR_OTHER, queue_flush_locked();   // (the GPU idle: at once)
+            continue;
+        }
         queue_flush_locked();
         si.pNext = reflex_submit_id(nullptr);   // (NVIDIA Reflex: the frame being made; after the flush, which tags its own)
         VkSemaphoreSubmitInfo sparse_wait;   // (longshot: after the sparse mirrors' binds, RX_VK_MIRROR_SPARSE)
@@ -3110,9 +3139,12 @@ uint64_t fence();
 /// (longshot) A fence of one queue (nvnQueueFenceSync): the value of that queue's last submission
 uint64_t fence_q(uint64_t queue) {
     if (async_on() || !sync_waits_on() || per_queue_fences_off() || !queue) return fence();
-    std::lock_guard lk(sync_order_mu);
-    auto it = q_last.find(queue);
-    return it != q_last.end() ? it->second : fence();
+    {
+        std::lock_guard lk(qmap_mu);
+        auto it = q_last.find(queue);
+        if (it != q_last.end()) return it->second;
+    }
+    return fence();
 }
 // (longshot, RX_VK_LOG_READBACK_RANGES: gf_note_value) this thread's last wait for the GPU
 thread_local int64_t gf_waited_ns = 0;
@@ -3149,10 +3181,14 @@ int wait(uint64_t f, uint64_t timeout_ns) {
     if (!async_on() && sync_waits_on() && !per_queue_fences_off()) {
         bool mine = false;
         {
-            std::lock_guard lk(sync_order_mu);
-            auto it = value_queue.find(f);
-            if (it != value_queue.end()) {
-                auto q = qruns.find(it->second);
+            std::lock_guard lk(sync_order_mu);   // (qruns' state; value_queue under its own lock inside it)
+            uint64_t queue = 0;
+            {
+                std::lock_guard qk(qmap_mu);
+                if (auto it = value_queue.find(f); it != value_queue.end()) queue = it->second;
+            }
+            if (queue) {
+                auto q = qruns.find(queue);
                 mine = q == qruns.end() || !q->second.blocked() || q->second.oldest() > f;
             }
         }
@@ -3453,7 +3489,7 @@ void invalidate(uint64_t gpu, uint64_t size) {
             // (not unforced: the submitting thread's replay with RX_VK_SYNC_WAITS=0 or RX_VK_PER_QUEUE_FENCES=0, as before)
             const bool behind = async_on();
             const bool unforced = behind || (sync_waits_on() && !per_queue_fences_off());
-            static std::atomic<int64_t> settled{0}, held_back{0}, in_place{0};
+            static std::atomic<int64_t> settled{0}, held_back{0}, in_place{0}, ip_parted{0}, ip_fell_back{0};
             // That is the console's answer for a read the game makes without waiting for the GPU: the latest result that has
             // landed. Where the game does wait first (a fence, nvnSyncWait, nvnQueueFinish), that wait is the exact one and
             // the read after it finds its write-back recorded. RX_VK_READBACK_EXACT (a test, off): 1, every range is read
@@ -3480,8 +3516,9 @@ void invalidate(uint64_t gpu, uint64_t size) {
             // mirror: `whole`) keeps the wait for all of its submission, whose later parts read and write guest memory
             // itself. RX_VK_READBACK_PART=0: the last part always, as before
             static const bool by_part = !getenv("RX_VK_READBACK_PART") || atoi(getenv("RX_VK_READBACK_PART")) != 0;
-            uint64_t part = 0, whole = 0;
-            const uint64_t v = memory_writeback_value(host->gpu_guest(gpu), size, nullptr, &part, &whole);
+            uint64_t part = 0, whole = 0, ip_part = 0;   // (ip_part: ps5-overlap, the part that wrote it in place)
+            const uint64_t v = memory_writeback_value(host->gpu_guest(gpu), size, nullptr, &part, &whole,
+                                                      readback_in_place_part_on() ? &ip_part : nullptr);
             static const bool log_each = env_on("RX_VK_LOG_READBACK_WAITS");
             uint64_t l_part = 0, l_last = 0, l_sent = 0, l_done = 0;   // (the log's: recordings, on their timeline)
             if (log_each && v > completed() && rec_timeline) {
@@ -3500,9 +3537,16 @@ void invalidate(uint64_t gpu, uint64_t size) {
                 // those parts still read. Then the last part, as before)
                 const bool in_place_after = memory_in_place_part() > part;
                 if (by_part && part && in_place_after) held_back++;
-                const bool parted = unforced && by_part && part && whole <= completed() && !in_place_after &&
-                                    wait_recorded_part(part, UINT64_MAX, &ok);
-                if (!parted && !part) in_place++;   // (pages written in place (no mirror: part 0): the whole submission waited for)
+                // (ps5-overlap: pages the GPU wrote in place in a known part: that part, whatever reads guest memory in place
+                // after it. The parts after it read what the game wrote before its submit, as the console's GPU, which runs
+                // behind the CPU too, does: the game keeps what it hands the GPU from its writes by its own fences and
+                // presents (polled here: the present poll is answered early only with the render thread)
+                const uint64_t want = std::max(part, ip_part);
+                const bool parted = unforced && by_part && want && whole <= completed() && !(part && in_place_after) &&
+                                    wait_recorded_part(want, UINT64_MAX, &ok);
+                if (parted && ip_part) ip_parted++;
+                if (!parted && !part && !ip_part) in_place++;   // (pages written in place (no mirror: part 0): the whole submission waited for)
+                if (!parted && ip_part) ip_fell_back++;
                 if (!parted && !(unforced && wait_recorded(v, UINT64_MAX, &ok))) {
                     if (unforced && replay_behind()) wait_queue_empty();   // (not recorded whole: as before)
                     if (behind) readback_fell_back();
@@ -3536,9 +3580,11 @@ void invalidate(uint64_t gpu, uint64_t size) {
                 const int64_t n = waited.exchange(0);
                 logf("vk: readbacks of GPU results: %lld of 3000 waited for their write-back, %.2f ms each; %lld looked at the "
                      "stopped queues first, %lld waited for their submission's last part (guest memory read in place after theirs), "
-                     "%lld waited for their whole submission (their pages written in place, no mirror)",
+                     "%lld waited for their whole submission (their pages written in place, no mirror); %lld waited for the part "
+                     "that wrote them in place, %lld of those for more (part not known in time)",
                      (long long)n, n ? ns.exchange(0) / (double)n / 1e6 : 0.0, (long long)settled.exchange(0),
-                     (long long)held_back.exchange(0), (long long)in_place.exchange(0));
+                     (long long)held_back.exchange(0), (long long)in_place.exchange(0), (long long)ip_parted.exchange(0),
+                     (long long)ip_fell_back.exchange(0));
             }
         }
     }
@@ -3846,6 +3892,12 @@ uint64_t vk_retirement_value() {
 /// it sees goes to device_lost(), and work sent to the queue that makes no progress at all for RX_VK_GPU_HANG_SEC
 /// seconds (default 30) is taken as a hang and goes there too. A window the system stops presenting can hold the queue
 /// that long as well (the present waits for its image): RX_VK_GPU_HANG_SEC=0 logs the stall and lets the game wait.
+#ifdef __PROSPERO__
+}  // namespace mkwvk
+// (set by the PS5 RADV winsys when its queue is made: radv_ps5_dump_stall_now; null with a driver without the patch)
+extern "C" { void (*eden_radv_stall_dump)(void) = nullptr; }
+namespace mkwvk {
+#endif
 void gpu_hang_watch_start() {
     static std::atomic<bool> started{false};
     if (!timeline || started.exchange(true)) return;
@@ -3871,6 +3923,11 @@ void gpu_hang_watch_start() {
             if (still == 10 || still % 30 == 0)
                 logf("vk: the GPU has finished nothing for %d s: the timeline at %llu, %llu sent (RX_VK_GPU_HANG_SEC=%d)",
                      still, (unsigned long long)done, (unsigned long long)sent, limit);
+#ifdef __PROSPERO__
+            // (PS5) the driver's stall dump (RADV winsys, EglantinePS5's patches lead-mesh-01..04): the stuck submission's
+            // packets, draws and waits to klog, once, before the game ends; the console keeps no other record of a GPU hang
+            if (still == 10 && eden_radv_stall_dump) eden_radv_stall_dump();
+#endif
             if (limit && still >= limit) {
                 static char why[256];
                 std::snprintf(why, sizeof why, "the GPU hung: no submission finished in %d s, and the driver never reported the "
@@ -6112,6 +6169,7 @@ void submit_q(const uint64_t* handles, int n, uint64_t queue) {
             const uint64_t value = ++q_values;
             gf_note_value(value);
             if (queue) {
+                std::lock_guard qk(qmap_mu);
                 q_last[queue] = value;
                 value_queue[value] = queue;
                 while (value_queue.size() > 8192) value_queue.erase(value_queue.begin());

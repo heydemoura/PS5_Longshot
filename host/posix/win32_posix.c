@@ -1153,11 +1153,21 @@ HANDLE IO_INNER(CreateFileA)(LPCSTR name, DWORD access, DWORD share, void *attr,
 #endif
     return f;
 }
+#ifdef __PROSPERO__
+void hos_ps5_io_hold(void *addr, size_t size), hos_ps5_io_release(void *addr, size_t size);
+typedef struct { void *addr; size_t size; } IoHold;
+static IoHold io_hold_begin(void *addr, size_t size) {
+    hos_ps5_io_hold(addr, size);
+    return (IoHold){addr, size};
+}
+static void io_hold_end(IoHold *h) { hos_ps5_io_release(h->addr, h->size); }
+#endif
 IO_STATIC BOOL IO_INNER(ReadFile)(HANDLE h, void *buf, DWORD n, DWORD *got, OVERLAPPED *ov) {
     if (got) *got = 0;
-#ifdef __PROSPERO__   /* (a guest buffer the game never touched may be only reserved: the kernel's write into it would fail) */
-    int hos_ps5_commit_now(void *addr, size_t size);
-    hos_ps5_commit_now(buf, n);
+#ifdef __PROSPERO__   /* (a guest buffer the game never touched may be only reserved, or in the swap file, armed or read-only:
+                         the kernel's write into it would fail. Held until the read is done: host/ps5/guest_swap_ps5.inc) */
+    IoHold hold __attribute__((cleanup(io_hold_end))) = io_hold_begin(buf, n);
+    (void)hold;
 #endif
     if (!is(h, H_FILE)) { last_error = ERROR_INVALID_HANDLE; return FALSE; }
     const int fd = ((HFile *)h)->fd;
@@ -1187,9 +1197,9 @@ IO_STATIC BOOL IO_INNER(ReadFile)(HANDLE h, void *buf, DWORD n, DWORD *got, OVER
 }
 IO_STATIC BOOL IO_INNER(WriteFile)(HANDLE h, const void *buf, DWORD n, DWORD *put, OVERLAPPED *ov) {
     if (put) *put = 0;
-#ifdef __PROSPERO__
-    int hos_ps5_commit_now(void *addr, size_t size);
-    hos_ps5_commit_now((void *)buf, n);
+#ifdef __PROSPERO__   /* (as ReadFile's) */
+    IoHold hold __attribute__((cleanup(io_hold_end))) = io_hold_begin((void *)buf, n);
+    (void)hold;
 #endif
     if (!is(h, H_FILE)) { last_error = ERROR_INVALID_HANDLE; return FALSE; }
     const int fd = ((HFile *)h)->fd;
@@ -1536,7 +1546,9 @@ static void on_signal(int sig, siginfo_t *si, void *uctx) {
 #ifdef __PROSPERO__
     /* (a page-not-present fault on a guest unit another thread backed meanwhile: committed now, so the access is retried. Its
        own commit_on_touch would find the unit committed and take the fault for a crash) */
-    int hos_ps5_unit_backed(uintptr_t addr), hos_ps5_stack_fault(uintptr_t addr);
+    int hos_ps5_unit_backed(uintptr_t addr), hos_ps5_stack_fault(uintptr_t addr), hos_ps5_swap_fault(uintptr_t addr, int write);
+    /* (a unit of the swap's: in the file, armed, read-only and clean, on its way out: host/ps5/guest_swap_ps5.inc) */
+    if ((sig == SIGSEGV || sig == SIGBUS) && hos_ps5_swap_fault((uintptr_t)si->si_addr, HOS_FAULT_WRITE(uc))) return;
     if (sig == SIGSEGV && !(uc->uc_mcontext.mc_err & 1) && hos_ps5_unit_backed((uintptr_t)si->si_addr)) return;
     /* (a stack growing into its reserved part: backed now, host/ps5/win32_ps5.c) */
     if (sig == SIGSEGV && !(uc->uc_mcontext.mc_err & 1) && hos_ps5_stack_fault((uintptr_t)si->si_addr)) return;

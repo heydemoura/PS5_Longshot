@@ -12,7 +12,7 @@
 namespace mkwvk {
 namespace {
 
-constexpr int kSlots = 48;                // (vk_replay.cpp's kRecordings)
+constexpr int kSlots = 128;               // (vk_replay.cpp's kRecordings: the most slots)
 constexpr uint32_t kQ = 2048;             // timestamps a command buffer can take in a recording
 VkQueryPool pool = VK_NULL_HANDLE;
 struct Span {

@@ -46,6 +46,7 @@ CODE = r"""
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include "hos_report_prefixes.h"
@@ -63,6 +64,7 @@ static void hos_crash_record_fatal(const uint64_t*, const char* reason) {
     fatal_calls++;
 }
 %(tag)s
+%(host_left_out)s
 %(hos_vlog)s
 void host_line(int level, const char* fmt, ...) {
     va_list ap;
@@ -77,6 +79,7 @@ std::string got;
 struct Host { void (*log)(const char*); };
 const Host the_host{[](const char* line) { got = line; }};
 const Host* host = &the_host;
+%(left_out)s
 %(vlogf)s
 %(logf)s
 %(logf_at)s
@@ -134,8 +137,11 @@ def main():
     hos_h = (ROOT / "host/hos.h").read_text(encoding="utf-8")
     code = CODE % {"hos_enum": statement(hos_h, "enum { HOS_LOG_ERROR"),
                    "tag": block(thread, "static const char *log_level_tag(int level) {"),
+                   # (the lines each log leaves out: HOS_QUIET_STATS, RX_VK_LOG_LEVEL and RX_VK_QUIET_STATS, unset here: none)
+                   "host_left_out": block(thread, "static int log_left_out(int level, const char *fmt) {"),
                    "hos_vlog": block(thread, "static void hos_vlog(int level, const char *fmt, va_list ap) {"),
                    "enum": statement(internal, "enum LogLevel"),
+                   "left_out": block(vk_main, "static bool log_left_out(LogLevel level, const char* fmt) {"),
                    "vlogf": block(vk_main, "static void vlogf("),
                    "logf": block(vk_main, "void logf(const char* fmt, ...) {"),
                    "logf_at": block(vk_main, "void logf_at(LogLevel level, const char* fmt, ...) {")}

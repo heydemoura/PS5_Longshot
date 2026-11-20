@@ -21,7 +21,7 @@ def body(src, signature):
 def main():
     replay = (ROOT / "gpu" / "vk" / "vk_replay.cpp").read_text(encoding="utf-8")
     inv = body(replay, "void invalidate(uint64_t gpu, uint64_t size) {")
-    lookup = "const uint64_t v = memory_writeback_value(host->gpu_guest(gpu), size, nullptr, &part, &whole);"
+    lookup = "const uint64_t v = memory_writeback_value(host->gpu_guest(gpu), size, nullptr, &part, &whole,"
     if lookup not in inv:
         raise SystemExit("invalidate no longer looks up the range's write-back value: update this test")
     before = inv[:inv.index(lookup)]

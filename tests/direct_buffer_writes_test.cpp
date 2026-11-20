@@ -67,7 +67,13 @@ struct Host { const uint8_t* (*gpu_ptr)(uint64_t, uint64_t*); uint64_t (*gpu_gue
 static Host interface{gpu_ptr, gpu_guest};
 static Host* host = &interface;
 
-uint64_t memory_writeback_value(uint64_t guest, uint64_t size, bool* ever, uint64_t* part = nullptr, uint64_t* whole = nullptr);
+// (ps5-overlap: the part being recorded, and RX_VK_READBACK_IN_PLACE_PART, off unless a part_ case)
+static std::atomic<uint64_t> mem_rec_part{5};
+static std::atomic<bool> mem_rec_part_mapped{true};   // (false: a parallel replay's segment)
+static bool in_place_part_switch = false;
+static bool readback_in_place_part_on() { return in_place_part_switch; }
+uint64_t memory_writeback_value(uint64_t guest, uint64_t size, bool* ever, uint64_t* part = nullptr, uint64_t* whole = nullptr,
+                                uint64_t* in_place_part = nullptr);
 #include "direct_write_actual.inc"
 
 static void readback_disabled(bool off) {
@@ -96,7 +102,14 @@ static void page_state(uint64_t guest, uint64_t size, bool expected) {
         // (written in place: no part of its submission is enough for a read of it, the whole submission is waited for)
         uint64_t part = 1, whole = 0;
         require(memory_writeback_value(guest, size, nullptr, &part, &whole) == mem_rec_value && part == 0 && whole == mem_rec_value,
-                "a range written in place must wait for its whole submission");
+                "a range written in place must wait for its whole submission (a reader that does not ask for its part)");
+        // (ps5-overlap: with the switch, a reader that asks gets the part it was written in, inside a recording's part)
+        const bool with_part = in_place_part_switch && mirror_upload && mem_rec_part_mapped.load();
+        uint64_t ip = 9;
+        part = 1, whole = 0;
+        require(memory_writeback_value(guest, size, nullptr, &part, &whole, &ip) == mem_rec_value && part == 0 &&
+                    ip == (with_part ? mem_rec_part.load() : 0) && whole == (with_part ? 0 : mem_rec_value),
+                "a range written in place must carry its part only with the switch, inside a recording's part");
     }
 }
 
@@ -117,6 +130,9 @@ int main(int argc, char** argv) {
         else if (mode == "mirror_on") pool.mstate = Pool::MIRROR_ON;
         else if (mode == "invalid_pool") have_pool = false;
         else if (mode == "invalid_mapping") mapping_valid = false, gpu = virtual_base + 4092;
+        else if (mode == "part_in_place") mirrors = false, in_place_part_switch = true;
+        else if (mode == "part_outside") mirrors = false, in_place_part_switch = true, mirror_upload = false;
+        else if (mode == "part_segment") mirrors = false, in_place_part_switch = true, mem_rec_part_mapped = false;
         else throw std::runtime_error("unknown fixture case");
         if (mode == "virtual_write") gpu = virtual_base + 4092;
         if (mode == "large_write") size = (1u << 20) + 4;

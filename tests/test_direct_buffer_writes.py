@@ -13,7 +13,8 @@ ENV_ON_H = str(Path(__file__).resolve().parents[1] / "gpu" / "vk" / "compat" / "
 ROOT = Path(__file__).resolve().parents[1]
 RUN_ALL_ARGS = ["--cxx", "{cxx}"]
 CASES = ("mirror_off", "upload_off", "refused", "virtual_write", "large_write", "no_recording",
-         "wait_disabled", "readonly", "mirror_pending", "mirror_on", "invalid_pool", "invalid_mapping")
+         "wait_disabled", "readonly", "mirror_pending", "mirror_on", "invalid_pool", "invalid_mapping",
+         "part_in_place", "part_outside", "part_segment")   # (ps5-overlap: RX_VK_READBACK_IN_PLACE_PART on)
 
 
 def block(source, signature, semicolon=False):

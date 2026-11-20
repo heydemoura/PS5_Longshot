@@ -29,6 +29,9 @@
 typedef struct VmaAllocation_T* VmaAllocation;   // (vk_mem_alloc.h's handle)
 
 namespace mkwvk {
+#ifdef __PROSPERO__
+uint64_t ps5_tex_reserve();   // (vk_texture.cpp: free memory kept for the game)
+#endif
 
 extern std::vector<std::string> gpu_device_names;
 extern std::vector<gpu_choice::Card> gpu_device_cards;   // (the same GPUs' models, for the row's saved card: gpu_choice.h)
@@ -280,7 +283,8 @@ void memory_recording_value(uint64_t value, uint64_t completed);
 // (longshot) The recording being made, as vk_replay.cpp numbers them (Recording::part), and the newest of them in which
 // the GPU reads guest memory in place (a pool bound with no mirror, a mirror's dirty pages copied from guest memory, a
 // mirror made): a CPU read of GPU results that returned before such a part let the game write what that part still reads
-void memory_recording_part(uint64_t part);
+/// (mapped: a recording's part, which submit_recording puts on the recordings' timeline; false: a parallel replay's segment)
+void memory_recording_part(uint64_t part, bool mapped = true);
 uint64_t memory_in_place_part();
 /// RX_VK_TEX_CAPTURE (on with the capture; =0 off): the storage of a texture uploaded from guest memory joins the
 /// capture (its pool up to 256 MB, else its 2 MB regions), and what the capture took of it is kept for the uploads
@@ -315,7 +319,11 @@ const uint8_t* memory_as_submitted(uint64_t guest, const uint8_t* live, uint64_t
 void memory_drop_shadow(uint64_t guest, uint64_t size);   // (a write the capture did not take: the copies go)
 /// (EvilBoyce) the newest submission value whose write-back reaches into [guest, guest + size) (0: none ever); *ever set
 /// when any write-back ever did
-uint64_t memory_writeback_value(uint64_t guest, uint64_t size, bool* ever, uint64_t* part = nullptr, uint64_t* whole = nullptr);
+/// (ps5-overlap) *in_place_part, when asked: the newest part that wrote any of them in place (readback_in_place_part_on); not
+/// asked, those pages count in *whole as before
+uint64_t memory_writeback_value(uint64_t guest, uint64_t size, bool* ever, uint64_t* part = nullptr, uint64_t* whole = nullptr,
+                                uint64_t* in_place_part = nullptr);
+bool readback_in_place_part_on();   // (ps5-overlap: GPU writes in place noted with their part: vk_memory.cpp)
 void memory_note_readback(uint64_t guest, uint64_t size);   // (PR 430) a CPU read of GPU results: see memory_rb_refresh
 void memory_note_cpu_read(uint64_t guest, uint64_t size);   // (invalidate) a CPU read: a large binding over it keeps its write-back
 void memory_note_cpu_access(uint64_t guest, uint64_t size, bool write);   // (and a CPU write a mirror sync copies: wb_learn.h)

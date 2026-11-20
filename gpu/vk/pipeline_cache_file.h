@@ -24,6 +24,13 @@
 #include <unistd.h>
 #endif
 
+// (PS5) The cache in memory and written with plain writes: the file mapping, flock and posix_fallocate the other systems'
+// path takes failed on the console's exFAT drive without a word, and the driver's pipeline cache was never kept (0 KB at
+// every start, no play file ever saved: every start compiled every pipeline again, 2026-11-18). The program cache, written
+// with fwrite, was kept all along
+#if defined(__PROSPERO__)
+#define LONGSHOT_CACHE_FILE_BUFFERED 1
+#endif
 namespace mkwvk {
 // File-backed, contiguous Vulkan cache bytes. Published files are replaced, never
 // truncated. Read views retain the opened file/inode across atomic replacement.
@@ -52,7 +59,10 @@ class PipelineCacheFile {
     int file_ = -1;
 #endif
     bool resize(size_t n) {
-#if defined(_WIN32)
+#if defined(LONGSHOT_CACHE_FILE_BUFFERED)
+        (void)n;
+        return true;
+#elif defined(_WIN32)
         LARGE_INTEGER length{}; length.QuadPart = (LONGLONG)n;
         return SetFilePointerEx(file_, length, nullptr, FILE_BEGIN) && SetEndOfFile(file_);
 #else
@@ -60,7 +70,9 @@ class PipelineCacheFile {
 #endif
     }
     bool refresh_modified() {
-#if defined(_WIN32)
+#if defined(LONGSHOT_CACHE_FILE_BUFFERED)
+        return true;
+#elif defined(_WIN32)
         FILETIME now; GetSystemTimeAsFileTime(&now);
         return SetFileTime(file_, nullptr, nullptr, &now) != 0;
 #else
@@ -68,7 +80,7 @@ class PipelineCacheFile {
 #endif
     }
     bool preserve_permissions() {
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(LONGSHOT_CACHE_FILE_BUFFERED)
         struct stat existing{};
         if (lstat(destination_.c_str(), &existing) == 0) {
             // Keep an existing cache's access bits. New files retain mkstemp's
@@ -99,7 +111,10 @@ class PipelineCacheFile {
         return dash != std::string::npos && digits(suffix.substr(0, dash)) && digits(suffix.substr(dash + 1));
     }
     bool map(bool writable) {
-#if defined(_WIN32)
+#if defined(LONGSHOT_CACHE_FILE_BUFFERED)
+        (void)writable;
+        bytes_ = std::malloc(size_ ? size_ : 1);
+#elif defined(_WIN32)
         mapping_ = CreateFileMappingW(file_, nullptr, writable ? PAGE_READWRITE : PAGE_READONLY, 0, 0, nullptr);
         if (mapping_) bytes_ = MapViewOfFile(mapping_, writable ? FILE_MAP_WRITE : FILE_MAP_READ, 0, 0, size_);
 #else
@@ -112,7 +127,10 @@ class PipelineCacheFile {
     bool unmap() {
         bool ok = true;
         if (bytes_) {
-#if defined(_WIN32)
+#if defined(LONGSHOT_CACHE_FILE_BUFFERED)
+            std::free(bytes_);
+            ok = true;
+#elif defined(_WIN32)
             ok = UnmapViewOfFile(bytes_) != 0;
 #else
             ok = munmap(bytes_, size_) == 0;
@@ -152,6 +170,16 @@ class PipelineCacheFile {
                 temporary_ = std::move(candidate); temporary_wide_ = std::move(name); return true;
             }
             if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) return false;
+        }
+        return false;
+#elif defined(LONGSHOT_CACHE_FILE_BUFFERED)
+        if (path.empty() || path.find('\0') != std::string::npos) return false;
+        static std::atomic<unsigned long long> sequence{0};
+        for (int attempt = 0; attempt < 32; ++attempt) {   // (a name temporary_name knows: .tmp-<pid>-<n>)
+            std::string candidate = path + ".tmp-" + std::to_string((long long)getpid()) + "-" + std::to_string(sequence++);
+            file_ = open(candidate.c_str(), O_RDWR | O_CREAT | O_EXCL, 0644);
+            if (file_ >= 0) { temporary_ = std::move(candidate); return true; }
+            if (errno != EEXIST) return false;
         }
         return false;
 #else
@@ -267,7 +295,7 @@ public:
         if (!capacity || capacity > (uint64_t)INT64_MAX || !result.create_temporary(path)) return {};
         result.size_ = capacity;
         if (!result.resize(capacity)) return {};
-#if !defined(_WIN32)
+#if !defined(_WIN32) && !defined(LONGSHOT_CACHE_FILE_BUFFERED)
         // ftruncate can leave sparse holes. Reserve backing storage before the
         // driver writes through mmap, so ENOSPC is a clean failure, not SIGBUS.
         // posix_fallocate returns an error number directly, not -1/errno.
@@ -309,6 +337,14 @@ public:
         if (!valid(header, length)) return rejected_file();
         result.size_ = (size_t)length;
         if (!result.map(false)) return {};
+#if defined(LONGSHOT_CACHE_FILE_BUFFERED)
+        for (size_t done = 0; done < result.size_;) {   // (read whole into memory: map gave a buffer)
+            const ssize_t r = pread(source, (char*)result.bytes_ + done, result.size_ - done, (off_t)done);
+            if (r < 0 && errno == EINTR) continue;
+            if (r <= 0) return {};
+            done += (size_t)r;
+        }
+#endif
 #endif
         return result;
     }
@@ -316,6 +352,13 @@ public:
         if (!bytes_ || temporary_.empty() || !actual || actual > size_) return false;
 #if defined(_WIN32)
         if (!FlushViewOfFile(bytes_, actual)) return false;
+#elif defined(LONGSHOT_CACHE_FILE_BUFFERED)
+        for (size_t done = 0; done < actual;) {   // (the buffer written to the temporary file)
+            const ssize_t r = pwrite(file_, (const char*)bytes_ + done, actual - done, (off_t)done);
+            if (r < 0 && errno == EINTR) continue;
+            if (r <= 0) return false;
+            done += (size_t)r;
+        }
 #else
         if (msync(bytes_, actual, MS_SYNC)) return false;
 #endif

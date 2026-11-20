@@ -18,6 +18,7 @@
 namespace mkwvk {
 
 std::atomic<int> fps_level_now{0};
+std::atomic<bool> fps_log_forced{false};
 int64_t gpu_time_ns();     // (vk_replay.cpp: the GPU's time in the timed recordings so far)
 int64_t slot_wait_ns();    // (and the replay's waits for a recording slot: inside the renderer's entries, on this thread)
 
@@ -76,7 +77,15 @@ FpsRender::~FpsRender() {
 }
 
 void fps_presented() {
-    const int level = fps_level_now.load(std::memory_order_relaxed);
+    // (ps5-overlap, RX_VK_FPS_LOG=<seconds>: the Breakdown measured from the first present on, whatever the counter shows, and
+    // its means logged every that many seconds: where the presenting thread's frame goes, with no screen to read it off)
+    static const int log_s = [] {
+        const char* e = getenv("RX_VK_FPS_LOG");
+        const int s = e ? std::clamp(atoi(e), 0, 600) : 0;
+        if (s) fps_log_forced.store(true, std::memory_order_relaxed);
+        return s;
+    }();
+    const int level = std::max(fps_level_now.load(std::memory_order_relaxed), log_s ? (int)fs::kBreakdown : 0);
     // (the last frame's state, for the next one: on the presenting thread only)
     static int64_t last_at = 0, last_render = 0, last_wait[fs::kParts] = {}, last_slept[2] = {}, last_gpu = 0, last_pipes = 0,
                    last_left = 0, last_slot = 0;
@@ -142,6 +151,26 @@ void fps_presented() {
     last_other[0] = other_wait[0].load(std::memory_order_relaxed), last_other[1] = other_wait[1].load(std::memory_order_relaxed);
     for (int k = 0; k < fs::kRtParts; k++) last_rt[k] = rt_wait[k].load(std::memory_order_relaxed);
     last_slept[0] = slept[0], last_slept[1] = slept[1];
+    if (log_s) {
+        static int64_t last_log = 0;
+        if (!last_log) last_log = now;
+        if (now - last_log >= (int64_t)log_s * fs::kSecond) {
+            last_log = now;
+            fs::Summary s;
+            {
+                std::lock_guard lk(ring_mu);
+                s = fs::summarize(ring, now, (int64_t)log_s * fs::kSecond, fs::kLowWindow);
+            }
+            if (s.frames)
+                logf("vk: frame breakdown over %d s: %d frames, %.1f ms a frame (%.1f fps, 1%% low %.1f): game %.1f, renderer %.1f, "
+                     "GPU waits %.1f, pacing %.1f, fence waits for unrecorded work %.1f, for the GPU %.1f, for the main thread %.1f; "
+                     "GPU %.1f ms; render thread: work %.1f, workers %.1f, GPU %.1f, idle %.1f; %d pipelines made, %d draws left out",
+                     log_s, s.frames, s.avg_ms, s.avg_ms > 0 ? 1000.0 / s.avg_ms : 0.0, s.low_fps, s.part[fs::kGame],
+                     s.part[fs::kRender], s.part[fs::kGpuWait], s.part[fs::kPace], s.part[fs::kWaitRender], s.part[fs::kWaitGpu],
+                     s.part[fs::kWaitMain], s.gpu_ms, s.rt[fs::kRtWork], s.rt[fs::kRtWorkers], s.rt[fs::kRtGpu], s.rt[fs::kRtIdle],
+                     s.pipelines, s.left_out);
+        }
+    }
 }
 
 fs::Summary fps_summary(int64_t now, int64_t window, int64_t low_window) {

@@ -394,7 +394,8 @@ def check_drawn_only():
     assert len(six) == 1 and six[0].group(0) in gp, "pipeline_note() gets colour types from outside graphics_pipeline()"
     users = [m.start() for m in re.finditer(r"(?<![\w:*])graphics_pipeline\(", draw)]
     users = [u for u in users if draw[max(0, u - 12):u] != "PipeEntry* " and not draw[max(0, u - 11):u].endswith("PipeEntry* ")]
-    d = body_of(draw, "void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {")
+    # (the PC's draw(): on the PS5 a draw() wraps draw_body, the same body, in a std::bad_alloc catch, and calls nothing else)
+    d = body_of(draw, "#else\nvoid draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {")
     assert len(users) == 1 and d.count("graphics_pipeline(") == 1, "graphics_pipeline() is reached from outside draw()"
     for fn in ("void precompile_run(", "void state_list_prepare("):
         if fn in draw:

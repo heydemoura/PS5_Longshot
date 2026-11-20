@@ -102,6 +102,7 @@ VKAPI_ATTR void VKAPI_CALL vkCmdBindDescriptorSets(VkCommandBuffer, VkPipelineBi
 std::deque<RecordingRes> res;
 thread_local RecordingRes* cur = nullptr;
 const uint64_t kStream = 1024;
+uint64_t stream_first() { return kStream; }   // (vk_draw.cpp's first stream size, RX_VK_STREAM_MB, as kStream)
 constexpr VkBufferUsageFlags kStreamUse = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
 std::atomic<uint64_t> stream_extra{0}, stream_grown{0}, stream_peak{0}, pools_extra{0};
 bool grow_off = false;

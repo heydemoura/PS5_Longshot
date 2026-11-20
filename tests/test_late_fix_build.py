@@ -132,6 +132,7 @@ std::deque<DeadShadow> dead_shadows;
 std::mutex wb_pages_mu;
 @WBPAGES@;
 WbPages wb_pages, wb_parts, wb_direct;
+constexpr uint64_t kInPlaceTag = 1ull << 63;   // (vk_memory.cpp: a page written in place in a known part)
 @WBNOTE@
 @SECTION@
 @CAPTURE@;
@@ -647,7 +648,7 @@ def main():
                          "command buffer wrote since its last barrier (shadow_sync_copy's shadows) is not ordered before its reads")
     fixture = (FIXTURE
                .replace('@WBPAGES@', block(text, 'struct WbPages {'))
-               .replace('@WBNOTE@', block(text, 'void wb_pages_note(uint64_t guest_lo, uint64_t guest_hi, uint64_t value, uint64_t part) {'))
+               .replace('@WBNOTE@', block(text, 'void wb_pages_note(uint64_t guest_lo, uint64_t guest_hi, uint64_t value, uint64_t part, bool in_place = false) {'))
                .replace('@SECTION@', section(text, "// ---- the late pages' fix (longshot, 2026-11-13) ----", 'bool late_fix_pipe_ready() {'))
                .replace('@CAPTURE@', block(text, 'struct Capture {'))
                .replace('@BUILD@', block(text, 'bool late_fix_build(Capture& c) {'))

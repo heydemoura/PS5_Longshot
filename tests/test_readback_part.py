@@ -65,6 +65,9 @@ FIXTURE = r"""
 #include "readback_late.h"
 constexpr uint64_t kPageShift = 12, kChunkPages = 16, kPages = 64;
 static bool env_on(const char*) { return false; }   // (no switch set)
+// (as vk_internal.h declares it, with its defaults: the definition cut below has none)
+uint64_t memory_writeback_value(uint64_t guest, uint64_t size, bool* ever, uint64_t* part = nullptr, uint64_t* whole = nullptr,
+                                uint64_t* in_place_part = nullptr);
 namespace {
 /* PAGES */
 static int failures;
@@ -104,6 +107,8 @@ static uint64_t in_place_part;   // (the newest part that reads guest memory in 
 static uint64_t memory_in_place_part() { return in_place_part; }
 static int held_back;
 static int in_place;   // (the waits for a whole submission whose pages were written in place, part 0)
+static int ip_parted, ip_fell_back;   // (ps5-overlap: waits for the part that wrote in place; those that could not)
+static bool ip_on;                    // (readback_in_place_part_on: off, as on a PC, until its checks)
 static uint64_t fence_handed;             // (the newest value handed out, as fence() when the readback begins)
 static readback_late::Rules late_rules;   // (RX_VK_READBACK_LATE: none set, until the checks of it)
 static bool readback_late_wanted(uint64_t size, bool newest) { return readback_late::wanted(late_rules, size, newest); }
@@ -111,8 +116,8 @@ static bool readback_late_wanted(uint64_t size, bool newest) { return readback_l
 static uint64_t readback(uint64_t guest, uint64_t size) {
     bool w = false;
     waited_seq = 0;
-    uint64_t part = 0, whole = 0;
-    const uint64_t v = memory_writeback_value(guest, size, nullptr, &part, &whole);
+    uint64_t part = 0, whole = 0, ip_part = 0;
+    const uint64_t v = memory_writeback_value(guest, size, nullptr, &part, &whole, ip_on ? &ip_part : nullptr);
     const uint64_t f0 = fence_handed;
     /* CHOICE */
     (void)w;
@@ -233,6 +238,52 @@ int main() {
     fence_handed = 11;
     check(readback(4 * P, 64) == 4, "no rule: the wait, as before");
 
+    // ps5-overlap: a page written in place in a known part (note_direct_write with readback_in_place_part_on). Submission
+    // 20 in three parts (8-10): page 8 written in place in part 8, page 9 in place in part 10, page 10 from a mirror in 9
+    {
+        Recording g{20, 8}, h{20, 9}, k{20, 10};
+        wb_pages_note(8 * P, 9 * P, 20, 8, true);
+        note(g, 8);
+        wb_pages_note(10 * P, 11 * P, 20, 9);
+        note(h, 9);
+        wb_pages_note(9 * P, 10 * P, 20, 10, true);
+        rec_open_values.push_back(20);
+        note(k, 10);
+        done_value = 19;
+        in_place_part = 10;   // (every part reads guest memory in place: a GPU whose pools have no mirror)
+        ip_on = false, in_place = 0;
+        check(readback(8 * P, 64) == 10 && in_place == 1, "switch off: a page written in place waits for its submission's last part, as before");
+        uint64_t pt = 7, wh = 0;
+        check(memory_writeback_value(8 * P, 64, nullptr, &pt, &wh) == 20 && pt == 0 && wh == 20,
+              "switch off: a reader that does not ask for the in-place part sees the page as written in place, with no part");
+        ip_on = true, in_place = 0, ip_parted = 0, ip_fell_back = 0, held_back = 0;
+        check(readback(8 * P, 64) == 8 && ip_parted == 1 && in_place == 0, "switch on: the part that wrote it in place, not the last");
+        check(readback(9 * P, 64) == 10, "written in place in the last part: the last part");
+        check(readback(8 * P, 2 * P) == 10, "a range over both: the newer part");
+        check(waited_whole_value == 1, "none of them waits for every queue's work");
+        check(readback(10 * P, 64) == 10 && held_back == 1,
+              "a mirror's page with guest memory read in place after its part: still the last part (unchanged)");
+        check(readback(8 * P, 3 * P) == 10, "a range with an in-place page and a held-back mirror page: the last part");
+        uint64_t ipp = 0;
+        pt = 7, wh = 0;
+        check(memory_writeback_value(8 * P, 3 * P, nullptr, &pt, &wh, &ipp) == 20 && pt == 9 && wh == 0 && ipp == 10,
+              "the lookup keeps a mirror's part and the in-place part apart");
+        wb_pages_note(8 * P, 9 * P, 21, 0, true);   // (written in place outside a recording's part: no part known)
+        done_value = 20;
+        in_place = 0;
+        rec_open_values.push_back(21);
+        Recording m{21, 11};
+        note(m, 11);
+        check(readback(8 * P, 64) == 11 && in_place == 1, "written in place with no part: its submission's last part, as before");
+        done_value = 21;
+        check(readback(8 * P, 64) == 0, "nothing once its submission is done");
+        wb_pages_note(8 * P, 9 * P, 22, 12, true);   // (a part that never comes: the whole submission after 250 ms)
+        done_value = 21;
+        ip_fell_back = 0;
+        check(readback(8 * P, 64) == 0 && waited_whole_value == 2 && ip_fell_back == 1, "a part that never comes: every queue's work, counted");
+        ip_on = false, in_place_part = 0;
+    }
+
     // the look at the stopped queues: only after a CPU signal nobody has looked at
     const uint64_t event = 0x1000;
     ev_values[event] = 1;   // (an event the stream has set: its value is the replay's, not memory's)
@@ -294,12 +345,13 @@ def main():
     # Match the definition, not the forward declaration used by vk_timeline_wait.
     waits = block(replay, "bool wait_recorded(uint64_t f, uint64_t timeout_ns, int* ok) {") + "\n" + block(replay, "bool wait_recorded_part(")
     inv = replay[replay.index("void invalidate(uint64_t gpu, uint64_t size) {"):]
-    lookup = "const uint64_t v = memory_writeback_value(host->gpu_guest(gpu), size, nullptr, &part, &whole);"
+    lookup = "const uint64_t v = memory_writeback_value(host->gpu_guest(gpu), size, nullptr, &part, &whole,"
     after = inv[inv.index(lookup):]
     marker = "if (pending && !late) {\n                int ok = 0;"
     choice = after[after.index("const bool pending = v > completed()"):after.index(marker)] + block(after, marker)
     assert "readback_late_wanted(size, newest)" in choice, "the readback's late rule is no longer asked before its wait"
-    assert "wait_recorded_part(part" in choice, "the readback no longer waits for its pages' part: update this test"
+    assert "wait_recorded_part(want" in choice and "const uint64_t want = std::max(part, ip_part);" in choice, \
+        "the readback no longer waits for its pages' part (a mirror's or the in-place one): update this test"
     # (the settle before the lookup goes through sync_settle_met with per-queue fences)
     before = inv[:inv.index(lookup)]
     assert "else if (sync_settle_met())" in before, "the readback's look at the stopped queues is no longer sync_settle_met's"
@@ -308,10 +360,15 @@ def main():
     blocked = block(replay, "void update_blocked() {")
     assert "ev_wait_in_memory.store(n && waits_on_memory_event()" in blocked, \
         "update_blocked no longer says whether a stopped queue waits on an event in guest memory"
-    assert "const bool in_place_after = memory_in_place_part() > part;" in choice and "!in_place_after &&" in choice, \
-        "the readback's part wait no longer gives way to guest memory read in place after its part"
-    assert "if (!parted && !part) in_place++;" in choice and "(long long)held_back.exchange(0), (long long)in_place.exchange(0));" \
-        in replay, "the readback line no longer counts the waits for a whole submission whose pages were written in place"
+    assert "const bool in_place_after = memory_in_place_part() > part;" in choice and "!(part && in_place_after) &&" in choice, \
+        "the readback's part wait no longer gives way to guest memory read in place after a mirror's part"
+    assert "if (!parted && !part && !ip_part) in_place++;" in choice and \
+        "(long long)held_back.exchange(0), (long long)in_place.exchange(0), (long long)ip_parted.exchange(0)," in replay, \
+        "the readback line no longer counts the waits for a whole submission whose pages were written in place"
+    assert "readback_in_place_part_on() && mirror_upload && mem_rec_part_mapped.load() ? mem_rec_part.load() : 0, true);" in memory, \
+        "a GPU write in place is no longer noted with its part only inside a recording's part (note_direct_write)"
+    assert "memory_recording_part(++rec_part_next, false);" in replay, \
+        "a parallel replay's segment must say its part is not mapped: a readback would wait for a part that never comes"
     memory_src = memory
     # every place the guest pool's own buffer is handed to the GPU to read: bound, copied from, or given out whole
     # (gpu_buffer: a texture unswizzled on the GPU, a texel buffer's view). The write-back's own copies into it, the

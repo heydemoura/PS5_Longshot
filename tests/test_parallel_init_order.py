@@ -113,12 +113,28 @@ def main():
         if r.returncode:
             print(r.stdout + r.stderr)
             raise SystemExit("the fixture did not build")
-        for case in CASES:
-            r = subprocess.run([str(binary), case], capture_output=True, text=True, timeout=60)
-            print(r.stdout, end="", flush=True)
-            print(r.stderr, end="", file=sys.stderr)
-            if r.returncode != exits.get(case, 0) or "FAIL" in r.stdout:
-                failed.append(case)
+        # (ps5-overlap: each case with the segments' submits as before, then held in the batch (RX_VK_BATCH) and sent at once
+        # (the GPU idle), then held until the replay's next flush. The cases whose workers wait for segment 0's submit (latch z)
+        # cannot run held: a held segment is submitted only at the flush after them all)
+        latched = {"after_submit", "init_end_fail"}
+        batched = "seg_batch && batch_on()" in jobs
+        if not batched:
+            raise SystemExit("replay_handle no longer holds the segments' submits in the batch: update this test")
+        for mode in (None, "idle", "held"):
+            env = dict(os.environ)
+            env.pop("PIO_BATCH", None)
+            if mode:
+                env["PIO_BATCH"] = mode
+            print("---- segments' submits: %s" % ({None: "one each", "idle": "held, sent at once",
+                                                   "held": "held to the next flush"}[mode]), flush=True)
+            for case in CASES:
+                if mode == "held" and case in latched:
+                    continue
+                r = subprocess.run([str(binary), case], capture_output=True, text=True, timeout=60, env=env)
+                print(r.stdout, end="", flush=True)
+                print(r.stderr, end="", file=sys.stderr)
+                if r.returncode != exits.get(case, 0) or "FAIL" in r.stdout:
+                    failed.append("%s%s" % (case, " (batch %s)" % mode if mode else ""))
     if failed:
         raise SystemExit("FAIL: new images' initialization order or the init pools' startup: " + ", ".join(failed))
     print("PASS: each new image is initialized once, before every use in queue order; serial calls are unchanged; "

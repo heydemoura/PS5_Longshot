@@ -152,7 +152,13 @@ const char* const kFineC[] = {"draws", "descriptor builds", "descriptors", "desc
                                       "push constants", "pipeline keys from the fast pair", "pipeline keys from the thread's map",
                                       "sets allocated (over the push limit)", "descriptors in them", "storage buffer descriptors built"};
 static_assert(std::size(kFineT) == FT_COUNT && std::size(kFineC) == FC_COUNT, "every section and count is named");
-const bool g_fine = env_on("RX_VK_PROF_FINE");
+// (ps5-overlap: read at the first use, not while the library loads: on PS5 longshot_env.txt is applied after that, and the
+// switch read then was always off)
+inline bool fine_on() {
+    static const bool v = env_on("RX_VK_PROF_FINE");
+    return v;
+}
+#define g_fine fine_on()
 int64_t fine_ns[FT_COUNT], fine_n[FC_COUNT];
 struct FineScope {
     int ph;
@@ -428,7 +434,11 @@ bool stream_grow_off() {
     static const bool off = env_on("RX_VK_STREAM_GROW_OFF");
     return off;
 }
-const uint64_t kStream = (getenv("RX_VK_STREAM_MB") ? (uint64_t)std::max(1, atoi(getenv("RX_VK_STREAM_MB"))) : stream_grow_off() ? 24u : 2u) << 20;
+// (read at first use: an initialiser at namespace scope runs before the game folder's env file, whose RX_VK_STREAM_MB was not seen)
+uint64_t stream_first() {
+    static const uint64_t v = (getenv("RX_VK_STREAM_MB") ? (uint64_t)std::max(1, atoi(getenv("RX_VK_STREAM_MB"))) : stream_grow_off() ? 24u : 2u) << 20;
+    return v;
+}
 std::atomic<uint64_t> stream_peak{0}, stream_extra{0}, stream_grown{0};
 std::atomic<uint64_t> pools_extra{0};   // (descriptor pools made because a recording's own ran out: make_pool)
 std::deque<RecordingRes> res;   // (a deque: a recording thread keeps its own in place while another is added)
@@ -1230,7 +1240,20 @@ driver_faults::Quarantine& fault_quarantine() {
     });
     return q;
 }
+#ifdef __PROSPERO__
+extern "C" uint64_t hos_ps5_direct_room(void);
+#endif
 void driver_fault_note(uint64_t key) {
+#ifdef __PROSPERO__
+    // (PS5) a fault while memory is short is most likely the driver's own allocation coming back empty, not its compiler:
+    // kept out for this run only, not written for every later one (2026-11-18 14:20, mesh program ecfdeb7ef9687b09 with
+    // "operator new: no memory" the line before)
+    if (hos_ps5_direct_room() < ps5_tex_reserve()) {
+        logf("vk: memory short (%llu MB free): program %016llx kept out for this run only, not written to %s",
+             (unsigned long long)(hos_ps5_direct_room() >> 20), (unsigned long long)key, driver_faults_path().c_str());
+        return;
+    }
+#endif
     static std::mutex mu;
     std::lock_guard lk(mu);
     const std::string path = driver_faults_path();
@@ -1247,6 +1270,25 @@ void driver_fault_note(uint64_t key) {
     fputs(driver_faults::line(dev.props.vendorID, dev.props.driverVersion, key).c_str(), f);
     fclose(f);
 }
+
+// (PS5, LONGSHOT_RADV_SHADER_LOG=1) which program each pipeline the driver makes is: the driver logs a pipeline's handle with
+// its shaders' GPU addresses (ps5/radv-patches/lead-mesh-17), this the handle with the program's key, so that a GPU fault's
+// wave address in the console's crash dump names the program. 0: the renderer's own (its passes, the driver's meta shaders)
+thread_local uint64_t tl_pipeline_key = 0;
+bool pipeline_key_log_on() {
+    static const bool on = getenv("LONGSHOT_RADV_SHADER_LOG") && getenv("LONGSHOT_RADV_SHADER_LOG")[0] == '1';
+    return on;
+}
+void pipeline_key_note(uint64_t key) { tl_pipeline_key = key; }
+struct PipelineKeyLog {
+    VkPipeline* pl;
+    uint64_t key;
+    explicit PipelineKeyLog(VkPipeline* p) : pl(p), key(tl_pipeline_key) { tl_pipeline_key = 0; }
+    ~PipelineKeyLog() {
+        if (pipeline_key_log_on() && pl && *pl)
+            logf("vk: pipeline %p: program %016llx", (void*)*pl, (unsigned long long)key);
+    }
+};
 
 // (longshot) A driver's compiler that faults on a shader (amdvlk64.dll on a mesh program, Longshot issue 26) costs that one draw, not the game
 std::atomic<int> st_driver_faults{0};
@@ -1312,8 +1354,39 @@ static void install_driver_fault_guard() {
     });
 }
 
+#ifdef __PROSPERO__
+// (PS5) The pipeline memory gate, after EglantinePS5's (EDEN_PIPELINE_MEMORY_GATE_CRITICAL_MS): RADV's compiler (ACO) faulted
+// compiling a pipeline when the console's direct memory was exhausted. Below LONGSHOT_PS5_PIPELINE_FLOOR_MB (256) of free direct
+// memory a compile waits, up to LONGSHOT_PS5_PIPELINE_WAIT_MS (10000), for memory to come back (the texture cache gives some
+// back when memory is short, vk_texture.cpp; the game frees), then goes ahead with the fault guard around it. EglantinePS5
+// cut the wait to 1 s once and crashed in ACO at 3239 s: the 10 s stays.
+extern "C" uint64_t hos_ps5_direct_room(void);   // (host/ps5/win32_ps5.c)
+static void ps5_pipeline_gate(const char* what) {
+    static const uint64_t floor_bytes = (uint64_t)(getenv("LONGSHOT_PS5_PIPELINE_FLOOR_MB") ? atoi(getenv("LONGSHOT_PS5_PIPELINE_FLOOR_MB")) : 256) << 20;
+    static const int wait_ms = getenv("LONGSHOT_PS5_PIPELINE_WAIT_MS") ? atoi(getenv("LONGSHOT_PS5_PIPELINE_WAIT_MS")) : 10000;
+    static std::atomic<int64_t> waits{0}, waited_ms{0};
+    uint64_t room = hos_ps5_direct_room();
+    if (room >= floor_bytes) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    int ms = 0;
+    while (room < floor_bytes && ms < wait_ms) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));   // (the room is measured every 50 ms at most)
+        ms = (int)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        room = hos_ps5_direct_room();
+    }
+    const int64_t n = waits.fetch_add(1) + 1, total = waited_ms.fetch_add(ms) + ms;
+    if (n <= 20 || n % 100 == 0)
+        logf("vk: the %s compile waited %d ms for memory (%llu MB free%s; %lld waits, %lld ms in all)", what, ms,
+             (unsigned long long)(room >> 20), room < floor_bytes ? ", still under the floor: compiled anyway" : "",
+             (long long)n, (long long)total);
+}
+#endif
 VkResult guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl) {
+    PipelineKeyLog key_log(pl);
     install_driver_fault_guard();
+#ifdef __PROSPERO__
+    ps5_pipeline_gate("graphics pipeline");
+#endif
     if (sigsetjmp(fault_jmp, 1) != 0) {
         *pl = VK_NULL_HANDLE;   // (whatever the driver wrote before it faulted is not a pipeline)
         note_driver_fault();
@@ -1326,7 +1399,11 @@ VkResult guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateI
     return r;
 }
 VkResult guarded_compute(VkPipelineCache cache, const VkComputePipelineCreateInfo* ci, VkPipeline* pl) {
+    PipelineKeyLog key_log(pl);
     install_driver_fault_guard();
+#ifdef __PROSPERO__
+    ps5_pipeline_gate("compute pipeline");
+#endif
     if (sigsetjmp(fault_jmp, 1) != 0) {
         *pl = VK_NULL_HANDLE;   // (whatever the driver wrote before it faulted is not a pipeline)
         note_driver_fault();
@@ -1434,6 +1511,7 @@ VkResult cached_compute(const VkComputePipelineCreateInfo* ci, VkPipeline* pl) {
 /// (longshot) What a compute program's pipeline is made from: its one stage, pinned to 32 lanes where the GPU can, and its
 /// layout (ensure_layout first). noopt: RX_VK_NOOPT is followed, as play's builds follow it (the precompile's do not)
 VkComputePipelineCreateInfo compute_pipeline_info(const Program& q, bool noopt) {
+    pipeline_key_note(q.key);   // (LONGSHOT_RADV_SHADER_LOG: the pipeline made next is this program's)
     VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     ci.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -2758,6 +2836,7 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
     // (longshot) a quick build into no cache: an unoptimized pipeline saved would be what a later run's full build is answered with
     const VkPipelineCache cache = quick_build ? VK_NULL_HANDLE
                                   : lib_cached || (part < 0 && !driver_cache_only) ? pcache : driver_ask_cache;
+    pipeline_key_note(p.key);   // (LONGSHOT_RADV_SHADER_LOG)
     VkResult r = graphics_with(cache, &ci, &pl);
     // The AMD Windows compiler can reject ordinary graphics pipelines with its optimizer on. (A fault caught in it is kDriverFault
     // now, VK_ERROR_UNKNOWN before: the retry stays for both, under the gate)
@@ -2765,6 +2844,7 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
         (r == VK_ERROR_UNKNOWN || r == kDriverFault) && !(ci.flags & VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT)) {
         ci.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
         pl = VK_NULL_HANDLE;
+        pipeline_key_note(p.key);
         r = graphics_with(cache, &ci, &pl);
         if (r == VK_SUCCESS)
             logf("vk: graphics pipeline for %016llx recovered with optimization disabled", (unsigned long long)p.key);
@@ -5593,7 +5673,7 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
             }
         }
     }
-    if (r.streams.empty()) stream_insert(r, 0, kStream);
+    if (r.streams.empty()) stream_insert(r, 0, stream_first());
     if (!r.streams.empty()) {
         const RecordingRes::Stream& s = r.streams[0];
         r.si = 0, r.stream = s.buffer, r.stream_alloc = s.alloc, r.mapped = s.mapped, r.size = s.size;
@@ -5607,7 +5687,7 @@ void draw_begin_recording(int slot, VkCommandBuffer cmd, uint64_t value) {
     if (++begun % 3000 == 0)
         logf("vk: the recording streams: %zu of %llu MB, the most one held %llu KB; %llu made on demand (%llu MB kept now); "
              "c1 stages: at most %zu a recording; %llu descriptor pools made when a recording's own ran out", res.size(),
-             (unsigned long long)(kStream >> 20), (unsigned long long)(stream_peak.load(std::memory_order_relaxed) >> 10),
+             (unsigned long long)(stream_first() >> 20), (unsigned long long)(stream_peak.load(std::memory_order_relaxed) >> 10),
              (unsigned long long)stream_grown.load(), (unsigned long long)(stream_extra.load() >> 20),
              c1_peak.load(std::memory_order_relaxed), (unsigned long long)pools_extra.load(std::memory_order_relaxed));
     r.used = 0, r.before = 0;
@@ -7448,7 +7528,24 @@ static bool fallback_list_held(uint64_t list) {
     return false;
 }
 
+#ifdef __PROSPERO__
+void draw_body(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d);
+extern "C" void hos_ps5_klog_now(const char* fmt, ...);
+/// (PS5) A draw whose work found no memory (operator new's wait over, vk_main.cpp ps5_new_waits) is left out and the frame
+/// goes on, as a texture upload's is (vk_texture.cpp upload). A std::bad_alloc nothing caught ended the title three times on
+/// 2026-11-18 (texture_touch, ~Translation, memory_as_submitted)
 void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
+    try {
+        draw_body(cmd, s, d);
+    } catch (const std::bad_alloc&) {
+        static std::atomic<int> told{0};
+        if (told++ < 40) hos_ps5_klog_now("[ps5] draw: no memory: this draw left out (%d so far)", told.load());
+    }
+}
+void draw_body(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
+#else
+void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
+#endif
     Pass& ps = pass();   // (once: the accessor is a call and a thread-local read at each use. The same object for the thread's life: draw_begin_recording resets it in place)
     PROF_HOT(PROF_DRAW);
     FINE_N(FC_DRAWS, 1);

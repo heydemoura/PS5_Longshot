@@ -98,8 +98,11 @@ UI_RECORD_CALL = re.compile(r"\bui\s*::\s*record(?:_to)?\s*\(")
 NGX_RECORD_CALL = re.compile(r"\bNGX_(?:VULKAN_\w+_EXT|VK_\w+_DLSSG)\s*\(")   # (NVIDIA NGX's create/evaluate, DLSS's and frame generation's: its own commands into cmd)
 FFX_RECORD_CALL = re.compile(r"\bl\s*\.\s*dispatch\s*\(")   # (AMD FidelityFX's ffxDispatch, through its loaded pointer: its own commands into cmd)
 XESS_RECORD_CALL = re.compile(r"\bl\s*\.\s*execute\s*\(")   # (Intel XeSS's xessVKExecute, through its loaded pointer: its own commands into cmd)
+# (PS5_MihawkGen's fg_record_generate, vk_framegen.cpp neural_frames: its own dispatches into cmd, after a B_DIRECT boundary
+# before its loop)
+FG_RECORD_CALL = re.compile(r"\bfg_record_generate\s*\(")
 OPAQUE_RECORD_CALL = re.compile(UI_RECORD_CALL.pattern + "|" + NGX_RECORD_CALL.pattern + "|" + FFX_RECORD_CALL.pattern + "|" +
-                                XESS_RECORD_CALL.pattern)
+                                XESS_RECORD_CALL.pattern + "|" + FG_RECORD_CALL.pattern)
 B_DIRECT_BEFORE = re.compile(r"::\s*mkwvk\s*::\s*rec\s*::\s*boundary\s*\(\s*::\s*mkwvk\s*::\s*rec\s*::\s*B_DIRECT\s*\)\s*;\Z")
 
 
@@ -294,12 +297,15 @@ def build(cxx, headers, out, recorder_text, name, extra=(), work_text=None):
 
 def run(exe, env_mode, *args, parallel=None, timeout=600):
     env = dict(os.environ)
-    for k in ("RX_VK_RECORDER", "RX_VK_PARALLEL", "RX_VK_RECORDER_POISON", "RX_VK_RECORDER_RING_MB", "RX_VK_RECORDER_STATS"):
+    for k in ("RX_VK_RECORDER", "RX_VK_PARALLEL", "RX_VK_RECORDER_POISON", "RX_VK_RECORDER_RING_MB", "RX_VK_RECORDER_STATS",
+              "RX_VK_RECORDER_PARALLEL"):
         env.pop(k, None)
     if env_mode:
         env["RX_VK_RECORDER"] = env_mode
-    if parallel:
-        env["RX_VK_PARALLEL"] = parallel
+    if parallel:   # ("4+": RX_VK_PARALLEL=4 with RX_VK_RECORDER_PARALLEL=1, the recorder thread with the parallel replay)
+        env["RX_VK_PARALLEL"] = parallel.rstrip("+")
+        if parallel.endswith("+"):
+            env["RX_VK_RECORDER_PARALLEL"] = "1"
     try:
         return subprocess.run([str(exe), *args], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env, timeout=timeout)
     except subprocess.TimeoutExpired as e:   # (a hang: reported as exit code None)
@@ -317,6 +323,9 @@ ENV_RUNS = (
     ("thread", None, "env mode 3", ("LOG: vk: RX_VK_RECORDER=thread: vkCmd* packed",)),
     ("thread", "1", "env mode 3", ("LOG: vk: RX_VK_RECORDER=thread: vkCmd* packed",)),
     ("thread", "4", "env mode 0", ("LOG: vk: RX_VK_RECORDER=thread refused: RX_VK_PARALLEL=4",)),
+    # (ps5-overlap: RX_VK_RECORDER_PARALLEL=1 lets the recorder thread run with the parallel replay; defer stays refused)
+    ("thread", "4+", "env mode 3", ("LOG: vk: RX_VK_RECORDER=thread: vkCmd* packed",)),
+    ("defer", "4+", "env mode 0", ("LOG: vk: RX_VK_RECORDER=defer refused: RX_VK_PARALLEL=4",)),
 )
 
 

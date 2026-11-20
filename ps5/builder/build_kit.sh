@@ -138,6 +138,8 @@ step "RADV, the Vulkan driver, at PS5 Mesa ${MESA_REV:0:11} (the long step: 10 t
 archive="$vulkan/.deps/native/radv-release/lib/libvulkan_radeon.ps5.a"
 (cd "$vulkan" && PS5_MESA_REVISION=$MESA_REV run radv bash tools/build-radv.sh release)
 [[ -f $archive ]] || die "no RADV archive at $archive"
+step "this title's RADV patches (ps5/radv-patches: the stall dump, mesh-as-compute, the PS5 memory fixes)"
+PS5_VULKAN="$vulkan" run radv-patches bash ps5/radv-patches/apply.sh
 
 step "the payload SDK the title is compiled with, at ${SDK_REV:0:11}"
 sdk="$deps/ps5-payload-sdk"
@@ -150,6 +152,8 @@ else
     rm -rf -- "$tree"
 fi
 [[ -x $sdk/bin/prospero-lld ]] || die "the payload SDK at $sdk is incomplete"
+step "this title's payload SDK patch (ps5/sdk-patches: a heap segment of several pieces of direct memory)"
+run sdk-patches bash ps5/sdk-patches/apply.sh
 export PS5_PAYLOAD_SDK="$sdk" PS5_VULKAN="$vulkan" PS5_MIHAWKGEN="$projects/PS5_MihawkGen"
 
 step "the Vulkan, SPIR-V and VMA headers"

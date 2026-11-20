@@ -1,0 +1,252 @@
+radv/ps5: mesh shaders of lines and points run as compute too (after lead-mesh-05..11)
+
+The series' first slice took triangle mesh shaders alone; with EDEN_NX2_RADV_MESH_COMPUTE on, a pipeline it refused
+has its draws dropped. In Ocarina of Time (Longshot on the PS5, 2026-11-18) one mesh pipeline, writing a point size
+(outputs 0x8001001), was refused "not triangles, or multiview" and dropped 32 times: the characters' hair did not
+show. EglantinePS5's core takes such draws itself (its own points/lines emulation); Longshot's renderer has the
+driver alone.
+
+- radv_mesh_compute_wanted: lines and points too; the point size among the vertex outputs
+- the copy vertex shader: c corners a primitive (3, 2, 1); the point size copied as a float; an unused line or
+  point slot off the screen (an unused triangle's three equal corners have no area, a point's would draw)
+- the copy's topology at compile (radv_pipeline_graphics.c) and draw (radv_mesh_compute_draw): line or point list
+- the cache keeps the corners in the capacity's top byte; an object from before reads 0, triangles
+diff -ruN a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+--- a/src/amd/vulkan/radv_cmd_buffer.c	2026-11-18 13:39:36.360869959 +0000
++++ b/src/amd/vulkan/radv_cmd_buffer.c	2026-11-18 14:15:47.500557769 +0000
+@@ -15887,7 +15887,7 @@
+    const uint64_t block_va = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + block_offset;
+ 
+    const uint32_t saved_topology = d->vk.ia.primitive_topology;
+-   d->vk.ia.primitive_topology = V_008958_DI_PT_TRILIST;
++   d->vk.ia.primitive_topology = radv_mesh_compute_topology(pipeline->mesh_compute_corners);
+    state->dirty_dynamic |= RADV_DYNAMIC_PRIMITIVE_TOPOLOGY;
+    state->dirty |= RADV_CMD_DIRTY_VGT_PRIM_STATE;
+ 
+diff -ruN a/src/amd/vulkan/radv_gs_compute.h b/src/amd/vulkan/radv_gs_compute.h
+--- a/src/amd/vulkan/radv_gs_compute.h	2026-11-18 13:39:36.304869967 +0000
++++ b/src/amd/vulkan/radv_gs_compute.h	2026-11-18 14:15:47.500557769 +0000
+@@ -114,6 +114,7 @@
+    struct radv_shader_binary *mesh_binary;
+    struct radv_shader_debug_info mesh_debug;
+    uint32_t mesh_vertices_per_workgroup;
++   uint32_t mesh_corners; /* (lead-mesh-14) */
+    uint32_t mesh_capacity;
+ };
+ 
+diff -ruN a/src/amd/vulkan/radv_mesh_compute.c b/src/amd/vulkan/radv_mesh_compute.c
+--- a/src/amd/vulkan/radv_mesh_compute.c	2026-11-18 13:39:36.352869960 +0000
++++ b/src/amd/vulkan/radv_mesh_compute.c	2026-11-18 14:33:10.232393034 +0000
+@@ -124,7 +124,8 @@
+    unsigned num_vtx_slots;
+    unsigned max_vertices;
+    unsigned max_primitives;
+-   unsigned prim_offset; /* the triangles, after the vertices */
++   unsigned prim_offset; /* the primitives' indices, after the vertices */
++   unsigned corners;     /* a primitive's vertices: 3 triangles, 2 lines, 1 points (lead-mesh-14) */
+    unsigned stride;      /* a slot */
+    unsigned capacity;    /* slots in a pass */
+    unsigned payload_stride;
+@@ -165,7 +166,8 @@
+    return progress;
+ }
+ 
+-static const uint64_t allowed_vertex_outputs = VARYING_BIT_POS | BITFIELD64_RANGE(VARYING_SLOT_VAR0, 32);
++/* (lead-mesh-14) and the point size, which a mesh shader of points or lines may write */
++static const uint64_t allowed_vertex_outputs = VARYING_BIT_POS | VARYING_BIT_PSIZ | BITFIELD64_RANGE(VARYING_SLOT_VAR0, 32);
+ 
+ /* Why a mesh shader stays out of this path. With the path on its draws are then dropped
+  * (radv_mesh_draw_dropped in radv_cmd_buffer.c), so this line names what is left to do. */
+@@ -195,10 +197,17 @@
+       return false;
+    }
+ 
+-   /* First slice: triangles, outputs that are positions and generic varyings, no
+-    * per-primitive outputs but the indices, no multiview. */
+-   if (mesh->info.mesh.primitive_type != MESA_PRIM_TRIANGLES || gfx_state->has_multiview_view_index) {
+-      mesh_compute_refused(mesh, "not triangles, or multiview");
++   /* Triangles, lines or points (lead-mesh-14: the first slice took triangles alone, and Ocarina's
++    * hair, a mesh shader writing its point size, was dropped), outputs that are positions, the point
++    * size and generic varyings, no per-primitive outputs but the indices, no multiview. */
++   const unsigned prim = mesh->info.mesh.primitive_type;
++   /* LONGSHOT_RADV_MESH_POINTS=0: triangles alone, as before lead-mesh-14 (to tell whether its lines and points stop
++    * the GPU: the first run with them ended in a GPU hang, 2026-11-18 14:31) */
++   const char *const points_env = getenv("LONGSHOT_RADV_MESH_POINTS");
++   const bool points_on = !(points_env && points_env[0] == '0');
++   if ((prim != MESA_PRIM_TRIANGLES && (!points_on || (prim != MESA_PRIM_LINES && prim != MESA_PRIM_POINTS))) ||
++       gfx_state->has_multiview_view_index) {
++      mesh_compute_refused(mesh, "not triangles, lines or points, or multiview");
+       return false;
+    }
+    if (!mesh->info.mesh.max_vertices_out || mesh->info.mesh.max_vertices_out > 256 ||
+@@ -240,9 +249,10 @@
+    return util_bitcount64(l->vtx_mask & BITFIELD64_MASK(location));
+ }
+ 
+-/* The copy vertex shader: vertex v draws corner v % 3 of primitive (v / 3) % max_primitives of
+- * mesh workgroup v / (3 max_primitives); a primitive past its workgroup's count is a triangle of
+- * three equal corners, which the rasterizer drops. */
++/* The copy vertex shader: vertex v draws corner v % c of primitive (v / c) % max_primitives of
++ * mesh workgroup v / (c max_primitives), c the primitive's corners (3, 2 lines, 1 points); a
++ * primitive past its workgroup's count is a triangle of three equal corners, which the rasterizer
++ * drops, or a line or point off the screen. */
+ static nir_shader *
+ build_copy_vs(const nir_shader_compiler_options *options, const struct mesh_compute_layout *l, unsigned wave_size)
+ {
+@@ -253,13 +263,13 @@
+    b.shader->info.min_subgroup_size = wave_size;
+    b.shader->info.max_subgroup_size = wave_size;
+    b.shader->info.api_subgroup_size = wave_size;
+-   const unsigned vpw = l->max_primitives * 3;
++   const unsigned vpw = l->max_primitives * l->corners;
+ 
+    nir_def *v = nir_load_vertex_id_zero_base(&b);
+    nir_def *wg = nir_udiv_imm(&b, v, vpw);
+    nir_def *rem = nir_umod_imm(&b, v, vpw);
+-   nir_def *prim = nir_udiv_imm(&b, rem, 3);
+-   nir_def *corner = nir_umod_imm(&b, rem, 3);
++   nir_def *prim = nir_udiv_imm(&b, rem, l->corners);
++   nir_def *corner = nir_umod_imm(&b, rem, l->corners);
+    nir_def *in_buffer = nir_ult_imm(&b, wg, l->capacity);
+    wg = nir_umin(&b, wg, nir_imm_int(&b, l->capacity - 1));
+ 
+@@ -286,8 +296,16 @@
+          nir_u2u64(&b, nir_iadd_imm(&b, nir_imul_imm(&b, nir_iadd_imm(&b, nir_imul_imm(&b, index, l->num_vtx_slots), s), 16), 16)));
+       nir_def *value = nir_build_load_global(&b, 4, 32, addr, .align_mul = 16);
+       if (location == VARYING_SLOT_POS) {
+-         /* All three corners of an unused slot at one point: no area. */
+-         value = nir_bcsel(&b, valid, value, nir_imm_vec4(&b, 0.0, 0.0, 0.0, 1.0));
++         /* All three corners of an unused slot at one point: no area. A line's or a point's
++          * there would draw: it goes off the screen (four times the clip volume's width). */
++         value = nir_bcsel(&b, valid, value,
++                           l->corners == 3 ? nir_imm_vec4(&b, 0.0, 0.0, 0.0, 1.0) : nir_imm_vec4(&b, 4.0, 4.0, 0.5, 1.0));
++      }
++      if (location == VARYING_SLOT_PSIZ) {   /* (a float: its first component) */
++         nir_variable *var = nir_variable_create(b.shader, nir_var_shader_out, glsl_float_type(), "mesh_point_size");
++         var->data.location = location;
++         nir_store_var(&b, var, nir_channel(&b, value, 0), 0x1);
++         continue;
+       }
+       nir_variable *var = nir_variable_create(b.shader, nir_var_shader_out, glsl_vec4_type(), "mesh_output");
+       var->data.location = location;
+@@ -520,6 +538,7 @@
+    l.max_vertices = mesh->info.mesh.max_vertices_out;
+    l.max_primitives = mesh->info.mesh.max_primitives_out;
+    l.prim_offset = 16 + l.max_vertices * l.num_vtx_slots * 16;
++   l.corners = radv_mesh_compute_corners(mesh->info.mesh.primitive_type);
+    l.stride = align(l.prim_offset + l.max_primitives * 4, 64);
+    l.capacity = MIN2((radv_mesh_compute_bytes() - RADV_MESH_COMPUTE_HEADER_BYTES) / l.stride,
+                      RADV_MESH_COMPUTE_CHUNK_WORKGROUPS);
+@@ -534,7 +553,8 @@
+    memset(out, 0, sizeof(*out));
+    out->mesh_stage = *ms;
+    out->cs = mesh;
+-   out->vertices_per_workgroup = l.max_primitives * 3;
++   out->vertices_per_workgroup = l.max_primitives * l.corners;
++   out->corners = l.corners;
+    out->capacity = l.capacity;
+ 
+    struct radv_shader_stage *vs_stage = &stages[MESA_SHADER_VERTEX];
+diff -ruN a/src/amd/vulkan/radv_mesh_compute.h b/src/amd/vulkan/radv_mesh_compute.h
+--- a/src/amd/vulkan/radv_mesh_compute.h	2026-11-18 13:39:36.348869961 +0000
++++ b/src/amd/vulkan/radv_mesh_compute.h	2026-11-18 14:16:20.108551996 +0000
+@@ -7,6 +7,7 @@
+ #ifndef RADV_MESH_COMPUTE_H
+ #define RADV_MESH_COMPUTE_H
+ 
++#include "sid.h"   /* (lead-mesh-14: V_008958_DI_PT_*) */
+ #include <stdbool.h>
+ #include <stdint.h>
+ 
+@@ -62,6 +63,19 @@
+  * task pipeline splits, the buffer is not made and mesh draws go as they did before. */
+ bool radv_mesh_compute_enabled(void);
+ 
++/* (lead-mesh-14) A mesh shader's primitive's vertices, and the copy's hardware topology for them. */
++static inline unsigned
++radv_mesh_compute_corners(unsigned mesa_prim)
++{
++   return mesa_prim == MESA_PRIM_LINES ? 2 : mesa_prim == MESA_PRIM_POINTS ? 1 : 3;
++}
++
++static inline unsigned
++radv_mesh_compute_topology(unsigned corners)
++{
++   return corners == 2 ? V_008958_DI_PT_LINELIST : corners == 1 ? V_008958_DI_PT_POINTLIST : V_008958_DI_PT_TRILIST;
++}
++
+ /* The buffer's size: EDEN_NX2_RADV_MESH_COMPUTE_MIB (8 to 512), RADV_MESH_COMPUTE_BYTES unset. */
+ uint32_t radv_mesh_compute_bytes(void);
+ 
+@@ -88,6 +102,8 @@
+    nir_shader *cs;
+    /* The copy draw's vertices a mesh workgroup: max primitives x 3. */
+    uint32_t vertices_per_workgroup;
++   /* A primitive's vertices in the copy: 3 triangles, 2 lines, 1 points (lead-mesh-14). */
++   uint32_t corners;
+    /* The mesh workgroups a pass holds. */
+    uint32_t capacity;
+ };
+diff -ruN a/src/amd/vulkan/radv_pipeline.h b/src/amd/vulkan/radv_pipeline.h
+--- a/src/amd/vulkan/radv_pipeline.h	2026-11-18 13:39:36.304869967 +0000
++++ b/src/amd/vulkan/radv_pipeline.h	2026-11-18 14:15:47.500557769 +0000
+@@ -59,6 +59,7 @@
+     * mesh_compute_capacity the mesh workgroups a pass of it holds. */
+    struct radv_shader *mesh_compute;
+    uint32_t mesh_compute_vertices_per_workgroup;
++   uint32_t mesh_compute_corners; /* 3 triangles, 2 lines, 1 points (lead-mesh-14) */
+    uint32_t mesh_compute_capacity;
+ 
+    /* Unique pipeline hash identifier. */
+diff -ruN a/src/amd/vulkan/radv_pipeline_cache.c b/src/amd/vulkan/radv_pipeline_cache.c
+--- a/src/amd/vulkan/radv_pipeline_cache.c	2026-11-18 13:39:36.316869965 +0000
++++ b/src/amd/vulkan/radv_pipeline_cache.c	2026-11-18 14:15:47.504557767 +0000
+@@ -422,7 +422,9 @@
+          assert(i == pipeline_obj->num_shaders - 1 && pipeline_obj->data_size == 2 * sizeof(uint32_t));
+          pipeline->base.mesh_compute = radv_shader_ref(pipeline_obj->shaders[i]);
+          pipeline->base.mesh_compute_vertices_per_workgroup = counts[0];
+-         pipeline->base.mesh_compute_capacity = counts[1];
++         pipeline->base.mesh_compute_capacity = counts[1] & 0xffffff;
++         /* (lead-mesh-14) the corners in the top byte; 0, an object from before, triangles */
++         pipeline->base.mesh_compute_corners = (counts[1] >> 24) ? (counts[1] >> 24) : 3;
+       } else if (s == MESA_SHADER_VERTEX && i > 0) {
+          /* The GS copy-shader is a VS placed after all other stages */
+          assert(i == pipeline_obj->num_shaders - 1 && pipeline->base.shaders[MESA_SHADER_GEOMETRY]);
+@@ -511,7 +513,7 @@
+       uint32_t *counts = pipeline_obj->data;
+       pipeline_obj->shaders[idx++] = radv_shader_ref(pipeline->mesh_compute);
+       counts[0] = pipeline->mesh_compute_vertices_per_workgroup;
+-      counts[1] = pipeline->mesh_compute_capacity;
++      counts[1] = pipeline->mesh_compute_capacity | (pipeline->mesh_compute_corners << 24);
+    }
+ 
+    assert(idx == num_shaders);
+diff -ruN a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipeline_graphics.c
+--- a/src/amd/vulkan/radv_pipeline_graphics.c	2026-11-18 13:39:36.348869961 +0000
++++ b/src/amd/vulkan/radv_pipeline_graphics.c	2026-11-18 14:38:37.992354898 +0000
+@@ -2544,7 +2544,8 @@
+    if (mesh_compute_used) {
+       radv_mesh_compute_split(compiler_info, stages, &mesh_split);
+       mesh_compute_gfx_state = *gfx_state;
+-      mesh_compute_gfx_state.ia.topology = V_008958_DI_PT_TRILIST;
++      /* (lead-mesh-14) by the split's corners: radv_mesh_compute_split has taken the mesh stage's NIR (NULL now) */
++      mesh_compute_gfx_state.ia.topology = radv_mesh_compute_topology(mesh_split.corners);
+       mesh_compute_gfx_state.vs.has_prolog = false;
+       gfx_state = &mesh_compute_gfx_state;
+    }
+@@ -2917,6 +2918,7 @@
+    if (mesh_compute_used) {
+       gs_compute->mesh_binary = radv_mesh_compute_compile(compiler_info, &mesh_split, &gs_compute->mesh_debug);
+       gs_compute->mesh_vertices_per_workgroup = mesh_split.vertices_per_workgroup;
++      gs_compute->mesh_corners = mesh_split.corners;
+       gs_compute->mesh_capacity = mesh_split.capacity;
+       gs_compute->mesh_used = true;
+    }
+@@ -3243,6 +3245,7 @@
+          pipeline->base.mesh_compute =
+             radv_shader_create(device, cache, gs_compute.mesh_binary, skip_shaders_cache, &gs_compute.mesh_debug);
+       pipeline->base.mesh_compute_vertices_per_workgroup = gs_compute.mesh_vertices_per_workgroup;
++      pipeline->base.mesh_compute_corners = gs_compute.mesh_corners;
+       pipeline->base.mesh_compute_capacity = gs_compute.mesh_capacity;
+       free(gs_compute.mesh_binary);
+       if (!pipeline->base.mesh_compute)

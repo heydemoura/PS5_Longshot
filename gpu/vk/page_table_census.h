@@ -19,7 +19,14 @@ namespace mkwvk {
 struct PageWindow {
     uint64_t base, bytes, first;   // (first: the window's first entry in the table, after the windows before it)
 };
+#if defined(__PROSPERO__)
+// (PS5: the guest's heap from 16 GiB and its address regions down from 64 GiB, host/hos.h HOS_HEAP_BASE: the PC's windows
+// held none of it, every pointer into a pool read 0 (390 pools outside, 0x403..0x577 and 0xf5b..0xfe2), and the fragment
+// stage's light probes and ambient tables with them: textures in shadow dark, 2026-11-18. The same sizes, so the same table)
+inline constexpr PageWindow kPageWindows[] = {{0x400000000ull, 8ull << 30, 0}, {0xf00000000ull, 4ull << 30, (8ull << 30) >> 12}};
+#else
 inline constexpr PageWindow kPageWindows[] = {{0x1000000000ull, 8ull << 30, 0}, {0x7f00000000ull, 4ull << 30, (8ull << 30) >> 12}};
+#endif
 inline constexpr uint64_t kPageTableEntries = ((8ull << 30) + (4ull << 30)) >> 12;   // (4 KB pages: a device address each)
 
 /// The bytes of [lo, hi) that no window covers

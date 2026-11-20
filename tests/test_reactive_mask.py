@@ -46,7 +46,7 @@ def main():
         raise SystemExit("reactive_scene_draw: the scene is copied inside its pass")
     if hook.index("reactive_policy::copy_before(") > hook.index("end_pass(cmd);"):
         raise SystemExit("reactive_scene_draw: the pass is ended for draws that need no copy")
-    body = function(draw, "void draw(")
+    body = function(draw, "#else\nvoid draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {")   # (the PC's draw(): on the PS5 one wraps draw_body, the same body, in a std::bad_alloc catch)
     if "reactive_scene_draw(cmd, p, s, at);" not in body or \
             body.index("reactive_scene_draw(cmd, p, s, at);") > body.index("writes = draw_hazards(cmd, p, s, at);"):
         raise SystemExit("draw: the scene is not copied before the draw's pass is settled (draw_hazards)")

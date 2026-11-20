@@ -1,0 +1,462 @@
+radv/ps5: the rest of EglantinePS5's driver adaptations (tools/patch-radv-wsi.py DRIVER_ADAPTATIONS)
+
+lead-mesh-12 took its memory fixes alone. These are the others EglantinePS5 applies to the same RADV: the command
+stream not split inside an emulated task or mesh-as-compute draw; an upload buffer still in flight kept; a dispatch's
+scratch written by the driver (EDEN_RADV_DISPATCH_SCRATCH); a mesh workgroup's primitive count by its primitive's
+vertices; the mesh buffers' switch (EDEN_RADV_NO_MESH_BUFFERS); the NGG mesh path's publish wait; SPIR-V to NIR tried
+again on a failure; empty pipeline cache objects refused; platform, queue and mapping failures reported.
+
+diff -ruN a/src/amd/common/nir/ac_nir_lower_ngg_mesh.c b/src/amd/common/nir/ac_nir_lower_ngg_mesh.c
+--- a/src/amd/common/nir/ac_nir_lower_ngg_mesh.c	2026-11-18 14:17:33.900530538 +0000
++++ b/src/amd/common/nir/ac_nir_lower_ngg_mesh.c	2026-11-18 14:17:33.900530538 +0000
+@@ -1172,11 +1172,16 @@
+ {
+    nir_if *if_first = nir_push_if(b, nir_ieq_imm(b, nir_load_local_invocation_index(b), 0));
+    {
++      nir_variable *spins = nir_local_variable_create(b->impl, glsl_uint_type(), "ms_publish_spins");
++      nir_store_var(b, spins, nir_imm_int(b, 0), 0x1);
+       nir_loop *loop = nir_push_loop(b);
+       {
+          nir_def *header = nir_build_load_global(b, 1, 32, s->header_addr, .align_mul = 4,
+                                                  .access = ACCESS_COHERENT | ACCESS_VOLATILE);
+          nir_break_if(b, nir_ult_imm(b, nir_isub(b, header, first), count));
++         nir_def *spun = nir_iadd_imm(b, nir_load_var(b, spins), 1);
++         nir_store_var(b, spins, spun, 0x1);
++         nir_break_if(b, nir_uge(b, spun, nir_imm_int(b, 1 << 18)));
+          ac_nir_sleep(b, 64);
+       }
+       nir_pop_loop(b, loop);
+diff -ruN a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+--- a/src/amd/vulkan/radv_cmd_buffer.c	2026-11-18 14:17:33.888530541 +0000
++++ b/src/amd/vulkan/radv_cmd_buffer.c	2026-11-18 14:17:33.892530540 +0000
+@@ -13976,6 +13976,8 @@
+  * kept: the submission after the split starts with the same preamble. State
+  * that re-emission does not restore (streamout, conditional rendering, active
+  * queries, an inherited render pass) defers the split until it ends. */
++static _Thread_local unsigned radv_task_emu_depth;
++
+ static void
+ radv_split_cmd_stream_if_due(struct radv_cmd_buffer *cmd_buffer)
+ {
+@@ -13986,6 +13988,8 @@
+ 
+    if (likely(!device->ws->cs_split_due) || !device->ws->cs_split_due(cs->b))
+       return;
++   if (radv_task_emu_depth)
++      return;
+    if (state->streamout.streamout_enabled || state->streamout.hw_enabled_mask || state->cond_render.enabled ||
+        state->active_occlusion_queries || state->active_pipeline_queries || state->active_emulated_pipeline_queries ||
+        state->active_pipeline_ace_queries || state->active_prims_gen_queries || state->active_prims_xfb_queries ||
+@@ -15651,8 +15655,19 @@
+ }
+ 
+ static void
++radv_task_emu_draw_direct_body(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint32_t z);
++
++static void
+ radv_task_emu_draw_direct(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint32_t z)
+ {
++   radv_task_emu_depth++;
++   radv_task_emu_draw_direct_body(cmd_buffer, x, y, z);
++   radv_task_emu_depth--;
++}
++
++static void
++radv_task_emu_draw_direct_body(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint32_t z)
++{
+    const struct radv_physical_device *pdev = radv_device_physical(radv_cmd_buffer_device(cmd_buffer));
+    const uint32_t view_mask = cmd_buffer->state.render.view_mask;
+    struct radv_task_emu emu;
+@@ -15682,8 +15697,19 @@
+ }
+ 
+ static void
++radv_task_emu_draw_indirect_body(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info);
++
++static void
+ radv_task_emu_draw_indirect(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info)
+ {
++   radv_task_emu_depth++;
++   radv_task_emu_draw_indirect_body(cmd_buffer, info);
++   radv_task_emu_depth--;
++}
++
++static void
++radv_task_emu_draw_indirect_body(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info)
++{
+    const struct radv_physical_device *pdev = radv_device_physical(radv_cmd_buffer_device(cmd_buffer));
+    const uint32_t view_mask = cmd_buffer->state.render.view_mask;
+    struct radv_task_emu emu;
+@@ -15818,9 +15844,23 @@
+  * radv_mesh_compute_chunk, the copy as a triangle list. info is the indirect draw, or NULL with
+  * the direct draw's grid. */
+ static void
++radv_mesh_compute_draw_body(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info, uint32_t x, uint32_t y,
++                            uint32_t z);
++
++static void
+ radv_mesh_compute_draw(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info, uint32_t x, uint32_t y,
+                        uint32_t z)
+ {
++   radv_split_cmd_stream_if_due(cmd_buffer);
++   radv_task_emu_depth++;
++   radv_mesh_compute_draw_body(cmd_buffer, info, x, y, z);
++   radv_task_emu_depth--;
++}
++
++static void
++radv_mesh_compute_draw_body(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info, uint32_t x, uint32_t y,
++                            uint32_t z)
++{
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+    const struct radv_pipeline *pipeline = &cmd_buffer->state.graphics_pipeline->base;
+    struct radv_cmd_state *state = &cmd_buffer->state;
+@@ -16408,6 +16448,56 @@
+ }
+ 
+ static void
++eden_dispatch_scratch(struct radv_cmd_buffer *cmd_buffer, struct radv_cmd_stream *cs,
++                      const struct radv_shader *shader)
++{
++   static int enabled = -1;
++   if (enabled < 0) {
++      const char *const value = getenv("EDEN_RADV_DISPATCH_SCRATCH");
++      p_atomic_set(&enabled, value && value[0] == '1');
++   }
++   const uint32_t need = shader->config.scratch_bytes_per_wave;
++   if (!enabled || !need)
++      return;
++   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
++   const struct radv_physical_device *pdev = radv_device_physical(device);
++   static simple_mtx_t lock = SIMPLE_MTX_INITIALIZER;
++   static struct radeon_winsys_bo *bo;
++   static uint32_t bo_wave_bytes, bo_waves;
++   simple_mtx_lock(&lock);
++   if (need > bo_wave_bytes) {
++      const uint32_t wave_bytes = MAX2(align(need, pdev->info.scratch_wavesize_granularity), 16384u);
++      const uint32_t waves = pdev->info.max_scratch_waves;
++      struct radeon_winsys_bo *grown = NULL;
++      if (radv_bo_create(device, NULL, (uint64_t)wave_bytes * waves, 4096, RADEON_DOMAIN_VRAM,
++                         RADEON_FLAG_NO_INTERPROCESS_SHARING, RADV_BO_PRIORITY_SCRATCH, 0, true,
++                         &grown) == VK_SUCCESS) {
++         /* The previous buffer may still be in flight: it is kept. */
++         bo = grown;
++         bo_wave_bytes = wave_bytes;
++         bo_waves = waves;
++         fprintf(stderr, "radv/ps5: dispatch scratch: %u bytes a wave, %u waves\n", wave_bytes, waves);
++      }
++   }
++   struct radeon_winsys_bo *const use = bo;
++   const uint32_t wave_bytes = bo_wave_bytes, waves = bo_waves;
++   simple_mtx_unlock(&lock);
++   if (!use || wave_bytes < need)
++      return;
++   const uint64_t va = radv_buffer_get_va(use);
++   uint32_t tmpring_size;
++   ac_get_scratch_tmpring_size(&pdev->info, waves, wave_bytes, &tmpring_size);
++   radv_cs_add_buffer(device->ws, cs->b, use);
++   radeon_check_space(device->ws, cs->b, 8);
++   radeon_begin(cs);
++   radeon_set_sh_reg_seq(R_00B900_COMPUTE_USER_DATA_0, 2);
++   radeon_emit(va);
++   radeon_emit(S_008F04_BASE_ADDRESS_HI(va >> 32) | S_008F04_SWIZZLE_ENABLE_GFX6(1));
++   radeon_set_sh_reg(R_00B860_COMPUTE_TMPRING_SIZE, tmpring_size);
++   radeon_end();
++}
++
++static void
+ radv_emit_dispatch_packets(struct radv_cmd_buffer *cmd_buffer, const struct radv_shader *compute_shader,
+                            const struct radv_dispatch_info *info)
+ {
+@@ -16420,6 +16510,7 @@
+    const uint32_t grid_size_offset = radv_get_user_sgpr_loc(compute_shader, AC_UD_CS_GRID_SIZE);
+ 
+    radv_describe_dispatch(cmd_buffer, info);
++   eden_dispatch_scratch(cmd_buffer, cs, compute_shader);
+ 
+    ASSERTED unsigned cdw_max = radeon_check_space(ws, cs->b, 30);
+ 
+diff -ruN a/src/amd/vulkan/radv_device.c b/src/amd/vulkan/radv_device.c
+--- a/src/amd/vulkan/radv_device.c	2026-11-18 14:17:33.896530539 +0000
++++ b/src/amd/vulkan/radv_device.c	2026-11-18 14:17:33.896530539 +0000
+@@ -1716,9 +1716,15 @@
+          goto fail;
+    }
+ 
++   const char *const eden_no_mesh_buffers = getenv("EDEN_RADV_NO_MESH_BUFFERS");
++   const bool eden_mesh_buffers = !(eden_no_mesh_buffers && eden_no_mesh_buffers[0] == '1' &&
++                                    getenv("EDEN_NX2_NO_MESH") && !getenv("EDEN_NX2_NO_MESH_FILE"));
++   if (!eden_mesh_buffers)
++      fprintf(stderr, "radv/ps5: no mesh draws in this run: task memory and publish ring not made\n");
++
+    /* Zeroed, as every draw packet leaves it; its address goes in a record's
+     * 32 bits. */
+-   if (device->vk.enabled_features.meshShader && radv_mesh_draw_records_enabled(pdev) &&
++   if (eden_mesh_buffers && device->vk.enabled_features.meshShader && radv_mesh_draw_records_enabled(pdev) &&
+        !pdev->info.compiler_info.has_ngg_per_prim_params) {
+       result = radv_bo_create(device, NULL, AC_MS_PUBLISH_RING_BYTES, 4096, RADEON_DOMAIN_VRAM,
+                               RADEON_FLAG_NO_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_ZERO_VRAM |
+@@ -1733,7 +1739,7 @@
+    }
+ 
+    /* Its records are read through a 32-bit address. */
+-   if (device->vk.enabled_features.taskShader && radv_task_emulated(pdev)) {
++   if (eden_mesh_buffers && device->vk.enabled_features.taskShader && radv_task_emulated(pdev)) {
+       result = radv_bo_create(device, NULL, RADV_TASK_EMU_BYTES, 4096, RADEON_DOMAIN_VRAM,
+                               RADEON_FLAG_NO_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_32BIT,
+                               RADV_BO_PRIORITY_SCRATCH, 0, true, &device->task_emu_bo);
+diff -ruN a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+--- a/src/amd/vulkan/radv_physical_device.c	2026-11-18 14:17:33.892530540 +0000
++++ b/src/amd/vulkan/radv_physical_device.c	2026-11-18 14:17:33.896530539 +0000
+@@ -2719,6 +2719,7 @@
+ 
+    pdev->addrlib = ac_addrlib_create(&pdev->info, &pdev->info.max_alignment);
+    if (!pdev->addrlib) {
++      fprintf(stderr, "radv/ps5: addrlib creation failed\n");
+       result = VK_ERROR_INITIALIZATION_FAILED;
+       goto fail_wsi;
+    }
+@@ -2952,6 +2953,7 @@
+ {
+    struct radv_physical_device *pdev;
+    VkResult result = radv_physical_device_try_create((struct radv_instance *)vk_instance, NULL, &pdev);
++   if (result != VK_SUCCESS) fprintf(stderr, "radv/ps5: physical device creation result=%d\n", result);
+    if (result == VK_ERROR_INCOMPATIBLE_DRIVER || result == VK_ERROR_INITIALIZATION_FAILED)
+       return VK_SUCCESS;
+    if (result != VK_SUCCESS)
+diff -ruN a/src/amd/vulkan/radv_pipeline_cache.c b/src/amd/vulkan/radv_pipeline_cache.c
+--- a/src/amd/vulkan/radv_pipeline_cache.c	2026-11-18 14:17:33.896530539 +0000
++++ b/src/amd/vulkan/radv_pipeline_cache.c	2026-11-18 14:17:33.896530539 +0000
+@@ -5,6 +5,7 @@
+  */
+ 
+ #include "radv_pipeline_cache.h"
++#include <stdio.h>
+ #include "util/macros.h"
+ #include "util/mesa-blake3.h"
+ #include "util/u_atomic.h"
+@@ -289,6 +290,11 @@
+    assert(key_size == BLAKE3_KEY_LEN);
+    unsigned total_size = blob->end - blob->current;
+    unsigned num_shaders = blob_read_uint32(blob);
++   if (num_shaders == 0) {
++      fprintf(stderr, "radv/ps5: a cached pipeline object has no shader (written by an earlier run); "
++                      "dropped, the pipeline is compiled again\n");
++      return NULL;
++   }
+    unsigned data_size = blob_read_uint32(blob);
+ 
+    struct radv_pipeline_cache_object *object;
+@@ -470,7 +476,12 @@
+    if (!pipeline_obj)
+       return false;
+ 
+-   assert(pipeline_obj->num_shaders == 1);
++   if (pipeline_obj->num_shaders != 1 || !pipeline_obj->shaders[0]) {
++      fprintf(stderr, "radv/ps5: cached compute pipeline %016llx has no shader; compiled again\n",
++              (unsigned long long)pipeline->base.pipeline_hash);
++      vk_pipeline_cache_object_unref(&device->vk, &pipeline_obj->base);
++      return false;
++   }
+    pipeline->base.shaders[MESA_SHADER_COMPUTE] = radv_shader_ref(pipeline_obj->shaders[0]);
+ 
+    pipeline->base.cache_object = &pipeline_obj->base;
+@@ -491,6 +502,11 @@
+    for (unsigned i = 0; i < MESA_VULKAN_SHADER_STAGES; ++i)
+       num_shaders += pipeline->shaders[i] ? 1 : 0;
+    num_shaders += pipeline->gs_copy_shader ? 1 : 0;
++   if (num_shaders == 0) {
++      fprintf(stderr, "radv/ps5: pipeline %016llx has no shader, not cached\n",
++              (unsigned long long)pipeline->pipeline_hash);
++      return;
++   }
+    num_shaders += pipeline->mesh_compute ? 1 : 0;
+ 
+    struct radv_pipeline_cache_object *pipeline_obj;
+diff -ruN a/src/amd/vulkan/radv_pipeline_compute.c b/src/amd/vulkan/radv_pipeline_compute.c
+--- a/src/amd/vulkan/radv_pipeline_compute.c	2026-11-18 14:17:33.896530539 +0000
++++ b/src/amd/vulkan/radv_pipeline_compute.c	2026-11-18 14:17:33.896530539 +0000
+@@ -80,6 +80,19 @@
+    pipeline->base.need_indirect_descriptors |= radv_shader_need_indirect_descriptors(shader);
+    pipeline->base.need_push_constants_upload |= radv_shader_need_push_constants_upload(shader);
+ 
++   {
++      static int stats = -1;
++      if (stats < 0) {
++         const char *const value = getenv("EDEN_RADV_SHADER_STATS");
++         p_atomic_set(&stats, value && value[0] == '1');
++      }
++      if (stats && (shader->config.num_vgprs >= 200 || shader->config.scratch_bytes_per_wave))
++         fprintf(stderr, "radv/ps5: compute shader stats: %u VGPRs, %u SGPRs, %u spilled VGPRs, "
++                         "%u spilled SGPRs, scratch %u bytes a wave, LDS %u bytes, wave%u, code %u bytes\n",
++                 shader->config.num_vgprs, shader->config.num_sgprs, shader->config.spilled_vgprs,
++                 shader->config.spilled_sgprs, shader->config.scratch_bytes_per_wave,
++                 shader->config.lds_size, shader->info.wave_size, shader->code_size);
++   }
+    pipeline->base.push_constant_size = align(shader->info.push_constant_size, 4);
+    if (layout)
+       pipeline->base.dynamic_offset_count = layout->dynamic_offset_count;
+diff -ruN a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
+--- a/src/amd/vulkan/radv_shader.c	2026-11-18 14:17:33.896530539 +0000
++++ b/src/amd/vulkan/radv_shader.c	2026-11-18 14:17:33.896530539 +0000
+@@ -343,6 +343,8 @@
+    const struct vk_object_base *object;
+ };
+ 
++#include "util/os_time.h"
++
+ static void
+ radv_spirv_nir_debug(void *private_data, enum nir_spirv_debug_level level, size_t spirv_offset, const char *message)
+ {
+@@ -358,6 +360,8 @@
+    snprintf(buffer, sizeof(buffer), "SPIR-V offset %lu: %s", (unsigned long)spirv_offset, message);
+ 
+    vk_debug_report(debug_data->debug_report, vk_flags[level], debug_data->object, 0, 0, "radv", buffer);
++   if (level == NIR_SPIRV_DEBUG_LEVEL_ERROR)
++      fprintf(stderr, "radv/ps5: %s\n", buffer);
+ }
+ 
+ static void
+@@ -539,6 +543,19 @@
+       };
+       nir = spirv_to_nir(spirv, stage->spirv.size / 4, spec, stage->stage, stage->entrypoint, &spirv_options,
+                          &compiler_info->nir_options[stage->stage]);
++      for (unsigned attempt = 1; !nir && attempt <= 8; attempt++) {
++         fprintf(stderr, "radv/ps5: SPIR-V to NIR failed (%s, %u words, entry %s), attempt %u of 8\n",
++                 _mesa_shader_stage_to_string(stage->stage), (unsigned)(stage->spirv.size / 4),
++                 stage->entrypoint ? stage->entrypoint : "?", attempt);
++         os_time_sleep(50000);
++         nir = spirv_to_nir(spirv, stage->spirv.size / 4, spec, stage->stage, stage->entrypoint, &spirv_options,
++                            &compiler_info->nir_options[stage->stage]);
++      }
++      if (!nir) {
++         fprintf(stderr, "radv/ps5: SPIR-V to NIR failed for good: out of memory, or a module the parser "
++                         "refuses (a radv/ps5: SPIR-V offset line above says which)\n");
++         abort();
++      }
+       nir->info.internal |= is_internal;
+       assert(nir->info.stage == stage->stage);
+ 
+diff -ruN a/src/amd/vulkan/radv_shader_info.c b/src/amd/vulkan/radv_shader_info.c
+--- a/src/amd/vulkan/radv_shader_info.c	2026-11-18 14:17:33.896530539 +0000
++++ b/src/amd/vulkan/radv_shader_info.c	2026-11-18 14:17:33.896530539 +0000
+@@ -431,7 +431,7 @@
+       return 0;
+ 
+    const unsigned vertices_per_prim = mesa_vertices_per_prim(nir->info.mesh.primitive_type);
+-   return MAX2(DIV_ROUND_UP(nir->info.mesh.max_primitives_out * vertices_per_prim, 256), 1);
++   return MAX2(DIV_ROUND_UP(nir->info.mesh.max_primitives_out, 256 / vertices_per_prim), 1);
+ }
+ 
+ static void
+diff -ruN a/src/amd/vulkan/winsys/ps5/radv_ps5_platform.c b/src/amd/vulkan/winsys/ps5/radv_ps5_platform.c
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_platform.c	2026-11-18 14:17:33.896530539 +0000
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_platform.c	2026-11-18 14:17:33.896530539 +0000
+@@ -320,6 +320,9 @@
+ 
+    void *address = hint;
+    int32_t result = sceKernelMapDirectMemory(&address, bytes, RADV_PS5_PROTECTION, 0, physical, alignment);
++   if (result != 0)
++      fprintf(stderr, "radv/ps5: mapping of %llu bytes at %p refused: 0x%08x (at 0: no %u granules in a row)\n",
++              (unsigned long long)bytes, hint, (unsigned)result, (unsigned)DIV_ROUND_UP(bytes, RADV_PS5_LARGE_BYTES));
+    if (result != 0 && hint != NULL) {
+       radv_ps5_granules_give(&radv_ps5_region, granule, granules);
+       granules = 0;
+@@ -336,6 +339,7 @@
+                        (window32 ? radv_ps5_window_contains(va, bytes)
+                                  : va < RADV_PS5_GPU_ADDRESS_LIMIT && bytes <= RADV_PS5_GPU_ADDRESS_LIMIT - va);
+    if (!placed) {
++      fprintf(stderr, "radv/ps5: mapping rejected result=%d address=%p bytes=%llu window32=%d\n", result, address, (unsigned long long)bytes, window32);
+       if (result == 0 && address != NULL)
+          sceKernelMunmap(address, bytes);
+       radv_ps5_granules_give(&radv_ps5_region, granule, granules);
+@@ -523,9 +527,13 @@
+ radv_ps5_map_fixed(uint8_t *at, uint64_t bytes, int64_t physical)
+ {
+    void *address = at;
+-   return sceKernelMapDirectMemory(&address, bytes, RADV_PS5_PROTECTION, PS5_KERNEL_MAP_FIXED, physical,
+-                                   RADV_PS5_PAGE_BYTES) == 0 &&
+-          address == at;
++   const int32_t result = sceKernelMapDirectMemory(&address, bytes, RADV_PS5_PROTECTION, PS5_KERNEL_MAP_FIXED, physical,
++                                                   RADV_PS5_PAGE_BYTES);
++   static uint32_t reported;
++   if (result != 0 && p_atomic_inc_return(&reported) <= 16)
++      fprintf(stderr, "radv/ps5: fixed mapping of %llu bytes at %p refused: 0x%08x\n", (unsigned long long)bytes,
++              (void *)at, (unsigned)result);
++   return result == 0 && address == at;
+ }
+ 
+ /* A device-memory buffer the pool has no single free range for is backed by
+@@ -723,8 +731,10 @@
+    } else {
+       granule = replayable ? radv_ps5_granules_take_top(&radv_ps5_region, granules, 1)
+                            : radv_ps5_granules_take(&radv_ps5_region, granules, 1);
+-      if (granule == UINT32_MAX)
++      if (granule == UINT32_MAX) {
++         fprintf(stderr, "radv/ps5: sparse range of %u granules refused: none free in a row\n", (unsigned)granules);
+          return false;
++      }
+    }
+    uint8_t *const va = (uint8_t *)(uintptr_t)(RADV_PS5_REGION_BASE + (uint64_t)granule * RADV_PS5_LARGE_BYTES);
+    const uint64_t span = (uint64_t)granules * RADV_PS5_LARGE_BYTES;
+@@ -910,11 +920,31 @@
+ bool
+ radv_ps5_memory_grant_gpu(void *address, uint64_t bytes)
+ {
+-   /* A title's anonymous memory takes GPU access this way, and a shader then
+-    * writes it through the CPU's address (HARDWARE_FINDINGS.md, 2026-09-27). */
+-   return sceKernelMprotect(address, bytes,
+-                            PS5_KERNEL_PROT_CPU_READ | PS5_KERNEL_PROT_CPU_WRITE | PS5_KERNEL_PROT_GPU_READ |
+-                               PS5_KERNEL_PROT_GPU_WRITE) == 0;
++   const uint32_t required = PS5_KERNEL_PROT_CPU_READ | PS5_KERNEL_PROT_CPU_WRITE |
++                             PS5_KERNEL_PROT_GPU_READ | PS5_KERNEL_PROT_GPU_WRITE;
++   const uintptr_t begin = (uintptr_t)address;
++   if (!begin || !bytes || bytes > UINTPTR_MAX - begin)
++      return false;
++   const uintptr_t limit = begin + bytes;
++   uintptr_t cursor = begin;
++   /* VideoOut already registered these GPU-visible pages. Do not change their
++    * protection again: validate the entire imported range, including subviews. */
++   while (cursor < limit) {
++      void *start = NULL, *end = NULL;
++      uint32_t protection = 0;
++      if (sceKernelQueryMemoryProtection((void *)cursor, &start, &end, &protection) != 0 ||
++          (uintptr_t)start > cursor || (uintptr_t)end <= cursor ||
++          (protection & required) != required)
++         break;
++      cursor = (uintptr_t)end;
++   }
++   if (cursor >= limit)
++      return true;
++   const int32_t result = sceKernelMprotect(address, bytes, required);
++   if (result != 0)
++      fprintf(stderr, "radv/ps5: host GPU protection failed address=%p bytes=%llu result=0x%08x\n",
++              address, (unsigned long long)bytes, (unsigned)result);
++   return result == 0;
+ }
+ 
+ void
+diff -ruN a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c	2026-11-18 14:17:33.896530539 +0000
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.c	2026-11-18 14:17:33.896530539 +0000
+@@ -34,13 +34,18 @@
+ radv_ps5_queue_create(void)
+ {
+    struct radv_ps5_queue *const queue = &radv_ps5_queue_storage;
+-   if (!radv_ps5_platform_init())
++   if (!radv_ps5_platform_init()) {
++      fprintf(stderr, "radv/ps5: queue platform initialization failed\n");
+       return;
++   }
+    /* The words the GPU runs and the marker it writes live in the window, where
+     * ps5vk's submission buffer has always been. */
+-   if (!radv_ps5_memory_alloc(RADV_PS5_RING_BYTES, RADV_PS5_LARGE_BYTES, true, &queue->ring))
++   if (!radv_ps5_memory_alloc(RADV_PS5_RING_BYTES, RADV_PS5_LARGE_BYTES, true, &queue->ring)) {
++      fprintf(stderr, "radv/ps5: queue ring allocation failed\n");
+       return;
++   }
+    if (!radv_ps5_memory_alloc(RADV_PS5_PAGE_BYTES, RADV_PS5_PAGE_BYTES, true, &queue->marker_memory)) {
++      fprintf(stderr, "radv/ps5: queue marker allocation failed\n");
+       radv_ps5_memory_free(&queue->ring);
+       return;
+    }

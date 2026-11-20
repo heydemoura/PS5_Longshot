@@ -1785,10 +1785,12 @@ int main(int argc, char** argv) {
     std::set<std::string> seen;
     for (const Call& c : ref) seen.insert(c.op);
     int missing = 0;
+    // (OP_END_DEFERRED, rec::end_deferred's packed vkEndCommandBuffer, is no vkCmd* of the frame: its order and its switch are
+    // checked by tests/test_recorder_own_idle.py's end_deferred and end_direct cases)
     for (uint32_t op = 0; op < rec::OP_COUNT; op++)
-        if (!seen.count(rec::op_name(op))) std::printf("NOT COVERED %s\n", rec::op_name(op)), missing++;
+        if (op != rec::OP_END_DEFERRED && !seen.count(rec::op_name(op))) std::printf("NOT COVERED %s\n", rec::op_name(op)), missing++;
     if (missing) failures++;
-    else std::printf("PASS coverage: all %d packed calls made by the frame\n", (int)rec::OP_COUNT);
+    else std::printf("PASS coverage: all %d packed calls made by the frame\n", (int)rec::OP_COUNT - 1);
     std::printf(failures ? "FAILED (%d)\n" : "ALL PASS\n", failures);
     return failures ? 1 : 0;
 }

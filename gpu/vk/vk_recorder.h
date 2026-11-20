@@ -109,6 +109,7 @@ enum Op : uint16_t {
 #define RX_REC_OP(f) OP_##f,
     RX_REC_CALLS(RX_REC_OP, RX_REC_OP)
 #undef RX_REC_OP
+    OP_END_DEFERRED,   // (ps5-overlap: end_deferred's vkEndCommandBuffer, RX_VK_RECORDER_END)
     OP_COUNT
 };
 inline const char* op_name(uint32_t op) {
@@ -116,7 +117,9 @@ inline const char* op_name(uint32_t op) {
 #define RX_REC_NAME(f) #f,
         RX_REC_CALLS(RX_REC_NAME, RX_REC_NAME)
 #undef RX_REC_NAME
+        "vkEndCommandBuffer (deferred)",
     };
+    static_assert(sizeof names / sizeof names[0] == OP_COUNT, "every op is named");
     return op < OP_COUNT ? names[op] : "?";
 }
 
@@ -167,6 +170,9 @@ inline bool g_stats_log = true;   // (RX_VK_RECORDER_STATS=0: no stats line ever
 /// (THREAD) RX_VK_RECORDER_OWN=1: a recording slot's own command pool resets and begins, and its descriptor pool's reset, at the
 /// slot's reuse, without the wait for the recorder (OwnSlot, below). Read when the mode is: tests change it
 inline bool g_own = false;
+/// (THREAD, ps5-overlap) RX_VK_RECORDER_END=1: a recording's own vkEndCommandBuffer at its submit is a packet (end_deferred, below)
+/// rather than a wait for the ring. Read when the mode is: tests change it
+inline bool g_end_deferred = false;
 /// (THREAD) RX_VK_RECORDER_IDLE=wait: with nothing to run the recorder spins 20 us, then waits on W itself (WaitOnAddress; the
 /// futex under host/posix's on Linux), and a publish wakes it; unset or spin: the spin above and a condition variable, as before.
 /// Read when the mode is; off again at the recorder's start without the two functions below: tests change it
@@ -194,6 +200,11 @@ inline int mode_from_env(bool* refused) {
     if (!strcmp(e, "sync")) return SYNC;
     if (!strcmp(e, "defer") || !strcmp(e, "thread")) {
         if (!parallel_configured()) return e[0] == 'd' ? DEFER : THREAD;
+        // (ps5-overlap) RX_VK_RECORDER_PARALLEL=1: the recorder thread with the parallel replay too. While its segments are
+        // recorded (par_active) every call is made directly on the worker that makes it (Enc::begin_thread: PASS, after what
+        // was published has run); the replay thread is the producer outside them, and its submit before the segments waits
+        // for the ring (a boundary). DEFER stays refused: its held packets are the recording thread's own
+        if (e[0] == 't' && env_on("RX_VK_RECORDER_PARALLEL")) return THREAD;
         *refused = true;
         return OFF;
     }
@@ -210,6 +221,7 @@ inline int mode_init() {
         if (const char* s = getenv("RX_VK_RECORDER_STATS")) g_stats_log = atoi(s) != 0;
         if (const char* s = getenv("RX_VK_RECORDER_SPIN_US")) g_spin_ns = (uint64_t)std::max(1, atoi(s)) * 1000;
         g_own = env_on("RX_VK_RECORDER_OWN");
+        g_end_deferred = env_on("RX_VK_RECORDER_END");
         const char* idle = getenv("RX_VK_RECORDER_IDLE");
         g_idle_wait = idle && !strcmp(idle, "wait");
     }
@@ -729,6 +741,12 @@ inline void boundary(Bound k) {
         else if (unordered(k)) return;
         else if (t_own_slot && own_slot_call(k)) return;   // (RX_VK_RECORDER_OWN: a slot's own resets, OwnSlot)
         else if (Recorder* g = t_prod) g->wait_idle(k);
+        // (longshot, PS5 2026-11-18) a thread without the replay lock too: a pipeline-build worker's vkDestroyPipeline of the
+        // quick build its full one replaces, while the replay held a packet that binds it, freed the pipeline before the
+        // recorder ran the bind; the driver read its shader address from freed memory and the GPU fetched instructions at
+        // 0xead028000 (SQC Inst fault, the title ended on entering an area). It waits until the recorder has run what was
+        // published when it came, as a direct call on the replay thread would have been made after those binds
+        else g_rec.foreign_wait();
     }
 }
 
@@ -1226,5 +1244,22 @@ RX_REC_PACKER void pk_vkCmdSetCheckpointNV(VkCommandBuffer cb, const void* marke
     e.emit(OP_vkCmdSetCheckpointNV, [=] { ::vkx::vkCmdSetCheckpointNV(cb, marker); }, [&] { ::vkx::vkCmdSetCheckpointNV(cb, marker); });
 }
 inline constexpr auto& rx_vkCmdSetCheckpointNV = Route<::vkx::vkCmdSetCheckpointNV, pk_vkCmdSetCheckpointNV>::call;
+
+/// (THREAD, ps5-overlap, RX_VK_RECORDER_END=1) vkEndCommandBuffer of a recording's own command buffers at its submit
+/// (vk_replay.cpp submit_recording), as a packet the recorder runs after the commands before it, not a wait for the ring. On PS5
+/// the replay waited for the recorder at each part's ends 5,476 times in 10 s, 301 ms of the 423 it waited in all. What needs
+/// the end done waits for the ring anyway: the submit (vkQueueSubmit2, a boundary, on the producer or on a thread flushing a
+/// held batch, foreign_wait), and a reset of the command buffer's pool (a boundary; with RX_VK_RECORDER_OWN, slot_begin checks
+/// the recorder is past the slot's last end, rec_end_pos taken after this packet). Off, or the mode not THREAD: the boundary
+/// and the call, as the vk_work.h macro makes them. The end's result was never looked at
+inline void end_deferred(VkCommandBuffer cb) {
+    const auto direct = [&] {
+        boundary(B_vkEndCommandBuffer);
+        ::vkx::vkEndCommandBuffer(cb);
+    };
+    if (!g_end_deferred || mode() != THREAD || !t_prod) return direct();   // (not the ring's producer: as before)
+    Enc e;
+    e.emit(OP_END_DEFERRED, [=] { ::vkx::vkEndCommandBuffer(cb); }, direct);
+}
 
 } // namespace mkwvk::rec
