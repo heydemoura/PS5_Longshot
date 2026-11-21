@@ -1162,6 +1162,45 @@ size_t program_cache_drop_modules() {
     return dropped;
 }
 
+#ifdef __PROSPERO__
+/// (PS5) The modules of compute programs whose pipeline is built, let go during play (texture_frame, every 600 frames):
+/// the driver keeps nothing of a module once its pipeline is made, and a compute program's pipeline is not made again from
+/// it (program_cache_drop_modules does the same after a precompile, which the console does not run). Shader modules held
+/// 189 MiB of the heap, growing, when direct memory ran out (2026-11-18). The locks are only tried: a walk that would wait
+/// is left for the next time. RX_VK_KEEP_MODULES=1: kept
+size_t program_drop_compute_modules() {
+    static const bool keep = env_on("RX_VK_KEEP_MODULES");
+    if (keep) return 0;
+    std::unique_lock sk(shader_mu, std::try_to_lock);
+    if (!sk.owns_lock()) return 0;
+    std::unique_lock lk(light_mu, std::try_to_lock);
+    if (!lk.owns_lock()) return 0;
+    std::unique_lock rk(module_remake::mu, std::try_to_lock);
+    if (!rk.owns_lock()) return 0;
+    size_t dropped = 0;
+    for (auto& kv : programs)
+        for (auto& p : kv.second) {
+            if (!p || !p->ready.load(std::memory_order_acquire) || p->failed) continue;
+            if (p->compute) {
+                if ((p->compute_pipeline != VK_NULL_HANDLE || p->compute_state.load(std::memory_order_acquire) == 2) &&
+                    !p->stages.empty() && p->stages[0].module) {
+                    vkDestroyShaderModule(dev.device, p->stages[0].module, nullptr);
+                    p->stages[0].module = VK_NULL_HANDLE;
+                    dropped++;
+                }
+            } else if (p->fallback && p->compute_state.load(std::memory_order_acquire) == 2) {
+                for (Stage& st : p->stages)
+                    if (st.module && st.vk_stage == VK_SHADER_STAGE_COMPUTE_BIT) {
+                        vkDestroyShaderModule(dev.device, st.module, nullptr);
+                        st.module = VK_NULL_HANDLE;
+                        dropped++;
+                    }
+            }
+        }
+    return dropped;
+}
+#endif
+
 /// (longshot, the prepare's driver part: vk_draw.cpp warm_libraries) the key of every kept graphics and mesh program, whoever made
 /// it (the seed, a state list, play), in the file's order, from the list of records alone: program_cache_each reads every record
 /// for its list, the whole file (6.7 GB with every program of the game). *loaded: the variants read in already, whose records

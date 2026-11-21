@@ -85,8 +85,10 @@ def main():
     parser.add_argument("--cxx", default="g++")
     cxx = parser.parse_args().cxx
     src = (ROOT / "gpu/vk/vk_draw.cpp").read_text(encoding="utf-8")
-    draw = src.index("void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {")
-    helpers = src[src.index("static bool writes_memory"):draw]
+    # (the PC's draw(); before it, the PS5's draw() that wraps draw_body, the same body, in a std::bad_alloc catch: the
+    # helpers end where that starts)
+    draw = src.index("#else\nvoid draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {")
+    helpers = src[src.index("static bool writes_memory"):src.index("#ifdef __PROSPERO__\nvoid draw_body(")]
     at = draw
     for step in STEPS:
         at = src.index(step, at)   # (ValueError: missing, or out of order)

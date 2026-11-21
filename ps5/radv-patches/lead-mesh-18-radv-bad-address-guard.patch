@@ -1,0 +1,83 @@
+radv/ps5: a buffer or vertex-buffer descriptor at an address no PS5 mapping can have is written empty (after lead-mesh-17)
+
+The console grants no address at or above 1 TiB and a GPU address is the CPU's (radv_ps5_bo.c), so a descriptor whose
+address is up there is garbage. Ocarina of Time on Longshot, 2026-11-18 18:5x: a vertex shader's fetch (program
+79323d04f98f23d3's, its first tbuffer loads) read 0x788001c0000 and the GPU fault ended the title; an earlier one read 0.
+radv_write_vertex_descriptor and radv_write_buffer_descriptor (vkUpdateDescriptorSets, templates, push descriptors) write
+such a descriptor empty, which reads zeros under robust access, and say so: up to 32 lines, the address, range, binding
+or descriptor type, and the graphics pipeline (lead-mesh-17's log names its program).
+
+diff -ruN a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+--- a/src/amd/vulkan/radv_cmd_buffer.c	2026-11-18 16:25:38.895424870 +0000
++++ b/src/amd/vulkan/radv_cmd_buffer.c	2026-11-18 19:13:51.193930218 +0000
+@@ -9,6 +9,7 @@
+  */
+ 
+ #include "radv_cmd_buffer.h"
++#include "radv_descriptors.h"   /* (lead-mesh-18: RADV_PS5_BAD_VA) */
+ #include "radv_gs_compute.h"
+ #ifdef RADV_GS_COMPUTE
+ #include <stdlib.h>
+@@ -6990,6 +6991,15 @@
+       return;
+    }
+ 
++#ifdef RADV_PS5
++   /* (lead-mesh-18) a vertex buffer bound at an address no mapping can have: empty, said (radv_descriptors.h) */
++   if (RADV_PS5_BAD_VA(vbo_info.va)) {
++      radv_ps5_bad_address("vertex buffer", i, vbo_info.va, vbo_info.size,
++                           (const void *)cmd_buffer->state.graphics_pipeline);
++      memset(desc, 0, 4 * 4);
++      return;
++   }
++#endif
+    const unsigned stride = vbo_info.stride;
+    uint32_t num_records = vbo_info.size;
+ 
+diff -ruN a/src/amd/vulkan/radv_descriptor_set.c b/src/amd/vulkan/radv_descriptor_set.c
+--- a/src/amd/vulkan/radv_descriptor_set.c	2026-11-17 21:27:41.023102412 +0000
++++ b/src/amd/vulkan/radv_descriptor_set.c	2026-11-18 19:13:37.169932453 +0000
+@@ -718,3 +718,14 @@
+    radv_update_descriptor_sets_impl(device, cmd_buffer, dstSetOverride, descriptorWriteCount, pDescriptorWrites,
+                                     descriptorCopyCount, pDescriptorCopies);
+ }
++
++#ifdef RADV_PS5
++void
++radv_ps5_bad_address(const char *what, unsigned index, uint64_t va, uint64_t range, const void *where)
++{
++   static uint32_t told;
++   if (p_atomic_inc_return(&told) <= 32)
++      fprintf(stderr, "radv/ps5: %s %u at %llx (range %llu) is outside every mapping: written empty, reads zeros (pipeline %p)\n",
++              what, index, (unsigned long long)va, (unsigned long long)range, where);
++}
++#endif
+diff -ruN a/src/amd/vulkan/radv_descriptors.h b/src/amd/vulkan/radv_descriptors.h
+--- a/src/amd/vulkan/radv_descriptors.h	2026-11-17 21:27:41.023102412 +0000
++++ b/src/amd/vulkan/radv_descriptors.h	2026-11-18 19:13:37.169932453 +0000
+@@ -43,10 +43,25 @@
+    memcpy(dst, buffer_view->state, RADV_BUFFER_DESC_SIZE);
+ }
+ 
++#ifdef RADV_PS5
++/* (lead-mesh-18) The console grants no address at or above 1 TiB, and a GPU address is the CPU's: a buffer descriptor's
++ * address there is garbage (a buffer freed before it was written), and the GPU faults on it and the title ends (Ocarina
++ * of Time on Longshot, 2026-11-18: a vertex fetch at 0x788001c0000). Written empty instead, which reads zeros, and said. */
++#define RADV_PS5_BAD_VA(va) ((va) >= (1ull << 40))
++void radv_ps5_bad_address(const char *what, unsigned index, uint64_t va, uint64_t range, const void *where);
++#endif
++
+ static ALWAYS_INLINE void
+ radv_write_buffer_descriptor(struct radv_device *device, VkDescriptorType descriptor_type, unsigned *dst, uint64_t va,
+                              uint64_t range)
+ {
++#ifdef RADV_PS5
++   if (RADV_PS5_BAD_VA(va)) {
++      radv_ps5_bad_address("buffer descriptor", (unsigned)descriptor_type, va, range, NULL);
++      memset(dst, 0, 4 * 4);
++      return;
++   }
++#endif
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+ 
+    if (!va) {

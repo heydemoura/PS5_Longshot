@@ -1,0 +1,82 @@
+radv/ps5: LONGSHOT_RADV_SHADER_LOG=1 names each pipeline's shaders' GPU addresses (after lead-mesh-16)
+
+A GPU page fault ends the title with the console's crash dump, which gives the faulting waves' code address and nothing
+else (Ocarina of Time on Longshot, 2026-11-18 18:19: 49 waves at 0x800000020F58CD40 read an unmapped page). With the
+switch on, every graphics, library and compute pipeline made is a line: its handle, each stage's shader address and
+size, the GS copy shader and the mesh shader's compute pass. The title says which program a handle is.
+
+diff -ruN a/src/amd/vulkan/radv_pipeline.c b/src/amd/vulkan/radv_pipeline.c
+--- a/src/amd/vulkan/radv_pipeline.c	2026-11-18 13:39:36.324869964 +0000
++++ b/src/amd/vulkan/radv_pipeline.c	2026-11-18 18:28:26.538323843 +0000
+@@ -1338,3 +1338,29 @@
+       break;
+    }
+ }
++
++void
++radv_ps5_log_pipeline(const struct radv_pipeline *pipeline, const char *kind)
++{
++   static int on = -1;
++   if (on < 0) {
++      const char *const e = getenv("LONGSHOT_RADV_SHADER_LOG");
++      p_atomic_set(&on, e && e[0] == '1');
++   }
++   if (!on || !pipeline)
++      return;
++   char line[640];
++   int n = snprintf(line, sizeof(line), "radv/ps5: %s pipeline %p:", kind, (const void *)pipeline);
++   for (unsigned i = 0; i < MESA_VULKAN_SHADER_STAGES && n < (int)sizeof(line) - 48; i++) {
++      const struct radv_shader *s = pipeline->shaders[i];
++      if (s)
++         n += snprintf(line + n, sizeof(line) - n, " stage%u %llx+%x", i, (unsigned long long)s->va, (unsigned)s->code_size);
++   }
++   if (pipeline->gs_copy_shader && n < (int)sizeof(line) - 48)
++      n += snprintf(line + n, sizeof(line) - n, " gscopy %llx+%x", (unsigned long long)pipeline->gs_copy_shader->va,
++                    (unsigned)pipeline->gs_copy_shader->code_size);
++   if (pipeline->mesh_compute && n < (int)sizeof(line) - 48)
++      n += snprintf(line + n, sizeof(line) - n, " meshcompute %llx+%x", (unsigned long long)pipeline->mesh_compute->va,
++                    (unsigned)pipeline->mesh_compute->code_size);
++   fprintf(stderr, "%s\n", line);
++}
+diff -ruN a/src/amd/vulkan/radv_pipeline.h b/src/amd/vulkan/radv_pipeline.h
+--- a/src/amd/vulkan/radv_pipeline.h	2026-11-18 14:15:47.500557769 +0000
++++ b/src/amd/vulkan/radv_pipeline.h	2026-11-18 18:28:26.538323843 +0000
+@@ -129,3 +129,8 @@
+                                                           mesa_shader_stage *stage);
+ 
+ #endif /* RADV_PIPELINE_H */
++
++/* (lead-mesh-17) LONGSHOT_RADV_SHADER_LOG=1: a line for each pipeline made, its handle and each shader's GPU address and size,
++ * the mesh shader's compute pass too. A GPU fault's wave address (the console's crash dump) then names its shader; the
++ * title logs which of its programs a handle is (gpu/vk/vk_draw.cpp). */
++void radv_ps5_log_pipeline(const struct radv_pipeline *pipeline, const char *kind);
+diff -ruN a/src/amd/vulkan/radv_pipeline_compute.c b/src/amd/vulkan/radv_pipeline_compute.c
+--- a/src/amd/vulkan/radv_pipeline_compute.c	2026-11-18 14:17:33.896530539 +0000
++++ b/src/amd/vulkan/radv_pipeline_compute.c	2026-11-18 18:28:26.538323843 +0000
+@@ -320,6 +320,7 @@
+    radv_pipeline_report_pso_history(device, &pipeline->base);
+ 
+    *pPipeline = radv_pipeline_to_handle(&pipeline->base);
++   radv_ps5_log_pipeline(&pipeline->base, "compute");
+    radv_rmv_log_compute_pipeline_create(device, &pipeline->base, pipeline->base.is_internal);
+    return VK_SUCCESS;
+ }
+diff -ruN a/src/amd/vulkan/radv_pipeline_graphics.c b/src/amd/vulkan/radv_pipeline_graphics.c
+--- a/src/amd/vulkan/radv_pipeline_graphics.c	2026-11-18 14:38:37.992354898 +0000
++++ b/src/amd/vulkan/radv_pipeline_graphics.c	2026-11-18 18:28:26.538323843 +0000
+@@ -3571,6 +3571,7 @@
+    radv_pipeline_report_pso_history(device, &pipeline->base);
+ 
+    *pPipeline = radv_pipeline_to_handle(&pipeline->base);
++   radv_ps5_log_pipeline(&pipeline->base, "graphics");
+    radv_rmv_log_graphics_pipeline_create(device, &pipeline->base, pipeline->base.is_internal);
+    return VK_SUCCESS;
+ }
+@@ -3720,6 +3721,7 @@
+    radv_pipeline_report_pso_history(device, &pipeline->base.base);
+ 
+    *pPipeline = radv_pipeline_to_handle(&pipeline->base.base);
++   radv_ps5_log_pipeline(&pipeline->base.base, "library");
+ 
+    return VK_SUCCESS;
+ }

@@ -308,7 +308,8 @@ def check_watchdog(cxx, tmp):
     internal = (ROOT / "gpu/vk/vk_internal.h").read_text(encoding="utf-8")
     pieces = [block(main, "int64_t steady_ms() {"), "std::atomic<int64_t> last_log_ms{0};\n",
               internal[internal.index("enum LogLevel"):internal.index(";", internal.index("enum LogLevel")) + 1],
-              block(main, "static void vlogf("), block(main, "void logf(const char* fmt, ...) {"), watch]
+              # (the lines vlogf leaves out: RX_VK_LOG_LEVEL and RX_VK_QUIET_STATS, unset here: none)
+              block(main, "static bool log_left_out("), block(main, "static void vlogf("), block(main, "void logf(const char* fmt, ...) {"), watch]
     exe = compile_run(cxx, "watchdog", WATCH_HEAD + "\n".join(pieces) + WATCH_MAIN, tmp)
     for case, code, need, never in (
             ("stuck", 4, ["waiting on the GPU driver or the disk", "the predicted pipelines (5 of 10)", "STOPPED"], ["faulted"]),

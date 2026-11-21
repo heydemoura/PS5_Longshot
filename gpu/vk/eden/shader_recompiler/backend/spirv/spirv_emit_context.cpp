@@ -401,7 +401,15 @@ Id CasFunction(EmitContext& ctx, Operation operation, Id value_type) {
 // only matters when the exchange never returns what it was given, as for a word out of bounds under robust buffer
 // access (seen on Intel Arc B390: no device loss, the frame never came back). One attempt counts: the condition to
 // leave the loop is success, or this many attempts made.
+// (PS5) 65536: the GPU (RDNA2, GFX10.3) has no float add on buffers in RADV (shaderBufferFloat32AtomicAdd is GFX11+), so
+// every RED/ATOM.ADD.F32 is this loop, and a word thousands of invocations add into (a light sum) can see more than 1024
+// others win in between: the add given up on is lost. Suspected for objects dark until a light reaches them at night
+// (heydemoura/PS5_Longshot #5, the PC on non-Nvidia cards too). An out-of-bounds word still leaves, 64 times later
+#ifdef __PROSPERO__
+constexpr u32 CAS_LOOP_MAX_TRIES = 65536;
+#else
 constexpr u32 CAS_LOOP_MAX_TRIES = 1024;
+#endif
 
 Id CasTriesVariable(EmitContext& ctx) {
     const Id tries_var{ctx.AddLocalVariable(ctx.TypePointer(spv::StorageClass::Function, ctx.U32[1]),
@@ -1066,11 +1074,21 @@ void EmitContext::DefineWriteStorageCasLoopFunction(const Info& info) {
 }
 
 // (longshot) The page table of guest memory for pointers no bound buffer holds: 4 KB pages from this base, a device address each
+// (PS5: the windows where the PS5 build puts them, gpu/vk/page_table_census.h kPageWindows: the heap from 16 GiB, the address
+// regions below 64 GiB. The PC's held no pool on the console, and every pointer no bound buffer holds read 0)
+#if defined(__PROSPERO__)
+constexpr unsigned long long kGuestPagesBase = 0x400000000ull;
+#else
 constexpr unsigned long long kGuestPagesBase = 0x1000000000ull;
+#endif
 constexpr unsigned long long kGuestPagesBytes = 8ull << 30;
 // (a second window, its entries after the first's: the pools the game's GPU allocator puts at 0x7fxxxxxxxx, where its storage
 // buffers are. Pointers there read 0 with the first alone)
+#if defined(__PROSPERO__)
+constexpr unsigned long long kGuestPagesBase2 = 0xf00000000ull;
+#else
 constexpr unsigned long long kGuestPagesBase2 = 0x7f00000000ull;
+#endif
 constexpr unsigned long long kGuestPagesBytes2 = 4ull << 30;
 
 void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {

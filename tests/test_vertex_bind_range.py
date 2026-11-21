@@ -33,7 +33,7 @@ def main():
     p.add_argument("--cxx", default="g++")
     a = p.parse_args()
     source = (ROOT / "gpu" / "vk" / "vk_draw.cpp").read_text(encoding="utf-8")
-    draw = block(source, "void draw(")
+    draw = block(source, "#else\nvoid draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {")   # (the PC's draw(): on the PS5 one wraps draw_body, the same body, in a std::bad_alloc catch)
     ask = "vertex_bind_range(vbufs, voffs, vsizes, vstrides, last_vb.b, last_vb.o, last_vb.z, last_vb.s, last_vb_valid, &vb_first, &vb_count);"
     bind = "vkCmdBindVertexBuffers2(cmd, vb_first, vb_count, vbufs + vb_first, voffs + vb_first, vsizes + vb_first, vstrides + vb_first);"
     for needle in (ask, bind, '"RX_VK_VB_RANGE"', "if (vb_count && vb_all) vb_first = 0, vb_count = 16;"):

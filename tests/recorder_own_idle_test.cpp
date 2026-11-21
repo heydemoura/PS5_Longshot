@@ -527,6 +527,38 @@ int main(int argc, char** argv) {
         pass(c);
     }
 
+    // (ps5-overlap, RX_VK_RECORDER_END=1: a recording's end at its submit, rec::end_deferred) with a packet in flight (the
+    // recorder held), end_deferred returns without waiting and the end has not reached the driver; once let go, the recorder runs
+    // the end after that packet, and a submit (a boundary) finds it run. Off: the end waits for the packet, then is made
+    if (c.rfind("end_", 0) == 0) {
+        warm_up();
+        g_ran = 0, g_ran_at = -1;
+        replay_mu.lock();
+        packet_in_flight();
+        watchdog();
+        rec::g_test_producer_waits = open_gate;   // (a wait lets the packet run then: the end reaches the driver after it)
+        rec::end_deferred(kCmd);
+        rec::g_test_producer_waits = nullptr;
+        const int at_return = g_ran_at;
+        if (c == "end_deferred") {
+            if (!rec::g_end_deferred) fail("RX_VK_RECORDER_END=1 expected");
+            if (at_return != -1) fail("the deferred end waited for the recorder, or reached the driver before the packet ahead of it");
+            open_gate();
+            (void)vkQueueSubmit2((VkQueue)(uintptr_t)0x50, 0, nullptr, VK_NULL_HANDLE);   // (a boundary: the ring run first)
+            if (g_ran_at != 1) fail("the deferred end was not run, in order after the packet ahead of it, by the time of the submit");
+        } else if (c == "end_direct") {
+            if (rec::g_end_deferred) fail("RX_VK_RECORDER_END off expected");
+            if (at_return != 1) fail("with the switch off the end did not wait for the packet ahead of it");
+        } else {
+            return 2;
+        }
+        open_gate();
+        replay_mu.unlock();
+        g_done = g_armed.load();
+        if (g_watchdog) fail("a wait for the recorder held in its packet (3 s watchdog)");
+        pass(c);
+    }
+
     if (c == "idle_default") {   // (RX_VK_RECORDER_IDLE unset: the condition variable as before, WaitOnAddress never called)
         rec::g_wait_on_address = fake_wait, rec::g_wake_by_address = fake_wake;
         warm_up();

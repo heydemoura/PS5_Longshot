@@ -36,7 +36,18 @@ EXE = ".exe" if os.name == "nt" else ""
 # textures (the Pro's 1024 take 135 MB more in the forest). The switches go in longshot_env.txt in the title folder, which
 # the title reads at its start (host/hos_main.c); a line the player adds there afterwards is theirs.
 MODELS = {
-    "base": {"name": "PS5 / PS5 Slim", "attribute3": 0x140040, "env": {"RX_VK_TEX_MAX_DIM": "512"}},
+    # (base: the console's 12,016 MiB, played through Hyrule Castle Town and Kokiri Forest on a base PS5 with no crash:
+    # the game's cold pages to a swap file on the extended drive (host/ps5/guest_swap_ps5.inc, 4 GiB at most, 2 GiB of the
+    # drive left free; no drive at /mnt/ext1: no swap), the last 1.5 GiB kept for the game (vk_texture.cpp ps5_tex_reserve),
+    # the renderer's pools, streams and staging smaller, textures of 256K texels and up in memory of their own, and mesh
+    # shaders through the driver's mesh-as-compute (ps5/radv-patches lead-mesh-05..19: hair and plants as on the Switch 2)
+    "base": {"name": "PS5 / PS5 Slim", "attribute3": 0x140040, "env": {
+        "RX_VK_TEX_MAX_DIM": "512", "HOS_PS5_SWAP": "1", "HOS_PS5_TEX_RESERVE_MB": "1536",
+        "EDEN_RADV_UPLOAD_TRIM_KIB": "512", "RX_VK_TARGET_POOL_MB": "64", "RX_VK_STAGING_KEEP_MB": "0", "RX_VK_STAGING_IDLE_S": "5",
+        "RX_VK_STREAM_MB": "1", "RX_VK_CAP_MIN_MB": "1", "RX_VK_DESC_POOL_DIV": "16", "RX_VK_IMAGE_BLOCK_MB": "16",
+        "RX_VK_PS5_OWN_TEXELS": "262144",
+        "RX_VK_MESH_SHADERS": "native", "EDEN_NX2_RADV_MESH_COMPUTE": "1", "EDEN_NX2_RADV_MESH_COMPUTE_LONE": "1",
+        "EDEN_NX2_RADV_MESH_COMPUTE_LATE_DEREFS": "1", "EDEN_NX2_RADV_MESH_COMPUTE_MIB": "64"}},
     "pro": {"name": "PS5 Pro", "attribute3": 0x8540040, "env": {}},
 }
 STEPS = ["Reading the game's program", "Translating it to C", "Compiling for the console", "Linking", "Making the title folder",

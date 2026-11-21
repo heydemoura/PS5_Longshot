@@ -1,0 +1,188 @@
+radv/ps5: an indirect draw of a mesh pipeline with no task shader runs as compute too (after lead-mesh-05..15)
+
+lead-mesh-09 runs a lone mesh pipeline's direct draws as compute and dropped its indirect ones ("indirect mesh draw
+with no task shader dropped", 8 a run in Ocarina of Time on Longshot, PS5, 2026-11-18, where the plants near the
+ground were missing with the path on). The records pass already reads each draw's x, y, z at a stride from its ring;
+an indirect draw's buffer is that ring, so:
+
+- radv_mesh_compute_draw_body: the lone indirect draw's ring is the draw's indirect buffer, a draw at a time (its
+  own draw ID) up to 16 draws, past that all in one records pass (draw ID 0, logged)
+- radv_mesh_compute_chunk: the ring's stride and a count bias taken, the callers before it pass the task ring's
+- the records pass (radv_meta_nir_build_mesh_compute_records_cs): the count buffer's draws less the bias, so a draw
+  of a multi-draw with a count is drawn only when the count is past it
+
+diff -ruN a/src/amd/vulkan/meta/radv_meta.h b/src/amd/vulkan/meta/radv_meta.h
+--- a/src/amd/vulkan/meta/radv_meta.h	2026-11-18 13:39:36.304869967 +0000
++++ b/src/amd/vulkan/meta/radv_meta.h	2026-11-18 16:25:38.883424871 +0000
+@@ -391,7 +391,7 @@
+ void radv_meta_mesh_compute_records(struct radv_cmd_buffer *cmd_buffer, uint64_t indirect_va, uint32_t stride,
+                                     uint64_t count_va, uint32_t max_count, uint64_t records_va, uint32_t task_rings,
+                                     uint32_t task_draw_id, uint64_t header_va, uint32_t capacity,
+-                                    uint32_t vertices_per_workgroup, uint32_t passes);
++                                    uint32_t vertices_per_workgroup, uint32_t passes, uint32_t count_bias);
+ 
+ void radv_meta_task_chunks(struct radv_cmd_buffer *cmd_buffer, uint64_t indirect_va, uint32_t stride, uint64_t count_va,
+                            uint32_t first_draw, uint32_t draws, uint32_t chunks, uint32_t entries, uint64_t out_va);
+diff -ruN a/src/amd/vulkan/meta/radv_meta_mesh_draw.c b/src/amd/vulkan/meta/radv_meta_mesh_draw.c
+--- a/src/amd/vulkan/meta/radv_meta_mesh_draw.c	2026-11-18 13:39:36.304869967 +0000
++++ b/src/amd/vulkan/meta/radv_meta_mesh_draw.c	2026-11-18 16:25:38.883424871 +0000
+@@ -118,13 +118,13 @@
+ radv_meta_mesh_compute_records(struct radv_cmd_buffer *cmd_buffer, uint64_t indirect_va, uint32_t stride,
+                                uint64_t count_va, uint32_t max_count, uint64_t records_va, uint32_t task_rings,
+                                uint32_t task_draw_id, uint64_t header_va, uint32_t capacity,
+-                               uint32_t vertices_per_workgroup, uint32_t passes)
++                               uint32_t vertices_per_workgroup, uint32_t passes, uint32_t count_bias)
+ {
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+    VkPipelineLayout layout;
+    VkPipeline pipeline;
+ 
+-   VkResult result = get_pipeline(device, RADV_META_OBJECT_KEY_MESH_COMPUTE_RECORDS, 60,
++   VkResult result = get_pipeline(device, RADV_META_OBJECT_KEY_MESH_COMPUTE_RECORDS, 64,
+                                   radv_meta_nir_build_mesh_compute_records_cs, &pipeline, &layout);
+    if (result != VK_SUCCESS) {
+       vk_command_buffer_set_error(&cmd_buffer->vk, result);
+@@ -136,10 +136,11 @@
+ 
+    radv_meta_bind_compute_pipeline(cmd_buffer, pipeline);
+ 
+-   const uint32_t constants[15] = {
++   /* (lead-mesh-16) count_bias: the draws the count at count_va has before this one */
++   const uint32_t constants[16] = {
+       indirect_va, indirect_va >> 32, records_va,   records_va >> 32,       count_va, count_va >> 32, stride, max_count,
+       task_rings,  task_draw_id,      header_va,    header_va >> 32,        capacity, vertices_per_workgroup,
+-      passes,
++      passes,      count_bias,
+    };
+    radv_meta_push_constants(cmd_buffer, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), constants);
+ 
+diff -ruN a/src/amd/vulkan/nir/radv_meta_nir.c b/src/amd/vulkan/nir/radv_meta_nir.c
+--- a/src/amd/vulkan/nir/radv_meta_nir.c	2026-11-18 13:39:36.304869967 +0000
++++ b/src/amd/vulkan/nir/radv_meta_nir.c	2026-11-18 16:25:38.883424871 +0000
+@@ -1592,9 +1592,12 @@
+    nir_def *capacity = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .base = 48, .range = 4);
+    nir_def *vertices_per_workgroup = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .base = 52, .range = 4);
+    nir_def *passes = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .base = 56, .range = 4);
++   /* (lead-mesh-16) the count buffer's draws before this pass's first: one draw of a multi-draw */
++   nir_def *count_bias = nir_load_push_constant(&b, 1, 32, nir_imm_int(&b, 0), .base = 60, .range = 4);
+ 
+    nir_push_if(&b, nir_ine_imm(&b, count_addr, 0));
+-   nir_def *count = nir_umin(&b, nir_build_load_global(&b, 1, 32, count_addr, .align_mul = 4), max_count);
++   nir_def *count = nir_umin(
++      &b, nir_usub_sat(&b, nir_build_load_global(&b, 1, 32, count_addr, .align_mul = 4), count_bias), max_count);
+    nir_pop_if(&b, NULL);
+    count = nir_if_phi(&b, count, max_count);
+ 
+diff -ruN a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+--- a/src/amd/vulkan/radv_cmd_buffer.c	2026-11-18 14:17:33.892530540 +0000
++++ b/src/amd/vulkan/radv_cmd_buffer.c	2026-11-18 16:25:38.895424870 +0000
+@@ -15795,7 +15795,8 @@
+  * compute pass and the copy draw. */
+ static void
+ radv_mesh_compute_chunk(struct radv_cmd_buffer *cmd_buffer, const struct radv_task_emu *emu, uint64_t block_va,
+-                        uint32_t draw_id, uint32_t count, uint64_t count_va, uint32_t known_workgroups)
++                        uint32_t draw_id, uint32_t count, uint64_t count_va, uint32_t known_workgroups,
++                        uint32_t ring_stride, uint32_t count_bias)
+ {
+    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+    const struct radv_pipeline *pipeline = &cmd_buffer->state.graphics_pipeline->base;
+@@ -15810,9 +15811,9 @@
+                     radv_mesh_compute_pass_limit());
+    const uint64_t header_va = radv_buffer_get_va(device->mesh_compute_bo);
+ 
+-   radv_meta_mesh_compute_records(cmd_buffer, emu->draw_ring_va, AC_TASK_DRAW_ENTRY_BYTES, count_va, count,
+-                                  emu->records_va, (uint32_t)emu->rings_va, draw_id, header_va, capacity,
+-                                  pipeline->mesh_compute_vertices_per_workgroup, passes);
++   radv_meta_mesh_compute_records(cmd_buffer, emu->draw_ring_va, ring_stride, count_va, count, emu->records_va,
++                                  (uint32_t)emu->rings_va, draw_id, header_va, capacity,
++                                  pipeline->mesh_compute_vertices_per_workgroup, passes, count_bias);
+ 
+    for (uint32_t pass = 0; pass < passes; pass++) {
+       const uint64_t args_va = header_va + RADV_MESH_COMPUTE_HEADER_PASSES + pass * RADV_MESH_COMPUTE_PASS_BYTES;
+@@ -15877,24 +15878,25 @@
+    const bool lone = !pipeline->shaders[MESA_SHADER_TASK];
+    struct radv_task_emu emu;
+    if (lone) {
+-      if (info) {
+-         static uint32_t told;
+-         if (told < 8 && p_atomic_inc_return(&told) <= 8)
+-            fprintf(stderr, "radv/ps5: indirect mesh draw with no task shader dropped\n");
+-         return;
+-      }
++      /* (lead-mesh-16) An indirect one too: its draws' grids are the ring, read where the draw has them
++       * (the records pass reads x, y, z at a stride, as from the task draw ring). It was dropped, and
++       * in Ocarina (Longshot, PS5, 2026-11-18) the plants near the ground went with it. */
+       if (!device->task_emu_bo)
+          return;
+-      const uint32_t entry[4] = {x, y, z, 0};
+-      unsigned entry_offset;
+-      if (!radv_cmd_buffer_upload_data(cmd_buffer, sizeof(entry), entry, &entry_offset)) {
+-         vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
+-         return;
+-      }
+       memset(&emu, 0, sizeof(emu));
+       emu.entries = 1;
+       emu.records_va = radv_buffer_get_va(device->task_emu_bo) + RADV_TASK_EMU_RECORDS_OFFSET;
+-      emu.draw_ring_va = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + entry_offset;
++      if (info) {
++         emu.draw_ring_va = info->indirect_va;
++      } else {
++         const uint32_t entry[4] = {x, y, z, 0};
++         unsigned entry_offset;
++         if (!radv_cmd_buffer_upload_data(cmd_buffer, sizeof(entry), entry, &entry_offset)) {
++            vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
++            return;
++         }
++         emu.draw_ring_va = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + entry_offset;
++      }
+       radv_cs_add_buffer(device->ws, cmd_buffer->cs->b, device->task_emu_bo);
+ #ifdef RADV_PS5
+       radv_ps5_task_emu_note[1] = 0;
+@@ -15940,8 +15942,26 @@
+       radeon_check_space(device->ws, cmd_buffer->cs->b, 16);
+       radv_emit_userdata_address(device, cmd_buffer->cs, state->shaders[MESA_SHADER_VERTEX], AC_UD_VS_GS_COMPUTE_DRAW,
+                                  block_va);
+-      if (lone) {
+-         radv_mesh_compute_chunk(cmd_buffer, &emu, block_va, 0, 1, 0, workgroups);
++      if (lone && info) {
++         /* (lead-mesh-16) A draw at a time, each its own draw ID and passes, up to 16 draws; past that
++          * one records pass takes them all (their workgroups one after another, the draw ID 0). The
++          * count is not known here: the passes the chunk limit allows, the empty ones cheap. */
++         const uint64_t ring = info->indirect_va;
++         if (info->count <= 16) {
++            for (uint32_t i = 0; i < info->count; i++) {
++               emu.draw_ring_va = ring + (uint64_t)i * info->stride;
++               radv_mesh_compute_chunk(cmd_buffer, &emu, block_va, i, 1, info->count_va, 0, info->stride, i);
++            }
++         } else {
++            static uint32_t told;
++            if (told < 4 && p_atomic_inc_return(&told) <= 4)
++               fprintf(stderr, "radv/ps5: indirect mesh draw with no task shader: %u draws in one pass, draw ID 0\n",
++                       info->count);
++            radv_mesh_compute_chunk(cmd_buffer, &emu, block_va, 0, MIN2(info->count, RADV_TASK_EMU_MAX_ENTRIES),
++                                    info->count_va, 0, info->stride, 0);
++         }
++      } else if (lone) {
++         radv_mesh_compute_chunk(cmd_buffer, &emu, block_va, 0, 1, 0, workgroups, AC_TASK_DRAW_ENTRY_BYTES, 0);
+       } else if (!info) {
+          for (uint32_t first = 0; first < workgroups; first += emu.entries) {
+             const uint32_t count = MIN2(emu.entries, workgroups - first);
+@@ -15953,7 +15973,7 @@
+             }
+             radv_task_emu_dispatch(cmd_buffer, &emu, radv_buffer_get_va(cmd_buffer->upload.upload_bo) + offset,
+                                    count, 0);
+-            radv_mesh_compute_chunk(cmd_buffer, &emu, block_va, 0, count, 0, 0);
++            radv_mesh_compute_chunk(cmd_buffer, &emu, block_va, 0, count, 0, 0, AC_TASK_DRAW_ENTRY_BYTES, 0);
+          }
+       } else {
+          /* As radv_task_emu_draw_indirect: every chunk the task workgroup limit allows, those past
+@@ -15977,7 +15997,8 @@
+                const uint64_t task_block_va = out_va + i * sizeof(struct radv_task_emu_block);
+                const uint64_t args_va = out_va + draws * chunks * sizeof(struct radv_task_emu_block) + i * 16;
+                radv_task_emu_dispatch(cmd_buffer, &emu, task_block_va, 0, args_va);
+-               radv_mesh_compute_chunk(cmd_buffer, &emu, block_va, first_draw + i / chunks, emu.entries, args_va, 0);
++               radv_mesh_compute_chunk(cmd_buffer, &emu, block_va, first_draw + i / chunks, emu.entries, args_va, 0,
++                                       AC_TASK_DRAW_ENTRY_BYTES, 0);
+             }
+          }
+       }

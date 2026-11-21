@@ -1257,7 +1257,16 @@ std::atomic<size_t> shadow_n{0};
 uint64_t shadow_seq = 0;   // (captures taken)
 // (256 MB: past it the pages no capture took in the last 64 go, the oldest first: those the game rewrites every frame
 // stay; if none can go, a page is read from guest memory as before)
-constexpr size_t kShadowMax = 65536;
+// (RX_VK_TEX_SHADOW_MB=<n>: the cap in MB; PS5 64, where it held 134 MiB of the heap when direct memory ran out)
+size_t shadow_max() {
+#ifdef __PROSPERO__
+    constexpr size_t kDefaultMb = 64;
+#else
+    constexpr size_t kDefaultMb = 256;
+#endif
+    static const size_t pages = (getenv("RX_VK_TEX_SHADOW_MB") ? (size_t)atoi(getenv("RX_VK_TEX_SHADOW_MB")) : kDefaultMb) << 8;
+    return pages;
+}
 std::map<uint64_t, std::pair<uint64_t, uint64_t>> tex_spans;   // lo -> (hi, the present a texture was last uploaded from it)
 std::vector<std::pair<uint64_t, uint64_t>> tex_merged;          // (tex_spans merged; shadow_mu)
 bool tex_spans_changed = false;
@@ -1529,44 +1538,57 @@ WbPages wb_parts;
 // (longshot) the pages' last write in place (part 0: note_direct_write), for the late pages' fix: no record of which words,
 // so a capture with such a page late waits, as before, whatever else writes it back
 WbPages wb_direct;
-void wb_pages_note(uint64_t guest_lo, uint64_t guest_hi, uint64_t value, uint64_t part) {
+// (longshot, ps5-overlap) A page written in place may carry the part it was written in (readback_in_place_part_on): its
+// wb_parts entry is that part with this tag, so a reader that asks (memory_writeback_value's in_place_part) can wait for
+// that part, and one that does not reads the page as written in place with no part, as before
+constexpr uint64_t kInPlaceTag = 1ull << 63;
+void wb_pages_note(uint64_t guest_lo, uint64_t guest_hi, uint64_t value, uint64_t part, bool in_place = false) {
     static const bool off = env_on("RX_VK_NO_READBACK_WAIT");
     if (off || !value || guest_hi <= guest_lo) return;
+    const uint64_t stored = in_place && part ? (part | kInPlaceTag) : part;
     std::lock_guard lk(wb_pages_mu);
     for (uint64_t p = guest_lo >> kPageShift; p <= (guest_hi - 1) >> kPageShift; p++) {
         wb_pages.set(p, value);
-        if (part || !wb_parts.empty()) wb_parts.set(p, part);
-        if (!part) wb_direct.set(p, value);
+        if (stored || !wb_parts.empty()) wb_parts.set(p, stored);
+        if (!part || in_place) wb_direct.set(p, value);
     }
 }
 } // namespace
 /// The newest write-back value of the range's pages (0: none; *ever: whether any page was ever written back). With part
 /// and whole: *part is the newest part that wrote any of them back from a mirror (0: none), *whole the newest value among
 /// the pages with no part (written in place: their whole submission is what a read waits for; 0: none)
-uint64_t memory_writeback_value(uint64_t guest, uint64_t size, bool* ever, uint64_t* part, uint64_t* whole) {
+uint64_t memory_writeback_value(uint64_t guest, uint64_t size, bool* ever, uint64_t* part, uint64_t* whole,
+                                uint64_t* in_place_part) {
     uint64_t v = 0;
     if (ever) *ever = false;
     if (part) *part = 0;
     if (whole) *whole = 0;
+    if (in_place_part) *in_place_part = 0;
     if (!size) return 0;
     std::lock_guard lk(wb_pages_mu);
     if (wb_pages.empty()) return 0;
     const uint64_t first = guest >> kPageShift, last = (guest + size - 1) >> kPageShift;
     v = wb_pages.max_in(first, last, ever);
-    if (v && (part || whole)) {
-        uint64_t newest = 0, in_place = 0;
+    if (v && (part || whole || in_place_part)) {
+        uint64_t newest = 0, in_place = 0, newest_in_place = 0;
         for (uint64_t p = first; p <= last && p < kPages;) {
             if (!wb_pages.chunks[p / kChunkPages]) {   // (a chunk never made: none of its pages, as max_in)
                 p = (p / kChunkPages + 1) * kChunkPages;
                 continue;
             }
-            const uint64_t pv = wb_pages.get(p), pp = pv ? wb_parts.get(p) : 0;
-            if (pp) newest = std::max(newest, pp);
+            const uint64_t pv = wb_pages.get(p), raw = pv ? wb_parts.get(p) : 0, pp = raw & ~kInPlaceTag;
+            // (written in place in a known part: that part for a reader that asks, else in place with no part, as before)
+            if (pp && (raw & kInPlaceTag)) {
+                if (in_place_part) newest_in_place = std::max(newest_in_place, pp);
+                else in_place = std::max(in_place, pv);
+            }
+            else if (pp) newest = std::max(newest, pp);
             else if (pv) in_place = std::max(in_place, pv);
             p++;
         }
         if (part) *part = newest;
         if (whole) *whole = in_place;
+        if (in_place_part) *in_place_part = newest_in_place;
     }
     return v;
 }
@@ -1988,13 +2010,19 @@ const std::vector<std::pair<uint64_t, uint64_t>>& capture_ranges_merged() {
 // Both are as they were before a value's recording became its last part's (v2.0.14 and before)
 namespace {
 std::atomic<uint64_t> mem_rec_part{0}, mem_in_place_part{0};
+// (ps5-overlap) whether mem_rec_part is a part the recordings' timeline will know (part_rec: submit_recording maps it). A
+// parallel replay's segment has a number of its own for the order of what it reads in place, and no recording mapped to it: a
+// GPU write in place noted with that number had a readback wait for a part that never comes (250 ms at most, until a later
+// part was submitted: the game's job threads held for whole submissions, frames of 40-126 ms). Not known: no part, the whole
+// submission's wait
+std::atomic<bool> mem_rec_part_mapped{false};
 void note_in_place_read(bool outside = false) {
     const uint64_t part = mem_rec_part.load() + (outside ? 1 : 0);
     uint64_t seen = mem_in_place_part.load();
     while (seen < part && !mem_in_place_part.compare_exchange_weak(seen, part)) {}
 }
 } // namespace
-void memory_recording_part(uint64_t part) { mem_rec_part.store(part); }
+void memory_recording_part(uint64_t part, bool mapped) { mem_rec_part.store(part), mem_rec_part_mapped.store(mapped); }
 uint64_t memory_in_place_part() { return mem_in_place_part.load(); }
 void memory_recording_value(uint64_t value, uint64_t completed) {
     mem_rec_value = value;
@@ -2715,7 +2743,7 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                     shadow_erase(p);
                     continue;
                 }
-                if (shadow_n.load(std::memory_order_relaxed) >= kShadowMax && !shadow.count(p)) {
+                if (shadow_n.load(std::memory_order_relaxed) >= shadow_max() && !shadow.count(p)) {
                     if (swept) break;
                     swept = true;
                     for (auto it = shadow.begin(); it != shadow.end();) {
@@ -2725,7 +2753,7 @@ bool take_capture(std::unique_ptr<Capture> c, uint64_t value, uint64_t completed
                         it = shadow.erase(it);
                         shadow_n--;
                     }
-                    if (shadow_n.load(std::memory_order_relaxed) >= kShadowMax) break;
+                    if (shadow_n.load(std::memory_order_relaxed) >= shadow_max()) break;
                 }
                 ShadowPage& slot = shadow[p];
                 if (!slot.b) {
@@ -4119,10 +4147,33 @@ struct BindMemo {
 };
 thread_local BindMemo bind_memo[256];
 
+/// (longshot, ps5-overlap) Whether a GPU write in place (note_direct_write: a pool with no mirror) is noted with the part of the
+/// submission it is recorded in, so a CPU read of it (invalidate) waits for that part, not the whole submission. On PS5
+/// every pool is written in place (no mirrors on the APU's one memory): 571-700 of every 3,000 readbacks waited 4-7 ms
+/// each for their whole submission, the game's job threads held while the GPU ran the rest of the frame. A part is
+/// ~120 draws, and its descriptors are built again in the next part (draw_begin_recording: last_desc_valid), so a
+/// binding written in a later part is noted again with that part. On the console a read of GPU results waits for
+/// nothing; the part's wait is still the one that has the write landed. Not on Intel, where a part may end before a
+/// draw whose bindings are made (part_ends_before_draw). RX_VK_READBACK_IN_PLACE_PART=1 on, =0 off; default on PS5 only
+bool readback_in_place_part_on() {
+    static const bool on = [] {
+        if (const char* e = getenv("RX_VK_READBACK_IN_PLACE_PART")) return !env_value_off(e);
+#ifdef __PROSPERO__
+        return dev.props.vendorID != 0x8086;
+#else
+        return false;
+#endif
+    }();
+    return on;
+}
+
 void note_direct_write(Pool& p, uint64_t off, uint64_t size) {   // (pools_mu held)
     p.direct_write_epoch = mirror_epoch;
     if (size <= (1u << 20))   // (EvilBoyce: GPU results written in place; small ones: the readbacks are)
-        wb_pages_note(p.lo + off, p.lo + std::min(off + size, p.hi - p.lo), mem_rec_value, 0);
+        // (ps5-overlap: its part only while a recording's part is open (mirror_upload); one bound outside belongs to no
+        // part begun yet, and keeps the whole submission's wait)
+        wb_pages_note(p.lo + off, p.lo + std::min(off + size, p.hi - p.lo), mem_rec_value,
+                      readback_in_place_part_on() && mirror_upload && mem_rec_part_mapped.load() ? mem_rec_part.load() : 0, true);
 }
 
 BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {

@@ -62,7 +62,7 @@ void hos_ps5_klog_now(const char *fmt, ...) {
 }
 
 /* ---- the guest window ---------------------------------------------------------------------------------------- */
-enum { U_RESERVED = 0, U_COMMITTED = 1 };
+enum { U_RESERVED = 0, U_COMMITTED = 1, U_OUT = 2 };   /* (U_OUT: in the swap file, host/ps5/guest_swap_ps5.inc) */
 static uint8_t *unit_state;                   /* GUEST_UNITS bytes, made with the reservation */
 static uint8_t *unit_ahead;                   /* (HOS_PS5_ZERO_SCAN) 1: backed by hos_ps5_commit_now, not by a touch */
 static int64_t *unit_phys;                    /* a committed unit's direct memory (for its decommit) */
@@ -75,11 +75,30 @@ static uint64_t committed_bytes;
 
 static int in_window(uintptr_t lo, uintptr_t hi) { return lo >= HOS_PS5_GUEST_LO && hi <= HOS_PS5_GUEST_HI && lo < hi; }
 
+/* (the swap's, host/ps5/guest_swap_ps5.inc, included at the end) */
+static void window_lock_take(void);
+static void window_lock_give(void);
+static int swap_tables(void);
+static int swap_in_locked(uint64_t u, int write, int wait);
+static void unit_fresh_locked(uint64_t u);
+static void swap_need_guest(size_t bytes);
+static void units_hold_locked(uint64_t u, uint64_t end, uint8_t pin);
+static void unit_range(const void *addr, size_t size, uint64_t *u, uint64_t *end);
+static void decommit_units_locked(uint64_t u, uint64_t end);
+static void swap_report(void);
+void hos_ps5_swap_need(size_t bytes);
+int hos_ps5_commit_now_plain(void *addr, size_t size);
+static uint64_t direct_room_now(uint64_t *pieces);
+static uint8_t *unit_sw;   /* (the swap's flags a unit: NULL with no swap) */
+#define PIN_GPU_ 0x80
+#define PIN_PROT_ 0x40
+
 static int reserve_window(void) {
     if (window_reserved) return 1;
     unit_state = calloc(GUEST_UNITS, 1);
     unit_phys = calloc(GUEST_UNITS, sizeof *unit_phys);
     if (!unit_state || !unit_phys) return 0;
+    if (!swap_tables()) fprintf(stderr, "[ps5] the guest window: no room for the swap's page table: no swap\n");
     for (uintptr_t at = HOS_PS5_GUEST_LO; at < HOS_PS5_GUEST_HI; at += PIECE) {
         const int r = ps5_vrange_reserve_at((void *)at, PIECE);
         if (r) {
@@ -125,8 +144,13 @@ static int commit_units(uintptr_t lo, uintptr_t hi) {
     const uint64_t end = (hi - HOS_PS5_GUEST_LO + UNIT - 1) / UNIT;
     while (u < end) {
         if (unit_state[u] == U_COMMITTED) { u++; continue; }
+        if (unit_state[u] == U_OUT) {   /* (in the swap file: read back, never backed afresh with zeros) */
+            if (!swap_in_locked(u, 1, 0)) return 0;   /* (no memory: commit_units_wait waits) */
+            u++;
+            continue;
+        }
         uint64_t run = u;
-        while (run < end && unit_state[run] != U_COMMITTED) run++;
+        while (run < end && unit_state[run] == U_RESERVED) run++;
         uint64_t need = (run - u) * UNIT;
         while (need) {
             uint64_t got = 0;
@@ -149,6 +173,7 @@ static int commit_units(uintptr_t lo, uintptr_t hi) {
             }
             memset(want, 0, got);   /* (the kernel hands direct memory out as it was left: PROBE.md) */
             for (uint64_t k = 0; k < got / UNIT; k++) {
+                unit_fresh_locked(u + k);   /* (none of the swap's state from before: guest_swap_ps5.inc) */
                 unit_phys[u + k] = phys + (int64_t)(k * UNIT);
                 __atomic_store_n(&unit_state[u + k], U_COMMITTED, __ATOMIC_RELEASE);
             }
@@ -176,12 +201,13 @@ static int commit_units_wait(uintptr_t lo, uintptr_t hi) {
             hos_ps5_klog_now("[ps5] guest commit: no direct memory left (%llu MiB committed)%s",
                              (unsigned long long)(committed_bytes >> 20), tries ? "" : ": waiting for some");
         if (tries == 500) return 0;
-        pthread_mutex_unlock(&window_lock);
+        window_lock_give();
 #ifdef PS5_HEAP_TRIM
         if (!tries) ps5_heap_trim();
 #endif
+        swap_need_guest(hi - lo);   /* (the swap's units out first: guest_swap_ps5.inc) */
         sceKernelUsleep(20000);
-        pthread_mutex_lock(&window_lock);
+        window_lock_take();
     }
 }
 
@@ -191,21 +217,25 @@ int hos_ps5_unit_backed(uintptr_t addr);
    memory kept for the next commits; the parts of units only partly inside read as zero. Without it every scene the game
    loaded added memory it never returned: 7.1 GB of guest pages when Link's house loaded, and the next page found none.
    Pages a GPU import holds never come here (host/hos_mem.c keeps and zeroes those). */
+static int unit_held_any(uintptr_t a) {   /* (backed, or in the swap file: its contents count) */
+    return __atomic_load_n(&unit_state[(a - HOS_PS5_GUEST_LO) / UNIT], __ATOMIC_ACQUIRE) != U_RESERVED;
+}
 int hos_ps5_decommit(void *addr, size_t size) {
     const uintptr_t lo = (uintptr_t)addr, hi = lo + size;
     if (!size || !window_reserved || !in_window(lo, hi)) return 0;
     const uintptr_t ulo = (lo + UNIT - 1) & ~(uintptr_t)(UNIT - 1), uhi = hi & ~(uintptr_t)(UNIT - 1);
     if (ulo >= uhi) {   /* (no whole unit) */
-        if (hos_ps5_unit_backed(lo) && hos_ps5_unit_backed(hi - 1)) memset(addr, 0, size);
+        if (unit_held_any(lo) && unit_held_any(hi - 1)) memset(addr, 0, size);   /* (a unit out: read back by the fault) */
         return 1;
     }
-    if (lo < ulo && hos_ps5_unit_backed(lo)) memset(addr, 0, ulo - lo);
-    if (uhi < hi && hos_ps5_unit_backed(uhi)) memset((void *)uhi, 0, hi - uhi);
+    if (lo < ulo && unit_held_any(lo)) memset(addr, 0, ulo - lo);
+    if (uhi < hi && unit_held_any(uhi)) memset((void *)uhi, 0, hi - uhi);
     /* (a run of committed units at a time, not a unit: two system calls a 64 KiB unit under the window's lock were 1.3 s of
        45 while a scene was up, and the game stood still for 1.8 s whenever it gave a large region back) */
     const double t0 = now_ms();
     uint64_t units = 0;
-    pthread_mutex_lock(&window_lock);
+    window_lock_take();
+    decommit_units_locked((ulo - HOS_PS5_GUEST_LO) / UNIT, (uhi - HOS_PS5_GUEST_LO) / UNIT);   /* (the swap's: guest_swap_ps5.inc) */
     for (uintptr_t at = ulo; at < uhi;) {
         uint64_t u = (at - HOS_PS5_GUEST_LO) / UNIT;
         if (unit_state[u] != U_COMMITTED) { at += UNIT; continue; }
@@ -232,7 +262,7 @@ int hos_ps5_decommit(void *addr, size_t size) {
         units += n;
         at += n * UNIT;
     }
-    pthread_mutex_unlock(&window_lock);
+    window_lock_give();
     if (now_ms() - t0 >= 20) hos_ps5_klog_now("[ps5] guest decommit: %llu MiB given back in %.0f ms", (unsigned long long)(units * UNIT >> 20), now_ms() - t0);
     return 1;
 }
@@ -268,9 +298,9 @@ void *VirtualAlloc(void *addr, SIZE_T size, DWORD type, DWORD protect) {
         return addr;
     }
     if (a == HOS_PS5_GUEST_LO && size == HOS_PS5_GUEST_HI - HOS_PS5_GUEST_LO && !(type & MEM_COMMIT)) {
-        pthread_mutex_lock(&window_lock);
+        window_lock_take();
         const int ok = reserve_window();
-        pthread_mutex_unlock(&window_lock);
+        window_lock_give();
         if (!ok) { set_error(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
         return addr;
     }
@@ -282,9 +312,9 @@ void *VirtualAlloc(void *addr, SIZE_T size, DWORD type, DWORD protect) {
            What the kernel or the GPU must find backed is committed with hos_ps5_commit_now (ReadFile and WriteFile
            buffers, the renderer's imported pools). */
         if (size >= LAZY_COMMIT) return addr;
-        pthread_mutex_lock(&window_lock);
+        window_lock_take();
         const int ok = window_reserved && commit_units_wait(a & ~(uintptr_t)(UNIT - 1), a + size);
-        pthread_mutex_unlock(&window_lock);
+        window_lock_give();
         if (!ok) { set_error(ERROR_COMMITMENT_LIMIT); return NULL; }
         return addr;
     }
@@ -307,15 +337,30 @@ int hos_ps5_unit_backed(uintptr_t addr) {
 }
 
 /* Guest pages backed now, whatever their size (the lazy rule above is for the runtime's own commits) */
-int hos_ps5_commit_now(void *addr, size_t size) {
+int hos_ps5_commit_now_plain(void *addr, size_t size) {
     const uintptr_t a = (uintptr_t)addr;
     if (!size || !in_window(a, a + size)) return 1;
-    pthread_mutex_lock(&window_lock);
+    window_lock_take();
     if (window_reserved && unit_ahead)   /* (HOS_PS5_ZERO_SCAN: the units backed here before the game touched them) */
         for (uint64_t u = (a - HOS_PS5_GUEST_LO) / UNIT; u < (a + size - HOS_PS5_GUEST_LO + UNIT - 1) / UNIT; u++)
             if (unit_state[u] != U_COMMITTED) unit_ahead[u] = 1;
     const int ok = window_reserved && commit_units_wait(a & ~(uintptr_t)(UNIT - 1), a + size);
-    pthread_mutex_unlock(&window_lock);
+    window_lock_give();
+    return ok;
+}
+
+/* The same for the GPU (the Vulkan back end's import, gpu/vk/vk_memory.cpp): held in memory from now on, writable, never
+   armed or swapped (the GPU does not fault) until the game gives the pages back */
+int hos_ps5_commit_now(void *addr, size_t size) {
+    const int ok = hos_ps5_commit_now_plain(addr, size);
+    const uintptr_t a = (uintptr_t)addr;
+    if (size && unit_sw && in_window(a, a + size)) {   /* (held even if the commit failed: never the swap's) */
+        uint64_t u, end;
+        unit_range(addr, size, &u, &end);
+        window_lock_take();
+        units_hold_locked(u, end, PIN_GPU_);
+        window_lock_give();
+    }
     return ok;
 }
 
@@ -346,6 +391,13 @@ BOOL VirtualProtect(void *addr, SIZE_T size, DWORD protect, DWORD *old) {
     const uintptr_t lo = (uintptr_t)addr & ~(uintptr_t)0x3FFF, hi = ((uintptr_t)addr + size + 0x3FFF) & ~(uintptr_t)0x3FFF;
     if (old) *old = PAGE_READWRITE;
     const int gpu = in_window(lo, hi) ? GPU_RW : 0;
+    if (gpu && unit_sw) {   /* (protected by its owner from now on: read back if in the swap file, left alone by the swap) */
+        uint64_t u, end;
+        unit_range((void *)lo, hi - lo, &u, &end);
+        window_lock_take();
+        units_hold_locked(u, end, PIN_PROT_);
+        window_lock_give();
+    }
     return sceKernelMprotect((void *)lo, hi - lo, prot_bits(protect) | gpu) == 0 ? TRUE : (set_error(ERROR_INVALID_PARAMETER), FALSE);
 }
 
@@ -357,9 +409,9 @@ SIZE_T VirtualQuery(const void *addr, MEMORY_BASIC_INFORMATION *mbi, SIZE_T size
     mbi->Type = 0x20000;
     if (window_reserved && in_window(a, a + 1)) {
         const uint64_t u = (a - HOS_PS5_GUEST_LO) / UNIT;
-        const uint8_t s = __atomic_load_n(&unit_state[u], __ATOMIC_ACQUIRE);
-        uint64_t end = u + 1;
-        while (end < GUEST_UNITS && __atomic_load_n(&unit_state[end], __ATOMIC_RELAXED) == s) end++;
+        const uint8_t s = __atomic_load_n(&unit_state[u], __ATOMIC_ACQUIRE) == U_RESERVED ? U_RESERVED : U_COMMITTED;
+        uint64_t end = u + 1;   /* (a unit in the swap file is committed: guest_swap_ps5.inc) */
+        while (end < GUEST_UNITS && (__atomic_load_n(&unit_state[end], __ATOMIC_RELAXED) == U_RESERVED ? U_RESERVED : U_COMMITTED) == s) end++;
         mbi->AllocationBase = (void *)HOS_PS5_GUEST_LO;
         mbi->RegionSize = HOS_PS5_GUEST_LO + end * UNIT - (uintptr_t)mbi->BaseAddress;
         mbi->State = s == U_COMMITTED ? MEM_COMMIT : MEM_RESERVE;
@@ -545,9 +597,20 @@ int hos_ps5_thread_start(pthread_t *th, size_t stack, void *(*fn)(void *), void 
 long hos_ps5_futex(volatile uint32_t *word, int op, uint32_t value, const struct timespec *relative) {
     if (op == FUTEX_WAKE_PRIVATE) return _umtx_op((void *)word, UMTX_OP_WAKE_PRIVATE, value, NULL, NULL);
     struct timespec t = relative ? *relative : (struct timespec){0};
+    /* (a word in guest memory is held while the kernel reads it: armed, read-only or in the swap file it would answer
+       EFAULT, host/ps5/guest_swap_ps5.inc) */
+    void hos_ps5_io_hold(void *addr, size_t size), hos_ps5_io_release(void *addr, size_t size);
+    const int guest = in_window((uintptr_t)word, (uintptr_t)word + 4);
+    if (guest) hos_ps5_io_hold((void *)word, 4);
     /* (a timespec in uaddr2 with its size in uaddr is a relative timeout; FreeBSD answers ETIMEDOUT as Linux does) */
-    return _umtx_op((void *)word, UMTX_OP_WAIT_UINT_PRIVATE, value, relative ? (void *)(uintptr_t)sizeof t : NULL,
-                    relative ? &t : NULL);
+    const long r = _umtx_op((void *)word, UMTX_OP_WAIT_UINT_PRIVATE, value, relative ? (void *)(uintptr_t)sizeof t : NULL,
+                            relative ? &t : NULL);
+    if (guest) {
+        const int e = errno;
+        hos_ps5_io_release((void *)word, 4);
+        errno = e;
+    }
+    return r;
 }
 pid_t hos_ps5_tid(void) { return (pid_t)pthread_getthreadid_np(); }
 
@@ -813,7 +876,11 @@ __attribute__((constructor)) void hos_ps5_clock_init(void) {
 const char *hos_ps5_nup(void) {
     static const char *const places[] = {
         "/data/eglantineps5/roms/The Legend of Zelda Ocarina of Time [0400486024dec000][v131072].nup",
-        "/data/eglantineps5/roms/oot.nup", "/data/lichii/roms/oot/oot.nup", "/data/prosperoeden/roms/oot/oot.nup"};
+        "/data/eglantineps5/roms/oot.nup", "/data/lichii/roms/oot/oot.nup", "/data/prosperoeden/roms/oot/oot.nup",
+        "/mnt/ext1/eglantineps5/roms/The Legend of Zelda Ocarina of Time [0400486024dec000][v131072].nup",
+        "/mnt/ext0/eglantineps5/roms/The Legend of Zelda Ocarina of Time [0400486024dec000][v131072].nup",
+        "/mnt/usb0/eglantineps5/roms/The Legend of Zelda Ocarina of Time [0400486024dec000][v131072].nup",
+        "/mnt/ext1/eglantineps5/roms/oot.nup", "/mnt/ext0/eglantineps5/roms/oot.nup", "/mnt/usb0/eglantineps5/roms/oot.nup"};
     const char *set = getenv("HOS_PS5_NUP");
     if (set && *set) return set;
     for (size_t i = 0; i < sizeof places / sizeof *places; i++)
@@ -1279,7 +1346,7 @@ static uint64_t zero_units_now(uint64_t *ahead) {
     uint64_t zero = 0;
     *ahead = 0;
     for (uint64_t u = 0; u < GUEST_UNITS; u += 1024) {
-        pthread_mutex_lock(&window_lock);
+        window_lock_take();
         for (uint64_t k = u; k < u + 1024 && k < GUEST_UNITS; k++) {
             if (unit_state[k] != U_COMMITTED) continue;
             void *at = (void *)(HOS_PS5_GUEST_LO + k * UNIT), *start = NULL, *end = NULL;
@@ -1293,7 +1360,7 @@ static uint64_t zero_units_now(uint64_t *ahead) {
             zero += i == UNIT / 8;
             if (i == UNIT / 8 && unit_ahead && unit_ahead[k]) (*ahead)++;
         }
-        pthread_mutex_unlock(&window_lock);
+        window_lock_give();
     }
     *ahead *= UNIT;
     return zero * UNIT;
@@ -1305,9 +1372,9 @@ static void *cpu_meter(void *unused) {
     (void)unused;
     if (getenv("HOS_PS5_ZERO_SCAN")) {
         uint8_t *marks = calloc(GUEST_UNITS, 1);
-        pthread_mutex_lock(&window_lock);
+        window_lock_take();
         unit_ahead = marks;
-        pthread_mutex_unlock(&window_lock);
+        window_lock_give();
     }
     struct rusage before;
     getrusage(RUSAGE_SELF, &before);
@@ -1328,9 +1395,9 @@ static void *cpu_meter(void *unused) {
                keeps without using it (the units a decommit left, the rest of its current block)) */
             uint64_t pieces = 0;
             const uint64_t room = direct_room_now(&pieces), total = sceKernelGetDirectMemorySize();
-            pthread_mutex_lock(&window_lock);
+            window_lock_take();
             const uint64_t kept = (uint64_t)free_count * UNIT, ahead = (uint64_t)(block_end - block_next);
-            pthread_mutex_unlock(&window_lock);
+            window_lock_give();
             if (getenv("HOS_PS5_ZERO_SCAN")) {
                 const double z0 = now_ms();
                 uint64_t ahead = 0;
@@ -1364,6 +1431,7 @@ static void *cpu_meter(void *unused) {
                 fprintf(stderr, "[ps5] driver buffers by purpose (under 1 MiB + under 16 + larger)%s\n", line);
             }
         }
+        swap_report();   /* (guest_swap_ps5.inc) */
 #ifdef PS5_HEAP_TRIM   /* (a platform heap that counts what its arenas hold in blocks handed out: PS5_PayloadSDK 55a2de0) */
         fprintf(stderr, "[ps5] heap: %llu MiB mapped in %u segments, %llu MiB of it in blocks in use, %u arenas\n",
                 (unsigned long long)(heap.mapped_bytes >> 20), heap.segments, (unsigned long long)(heap.in_use_bytes >> 20), heap.arenas);
@@ -1385,3 +1453,13 @@ void hos_ps5_cpu_meter(void) {
     if (pthread_create(&t, NULL, cpu_meter, NULL) == 0) pthread_detach(t);
 }
 
+/* The console's largest free direct-memory piece now (the swap's contiguous pass, guest_swap_ps5.inc) */
+uint64_t hos_ps5_direct_free(void) {
+    int64_t at = 0;
+    size_t largest = 0;
+    if (sceKernelAvailableDirectMemorySize(0, sceKernelGetDirectMemorySize(), 0x10000, &at, &largest) != 0) return 0;
+    return largest;
+}
+
+/* ---- the guest window's swap ------------------------------------------------------------------------------------ */
+#include "guest_swap_ps5.inc"

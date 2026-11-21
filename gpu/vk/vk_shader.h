@@ -162,6 +162,10 @@ bool program_cache_complete_graphics(const Program& p);
 /// (longshot) Lets go of the VkShaderModules of ready programs whose pipelines are built and whose stages can be remade from
 /// longshot_programs.bin (or are compute stages that need no another pipeline); returns how many modules were destroyed
 size_t program_cache_drop_modules();
+#ifdef __PROSPERO__
+/// (PS5) the modules of compute programs whose pipeline is built, let go during play (vk_progcache.cpp)
+size_t program_drop_compute_modules();
+#endif
 /// (longshot) precompile_run built p's noted graphics pipelines before the title: program_cache_drop_modules may let its graphics
 /// modules go (an un-noted program or variant keeps them for its first draw in play)
 void program_cache_note_built(const Program& p);

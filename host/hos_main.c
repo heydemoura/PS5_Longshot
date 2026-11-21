@@ -2329,6 +2329,12 @@ int main(int argc, char **argv) {
                whose pipelines the first start's preparation put in the driver's disk cache. Listed, they held ~290 MiB more of
                the driver's memory in a base console's Kokiri walk) */
             {"RX_VK_PRECOMPILE_COMPUTES", "learned"},
+            /* (the recorder thread (Threaded rendering On): a recording's ends are packets, not waits for its ring, and a
+               slot's own resets wait for nothing (vk_recorder.h end_deferred, OwnSlot): the replay waited for the recorder
+               423 -> 84 ms in 10 s on a base PS5. 96 recording slots, not 48: a slot reused waits for its last submission,
+               3.6 -> 0.6 ms a frame there. The driver's stall dump only on a GPU hang, 10 s in (vk_replay.cpp)) */
+            {"RX_VK_RECORDER_OWN", "1"}, {"RX_VK_RECORDER_END", "1"}, {"RX_VK_RECORDINGS", "96"},
+            {"EDEN_NX2_RADV_STALL_DUMP", "1"},
         };
         for (size_t i = 0; i < sizeof defaults / sizeof *defaults; i++) setenv(defaults[i][0], defaults[i][1], 0);
     }
@@ -2340,6 +2346,10 @@ int main(int argc, char **argv) {
     hos_ps5_sample_start();   /* (HOS_PS5_SAMPLE=<start>,<seconds>) */
     void hos_ps5_cpu_meter(void);
     hos_ps5_cpu_meter();   /* (HOS_PS5_CPU=1) */
+    void hos_ps5_heap_sites_start(void);
+    hos_ps5_heap_sites_start();   /* (HOS_PS5_HEAP_SITES=1: who holds the heap, host/ps5/heap_sites_ps5.cpp) */
+    void hos_ps5_swap_start(void);
+    hos_ps5_swap_start();   /* (HOS_PS5_SWAP=1: the game's cold pages to a file, host/ps5/guest_swap_ps5.inc) */
 #endif
     game_argc = argc, game_argv = argv;
     int prepare_shaders = 0;

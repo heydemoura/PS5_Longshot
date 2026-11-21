@@ -43,13 +43,14 @@ def check_source(source):
                          "made in the images' pool, they stay empty while the textures are compacted in a pool of their own)")
     need("vk_vma.cpp: blocks_at_start()", block(vma, "static size_t blocks_at_start(bool holds_textures)"),
          ["if (!holds_textures) return 0;", 'getenv("RX_VK_IMAGE_PREALLOC")',
-          "vram_compact::blocks_at_start(heap, kImageBlock, holds_textures,\n"
+          "vram_compact::blocks_at_start(heap, image_block(), holds_textures,\n"
           "                                                 dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU)"])
     # (the images' pool only when the textures are made there, RX_VK_COMPACT=0; else the textures' own)
     need("vk_vma.cpp: images_pool()", block(vma, "VmaPool images_pool() {"),
          ['make_pool(pi, blocks_at_start(!vram_compact::enabled(getenv("RX_VK_COMPACT"))), image_pool)', "made at the start"])
     need("vk_vma.cpp: textures_pool()", block(vma, "VmaPool textures_pool() {"),
-         ["texture_pool_kept = make_pool(pi, blocks_at_start(true), texture_pool) * kImageBlock;", "made at the start"])
+         ["pi.blockSize = image_block();",
+          "texture_pool_kept = make_pool(pi, blocks_at_start(true), texture_pool) * image_block();", "made at the start"])
     # (no room for the blocks: the pool empty, as before them)
     need("vk_vma.cpp: make_pool()", block(vma, "static size_t make_pool("),
          ["pi.minBlockCount = n;", "pi.minBlockCount = 0;"])
@@ -103,6 +104,7 @@ VmaPool image_pool{}, texture_pool{};
 bool image_pool_tried{}, texture_pool_tried{};
 uint64_t texture_pool_kept{};
 const uint64_t kImageBlock = 128ull << 20;
+uint64_t image_block() { return kImageBlock; }   // (vk_vma.cpp's on a PC with RX_VK_IMAGE_BLOCK_MB unset)
 const char* compact_env;
 const char* prealloc_env;
 const char* test_getenv(const char* name) {

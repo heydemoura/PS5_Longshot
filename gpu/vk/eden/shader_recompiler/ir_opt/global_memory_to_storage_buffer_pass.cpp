@@ -1673,7 +1673,14 @@ void GlobalMemoryToStorageBufferPass(Environment& env, IR::Program& program,
     // (longshot: compute only; the task and mesh stages were tried for the foliage, which it did not bring back)
     g_follow_stage = program.stage == Stage::Compute;
     // (geometry stages only: with the fragment stage too, the sky drew black rectangles and the lighting went too bright at the castle)
-    g_graphics_stage = program.stage != Stage::Compute && program.stage != Stage::Fragment;
+    // (PS5, 2026-11-18: the fragment stage too. Its addresses partly loaded from memory (the light probes and ambient tables
+    // read through a pointer in a table) were bound by the legacy tracking to the first constant-buffer word it met, read
+    // zeros, and objects stayed dark at night until a direct light reached them (heydemoura/PS5_Longshot #5); EglantinePS5,
+    // whose recompiler follows such pointers (its native tables), lights them. Left to the run-time search now, the page
+    // table's in the fragment stage (RX_VK_FOLLOW_GRAPHICS). RX_VK_NO_FRAG_LOAD_RULE=1: as before (the program cache is not
+    // keyed on it: delete longshot_programs.bin when switching). Check the sky at the castle)
+    static const bool frag_rule{!env_on("RX_VK_NO_FRAG_LOAD_RULE")};
+    g_graphics_stage = program.stage != Stage::Compute && (frag_rule || program.stage != Stage::Fragment);
     g_origins.clear();   // (EvilOOT: Origins' walk, kept per program)
     const bool pairing{!GmLegacyFor(program.stage)};
     std::optional<TrackingConditions> conditions;

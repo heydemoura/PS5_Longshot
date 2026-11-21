@@ -1252,7 +1252,24 @@ static void *pool_get(size_t n, unsigned *cls) {
         pool_bytes[c] -= (uint64_t)1 << c;
     }
     ReleaseSRWLockExclusive(&pool_lock);
-    return b ? b : malloc((size_t)1 << c);
+    if (b) return b;
+    b = malloc((size_t)1 << c);
+#ifdef __PROSPERO__
+    /* (PS5) the game's pages, the heap and the renderer share one pool, and a burst takes the last of it for a moment:
+       a recording copy waits for some, as a game page does (host/ps5/win32_ps5.c), up to 10 s, rather than ending the
+       title at once (2026-11-18 14:20: "recording copy (520 bytes)", with 724 MiB free 5 s before) */
+    for (int tries = 0; !b && tries < 500; tries++) {
+        extern int sceKernelUsleep(unsigned microseconds);
+        extern void ps5_heap_trim(void) __attribute__((weak));
+        if (tries == 0) {
+            fprintf(stderr, "[ps5] nvn: no memory for a %llu-byte block: waiting for some\n", (unsigned long long)1 << c);
+            if (ps5_heap_trim) ps5_heap_trim();
+        }
+        sceKernelUsleep(20000);
+        b = malloc((size_t)1 << c);
+    }
+#endif
+    return b;
 }
 static void pool_put(void *b, unsigned cls) {
     if (!b) return;

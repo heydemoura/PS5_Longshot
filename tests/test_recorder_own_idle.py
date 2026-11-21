@@ -117,7 +117,7 @@ def source_problems(replay, draw, others):
     for call in ("vkResetDescriptorPool(dev.device, r.pool, 0);", "for (VkDescriptorPool p : r.extra) vkDestroyDescriptorPool(dev.device, p,"):
         if call not in dblock:
             p.append("draw_begin_recording: %s not within the OwnSlot" % call)
-    ends = [m.start() for m in re.finditer(r"vkEndCommandBuffer\(r\.(cmd|upload)\);", submit)]
+    ends = [m.start() for m in re.finditer(r"(?:vkEndCommandBuffer|rec::end_deferred)\(r\.(cmd|upload)\);", submit)]   # (ps5-overlap: RX_VK_RECORDER_END)
     keep = submit.find("rec_end_pos[r.slot] = rec::produced();")
     if len(ends) != 2 or keep < max(ends):
         p.append("submit_recording: rec_end_pos[r.slot] = rec::produced() must come after both ends")
@@ -229,6 +229,8 @@ CASES = (
     ("real_race", {IDLE: "wait"}, None),
     ("real_stop", {IDLE: "wait"}, None),
     ("real_both", {OWN: "1", IDLE: "wait"}, None),
+    ("end_deferred", {"RX_VK_RECORDER_END": "1"}, None),   # (ps5-overlap: rec::end_deferred)
+    ("end_direct", {}, None),
 )
 
 
@@ -259,6 +261,10 @@ BROKEN = (
     ("the wake removed", "            g_wake_by_address(&W);\n", "", "idle_parked", {IDLE: "wait"}),
     ("the wait's timeout taken out", "g_wait_on_address(&W, &compare, sizeof compare, 2);",
      "g_wait_on_address(&W, &compare, sizeof compare, 0xFFFFFFFFu);", "real_timeout", {IDLE: "wait"}),
+    # (ps5-overlap) the deferred end made directly (no packet): it waits; and the switch ignored: the end deferred when off
+    ("the deferred end made directly", "e.emit(OP_END_DEFERRED, [=] { ::vkx::vkEndCommandBuffer(cb); }, direct);", "direct();",
+     "end_deferred", {"RX_VK_RECORDER_END": "1"}),
+    ("the end switch ignored", 'g_end_deferred = env_on("RX_VK_RECORDER_END");', "g_end_deferred = true;", "end_direct", {}),
 )
 
 

@@ -110,6 +110,7 @@ namespace rec {   // (vk_recorder.h's RX_VK_RECORDER_OWN marks, as they are with
 inline void slot_begin(uint64_t) {}
 inline void slot_done() {}
 inline uint64_t produced() { return 0; }
+inline void end_deferred(VkCommandBuffer cb) { vkEndCommandBuffer(cb); }   // (RX_VK_RECORDER_END: the end itself, recorder off)
 struct OwnSlot { OwnSlot() {} ~OwnSlot() {} };   // (a scope, as the real one)
 }   // namespace rec
 uint64_t rec_end_pos[64];   // (vk_replay.cpp: each slot's end in the recorder's ring)

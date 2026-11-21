@@ -264,7 +264,34 @@ void record_segment(VkCommandBuffer& cmd, const Segment& g) {
 }
 void draw_begin_recording(int, VkCommandBuffer, uint64_t) {}
 void draw_flush_recording(int slot) { CHECK(slot >= 0 && slot < 8); published_slots.insert(slot); }
-void queue_flush_locked() {}
+// (the FPS counter's render lane: nothing here)
+namespace fps_stats { enum { kRtWork, kRtWorkers, kRtGpu, kRtIdle }; }
+struct FpsRtWait { explicit FpsRtWait(int) {} };
+// (ps5-overlap) the held batch (RX_VK_BATCH, vk_replay.cpp's pend): PIO_BATCH unset, every segment its own submit as before;
+// =idle, held and sent at once (the GPU idle: batch_gpu_idle); =held, held until the replay's next flush (the end of
+// submit_segments here, a wait or present in the replay), in order after what was held before
+enum { FR_OTHER, FR_CAP, FR_SLOT };
+int flush_reason = FR_OTHER;
+const char* batch_env = getenv("PIO_BATCH");
+bool batch_on() { return batch_env != nullptr; }
+bool batch_gpu_idle() { return batch_env && !strcmp(batch_env, "idle"); }
+struct {
+    std::vector<VkCommandBufferSubmitInfo> cbs;
+    uint64_t reflex = 0;
+} pend;
+std::chrono::steady_clock::time_point pend_since;
+std::atomic<bool> pend_held{false};
+uint64_t batch_next = 0, batch_flushed = 0;
+uint64_t reflex_frame() { return 0; }
+void queue_flush_locked() {   // (what is held, as one submission, in order)
+    if (pend.cbs.empty()) return;
+    VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+    si.commandBufferInfoCount = (uint32_t)pend.cbs.size(), si.pCommandBufferInfos = pend.cbs.data();
+    vkQueueSubmit2(VK_NULL_HANDLE, 1, &si, VK_NULL_HANDLE);
+    batch_flushed = batch_next;
+    pend.cbs.clear();
+    pend_held.store(false);
+}
 void checkpoints_report() {}
 const void* reflex_submit_id(const void* next, uint64_t = ~0ull) { return next; }   // (vk_reflex.cpp: no tag without Reflex)
 bool memory_sparse_wait(VkSemaphoreSubmitInfo*) { return false; }   // (vk_memory.cpp: no sparse mirror binds here)
@@ -354,6 +381,7 @@ void submit_post() {
     cb[n++].commandBuffer = post.cmd;
     vkEndCommandBuffer(post.upload);
     vkEndCommandBuffer(post.cmd);
+    queue_flush_locked();   // (what is held goes first, as submit_recording's own submit or batch keeps it)
     VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
     si.commandBufferInfoCount = n, si.pCommandBufferInfos = cb;
     vkQueueSubmit2(VK_NULL_HANDLE, 1, &si, VK_NULL_HANDLE);
@@ -371,6 +399,13 @@ void submit_segments(std::vector<Segment> seg, std::vector<int> order) {
         return nullptr;
     }();
     for (auto& w : workers) w.join();
+    if (batch_on()) {   // (ps5-overlap) every segment held or sent, in order, with its slot told which batch it is in
+        for (int k = 0; k < recording_count; k++)
+            if (recordings[k].cmd && recordings[k].cmd->ended)
+                CHECK(recordings[k].submitted && recordings[k].batch >= 1 && recordings[k].batch <= batch_next);
+        std::lock_guard lk(dev.present_mu);
+        queue_flush_locked();   // (the replay's next flush: a wait, a present, the next submit)
+    }
 }
 #include "init_pools.inc"
 }  // namespace mkwvk

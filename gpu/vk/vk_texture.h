@@ -55,6 +55,7 @@ struct Texture {
     // contents
     bool uploaded = false;    // from guest memory, as of upload_gen
     uint32_t upload_gen = 0;
+    uint64_t mem_retry_frame = 0;   // (PS5) its upload found no memory: tried again from this frame (vk_texture.cpp upload)
     uint64_t bc_retry_frame = 0;   // (longshot) a BC3 image whose upload failed: tried again from this frame (vk_texture.cpp)
     uint64_t map_sig = 0;     // (a texture in a virtual pool: its pages' mapping when last uploaded)
     std::vector<uint64_t> page_map;   // (and each 64 KB page's guest address then: what a remap changed)

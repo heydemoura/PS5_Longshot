@@ -1,0 +1,119 @@
+radv/ps5: a mesh-as-compute pass with no workgroups is skipped on the GPU (after lead-mesh-18)
+
+A chunk of an emulated task draw records as many passes as its workgroups could need (their count is known only on the
+GPU; up to RADV_MESH_COMPUTE_MAX_PASSES), each with its flushes, a dispatch and a copy draw. In Ocarina of Time on
+Longshot (PS5, 2026-11-18, RX_VK_PASS_TIMING=2) the mesh programs were about half a heavy frame's GPU time, 16 of 32 ms,
+one draw up to 3.9 ms, the GPU idle at the empty passes' flushes.
+
+- radv_mesh_compute_chunk: each pass after the first wrapped in COND_EXEC on its dispatch's workgroup count (the records
+  pass writes it), after PFP_SYNC_ME; the block's size written once it is recorded, or 0 (it runs) if the stream grew
+- the passes fill in order, so a skipped pass hides none with work; pass 0 always runs, so the CPU's view of the state
+  those packets set holds; the skipped blocks' flushes asked again after the loop
+- LONGSHOT_RADV_MESH_SKIP=0: every pass run, as before; a log line counts the conditional passes and the grown ones
+
+diff -ruN a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+--- a/src/amd/vulkan/radv_cmd_buffer.c	2026-11-18 19:13:51.193930218 +0000
++++ b/src/amd/vulkan/radv_cmd_buffer.c	2026-11-18 23:34:15.544749190 +0000
+@@ -15800,6 +15800,27 @@
+    cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_INV_VCACHE | RADV_CMD_FLAG_INV_SCACHE;
+ }
+ 
++/* (lead-mesh-19) LONGSHOT_RADV_MESH_SKIP=0: every pass run, as before. A chunk records as many
++ * passes as its workgroups could need (an emulated task draw's count is known only on the GPU, up
++ * to RADV_MESH_COMPUTE_MAX_PASSES), each with its flushes, a dispatch and a copy draw: on the PS5
++ * the mesh programs took about half a heavy frame's GPU time (16 of 32 ms, Ocarina of Time on
++ * Longshot, 2026-11-18), the GPU idle at the empty passes' flushes. A pass after the first is now
++ * run only if its dispatch has workgroups (COND_EXEC on the count the records pass wrote). */
++static bool
++radv_mesh_compute_skip_on(void)
++{
++   static int on = -1;
++   if (on < 0) {
++      const char *const e = getenv("LONGSHOT_RADV_MESH_SKIP");
++      p_atomic_set(&on, !(e && e[0] == '0'));
++   }
++   return on;
++}
++
++/* (lead-mesh-19) counted for the log: blocks made conditional, and those whose stream grew in the
++ * middle (their skip count left 0: run, as before) */
++static uint32_t radv_mesh_skip_blocks, radv_mesh_skip_grown;
++
+ /* A chunk's mesh workgroups, from its draw ring (count task workgroups, or the count at
+  * count_va): the records pass, then per pass the first workgroup's index in the header, the
+  * compute pass and the copy draw. */
+@@ -15825,10 +15846,38 @@
+                                   (uint32_t)emu->rings_va, draw_id, header_va, capacity,
+                                   pipeline->mesh_compute_vertices_per_workgroup, passes, count_bias);
+ 
++   /* (lead-mesh-19) The passes fill in order (pass k's first workgroup is k * capacity, the
++    * records pass's start = min(k * capacity, total)), so once one is empty every later one is: a
++    * skipped pass never hides one with work. Pass 0 always runs, so what the CPU tracks of the
++    * state these packets set (the compute shader, the draw's registers) is what the GPU has. */
++   const bool skip = radv_mesh_compute_skip_on() && passes > 1;
+    for (uint32_t pass = 0; pass < passes; pass++) {
+       const uint64_t args_va = header_va + RADV_MESH_COMPUTE_HEADER_PASSES + pass * RADV_MESH_COMPUTE_PASS_BYTES;
+       const uint32_t first = pass * capacity;
+ 
++      /* (lead-mesh-19) This pass only if its dispatch's x, at args_va, is not 0. PFP_SYNC_ME
++       * first: the fetcher reads the count after the earlier passes' and the records pass's work
++       * (the flushes the micro engine waits on), not ahead of them. The block's size is known only
++       * once written: the count is set after it, or left 0 (the block runs) if the stream grew. */
++      uint32_t *cond_size = NULL;
++      const uint32_t *cond_buf = NULL;
++      unsigned cond_start = 0;
++      if (skip && pass > 0) {
++         radeon_check_space(device->ws, cs->b, 1024);   /* (the block's room: no growth in it as a rule) */
++         radeon_begin(cs);
++         radeon_emit(PKT3(PKT3_PFP_SYNC_ME, 0, 0));
++         radeon_emit(0);
++         radeon_emit(PKT3(PKT3_COND_EXEC, 3, 0));
++         radeon_emit((uint32_t)args_va);
++         radeon_emit((uint32_t)(args_va >> 32));
++         radeon_emit(0);
++         radeon_emit(0); /* (the block's dwords: below) */
++         radeon_end();
++         cond_size = &cs->b->buf[cs->b->cdw - 1];
++         cond_buf = cs->b->buf;
++         cond_start = cs->b->cdw;
++      }
++
+       /* The records pass, or the last pass's compute pass and copy, are done with the header. */
+       radv_emit_cache_flush(cmd_buffer);
+       radeon_check_space(device->ws, cs->b, 16);
+@@ -15845,9 +15894,35 @@
+       radeon_check_space(device->ws, cs->b, 64);
+       radv_emit_indirect_draw_packets(cmd_buffer, &rast);
+ 
++      if (cond_size) {
++         const unsigned block = cs->b->cdw - cond_start;
++         p_atomic_inc(&radv_mesh_skip_blocks);
++         if (cs->b->buf == cond_buf && cs->b->cdw >= cond_start && block <= 0x3fff) {
++            *cond_size = block;
++         } else {
++            *cond_size = 0; /* (grew, or too long for the count's 14 bits: runs, as before) */
++            p_atomic_inc(&radv_mesh_skip_grown);
++         }
++      }
++
+       /* The next pass or chunk writes the header and the slots the copy reads, and the rings. */
+       cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_VS_PARTIAL_FLUSH;
+    }
++   if (skip) {
++      /* (lead-mesh-19) A skipped block's flushes did not run: what came after the last pass that
++       * ran is ordered by these, at the next emission (the next chunk's records pass, the draw
++       * after), as the skipped passes' own flushes would have ordered it */
++      cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_CS_PARTIAL_FLUSH | RADV_CMD_FLAG_VS_PARTIAL_FLUSH |
++                                      RADV_CMD_FLAG_INV_VCACHE | RADV_CMD_FLAG_INV_SCACHE;
++      static uint32_t told;
++      const uint32_t blocks = p_atomic_read(&radv_mesh_skip_blocks);
++      if (told < 4 && blocks >= (1u << (told * 4 + 4))) {
++         told++;
++         fprintf(stderr, "radv/ps5: mesh compute: %u passes after the first made conditional (an empty one skipped on the "
++                         "GPU), %u of them left to run because their stream grew (LONGSHOT_RADV_MESH_SKIP=0: all run)\n",
++                 blocks, p_atomic_read(&radv_mesh_skip_grown));
++      }
++   }
+ }
+ 
+ /* A mesh draw of a pipeline whose mesh shader runs as compute: the emulated task draw's chunks

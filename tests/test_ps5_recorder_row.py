@@ -28,7 +28,10 @@ def main():
                         menu)),
          "Auto is not Off on the console"),
         ('{"RX_VK_DESC_POOL_DIV", "8"}' in host, "the console's descriptor pools are no longer an eighth"),
-        ("RX_VK_RECORDER" not in host, "hos_main.c sets a recorder switch on the console"),
+        # (the row chooses the recorder's mode: the console's defaults may not set the switches that do, RX_VK_RECORDER itself
+        # and RX_VK_ASYNC. Those that tune the recorder once the row turns it on, RX_VK_RECORDER_OWN, RX_VK_RECORDER_END and
+        # RX_VK_RECORDINGS, turn nothing on and may be there)
+        (not re.search(r"RX_VK_(?:RECORDER|ASYNC)\b", host), "hos_main.c sets the recorder's mode (RX_VK_RECORDER or RX_VK_ASYNC) on the console"),
         ("## Threaded rendering" in docs and "recorder thread alone" in docs, "docs/PS5.md does not say what On is there"),
     ]
     bad = [why for ok, why in checks if not ok]

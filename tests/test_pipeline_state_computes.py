@@ -571,6 +571,7 @@ struct VkComputePipelineCreateInfo {
 };
 struct { uintptr_t device = 0x1234; struct { bool pipelineCreationCacheControl = true; } vk13; } dev;
 struct Program {
+    uint64_t key = 0x5eed;
     struct Stage { uintptr_t module; };
     std::vector<Stage> stages{{0x2468}};
     unsigned workgroup[3]{32, 1, 1};
@@ -591,6 +592,7 @@ static bool serial = false, quick_row = false;
 static bool serial_builds_on() { return serial; }
 static bool intel_quick_compute() { return quick_row; }
 static void pin_subgroup(decltype(VkComputePipelineCreateInfo::stage)&, unsigned) {}
+static void pipeline_key_note(uint64_t) {}   // (vk_draw.cpp's names the next pipeline's program for LONGSHOT_RADV_SHADER_LOG's log alone)
 static VkResult cached_compute(const VkComputePipelineCreateInfo* ci, VkPipeline* pl) {
     CHECK(ci->stage.module == 0x2468 && ci->layout == 0x1357);
     if (ci->flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT) {

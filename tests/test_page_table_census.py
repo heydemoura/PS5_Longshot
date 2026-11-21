@@ -53,6 +53,9 @@ int main() {
     for (const PageWindow& w : kPageWindows)
         std::printf("WINDOW %llu %llu %llu\n", (unsigned long long)w.base, (unsigned long long)w.bytes, (unsigned long long)w.first);
     std::printf("ENTRIES %llu\n", (unsigned long long)kPageTableEntries);
+#ifdef __PROSPERO__
+    return 0;   // (the PS5's windows, compared with the shaders' PS5 constants; the cases below are the PC's addresses)
+#endif
     // (the bytes outside)
     CHECK(page_table_outside(0x1000000000ull, 0x1004000000ull) == 0);
     CHECK(page_table_outside(0x2000000000ull, 0x2004000000ull) == 64 * MB);
@@ -120,13 +123,20 @@ def number(text):
 
 def source_checks(vk, fails):
     emit = (vk / "eden/shader_recompiler/backend/spirv/spirv_emit_context.cpp").read_text(encoding="utf-8")
-    shaders = {}
+    # (the shaders' constants for each build: one definition for both, or the PS5's and the PC's in an
+    # #if defined(__PROSPERO__) / #else / #endif of their own. Anything else is not read as either)
+    shaders = {"pc": {}, "ps5": {}}
     for name in ("kGuestPagesBase", "kGuestPagesBytes", "kGuestPagesBase2", "kGuestPagesBytes2"):
-        m = re.search(r"constexpr unsigned long long %s = ([^;]+);" % name, emit)
-        if not m:
-            fails.append("spirv_emit_context.cpp: no %s" % name)
+        found = re.findall(r"constexpr unsigned long long %s = ([^;]+);" % name, emit)
+        split = re.findall(r"#if defined\(__PROSPERO__\)\nconstexpr unsigned long long %s = ([^;]+);\n#else\n"
+                           r"constexpr unsigned long long %s = ([^;]+);\n#endif\n" % (name, name), emit)
+        if len(found) == 1:
+            shaders["pc"][name] = shaders["ps5"][name] = number(found[0])
+        elif len(found) == 2 and len(split) == 1:
+            shaders["ps5"][name], shaders["pc"][name] = number(split[0][0]), number(split[0][1])
+        else:
+            fails.append("spirv_emit_context.cpp: no %s, or not one for the PS5 and one for the PC" % name)
             return None
-        shaders[name] = number(m.group(1))
     memory = (vk / "vk_memory.cpp").read_text(encoding="utf-8")
     setter = block(memory, "void guest_pages_set(")
     if "for (const PageWindow& w : kPageWindows)" not in setter or re.search(r"0x[0-9a-fA-F]{6,}", setter):
@@ -171,12 +181,24 @@ def main():
                     fails.append("the fixture failed: " + got.stderr.strip())
                 else:
                     out = got.stdout.splitlines()
-                    windows = [tuple(int(x) for x in line.split()[1:]) for line in out if line.startswith("WINDOW ")]
-                    if shaders and windows != [(shaders["kGuestPagesBase"], shaders["kGuestPagesBytes"], 0),
-                                               (shaders["kGuestPagesBase2"], shaders["kGuestPagesBytes2"], shaders["kGuestPagesBytes"] >> 12)]:
-                        fails.append("page_table_census.h's windows %r are not the shaders' %r" % (windows, shaders))
-                    if shaders and out.count("ENTRIES %d" % ((shaders["kGuestPagesBytes"] + shaders["kGuestPagesBytes2"]) >> 12)) != 1:
-                        fails.append("kPageTableEntries is not the two windows' 4 KB pages")
+                    # (the PC's windows here; the PS5's from the header built with __PROSPERO__, against the shaders' PS5 constants)
+                    outs = {"pc": out}
+                    ps5_exe = Path(tmp) / ("fixture_ps5" + (".exe" if os.name == "nt" else ""))
+                    r5 = subprocess.run([a.cxx, "-std=c++20", "-O1", "-Wall", "-Wextra", "-Werror", "-D__PROSPERO__", "-I", str(vk),
+                                         str(src), "-o", str(ps5_exe)], capture_output=True, text=True, timeout=180)
+                    if r5.returncode:
+                        print(r5.stdout + r5.stderr)
+                        fails.append("the fixture did not compile for the PS5 (__PROSPERO__)")
+                    else:
+                        outs["ps5"] = subprocess.run([str(ps5_exe)], capture_output=True, text=True, timeout=60).stdout.splitlines()
+                    for build, lines in outs.items():
+                        sh = shaders and shaders[build]
+                        windows = [tuple(int(x) for x in line.split()[1:]) for line in lines if line.startswith("WINDOW ")]
+                        if sh and windows != [(sh["kGuestPagesBase"], sh["kGuestPagesBytes"], 0),
+                                              (sh["kGuestPagesBase2"], sh["kGuestPagesBytes2"], sh["kGuestPagesBytes"] >> 12)]:
+                            fails.append("%s: page_table_census.h's windows %r are not the shaders' %r" % (build, windows, sh))
+                        if sh and lines.count("ENTRIES %d" % ((sh["kGuestPagesBytes"] + sh["kGuestPagesBytes2"]) >> 12)) != 1:
+                            fails.append("%s: kPageTableEntries is not the two windows' 4 KB pages" % build)
                     parts, at = {}, None
                     for line in out:
                         if line.startswith("REFRESH "):

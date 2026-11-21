@@ -35,6 +35,7 @@ inline void slot_begin(uint64_t) {}
 inline void slot_done() {}
 inline uint64_t produced() { return 0; }
 struct OwnSlot { OwnSlot() {} ~OwnSlot() {} };   // (a scope, as the real one)
+inline void end_deferred(VkCommandBuffer cb) { vkEndCommandBuffer(cb); }   // (RX_VK_RECORDER_END's packet; with the recorder off, the call)
 }   // namespace rec
 uint64_t rec_end_pos[64];   // (vk_replay.cpp: each slot's end in the recorder's ring)
 void logf(const char*,...) {}
@@ -53,6 +54,7 @@ void flush_mapped(VmaAllocation allocation,uint64_t size) {
 std::deque<RecordingRes> res;
 thread_local RecordingRes* cur=nullptr;
 const uint64_t kStream=1024;
+uint64_t stream_first() { return kStream; }   // (vk_draw.cpp's first stream size, RX_VK_STREAM_MB, as kStream)
 constexpr VkBufferUsageFlags kStreamUse=VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT|VK_BUFFER_USAGE_STORAGE_BUFFER_BIT|VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT|VK_BUFFER_USAGE_INDEX_BUFFER_BIT|VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
 std::atomic<uint64_t> stream_extra{0},stream_grown{0},stream_peak{0},pools_extra{0};
 bool stream_grow_off() { return false; }

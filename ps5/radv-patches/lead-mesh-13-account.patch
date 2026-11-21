@@ -1,0 +1,72 @@
+The driver's buffers counted by purpose and size class, for diagnosis: radv_ps5_account_bytes/_count[6][3], which
+host/ps5/win32_ps5.c's meter prints every 5 s ("[ps5] driver buffers by purpose"). Rows by the priority RADV gives each
+buffer and its domain: application, queries, descriptor pools, uploads and fences, shader code and scratch, command
+streams; columns under 1 MiB, under 16 MiB, larger. On 2026-11-18 ~1.5 GB of the driver's 3 GB had no owner known.
+
+diff -ruN a/src/amd/vulkan/winsys/ps5/radv_ps5_bo.c b/src/amd/vulkan/winsys/ps5/radv_ps5_bo.c
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_bo.c	2026-11-18 13:08:57.389139796 +0000
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_bo.c	2026-11-18 13:08:57.417139783 +0000
+@@ -21,6 +21,23 @@
+  * 2^47 (R86-R88). */
+ 
+ uint64_t radv_ps5_allocated_bytes;
++/* The buffers by purpose and size, for diagnosis (host/ps5/win32_ps5.c prints
++ * them every 5 s): rows application, queries, descriptor pools, uploads and
++ * fences, shader code and scratch, command streams, by the priority RADV
++ * gives each buffer and its domain; columns under 1 MiB, under 16, larger. */
++uint64_t radv_ps5_account_bytes[6][3], radv_ps5_account_count[6][3];
++
++static unsigned
++radv_ps5_account_row(unsigned priority, enum radeon_bo_domain domain)
++{
++   if (priority <= RADV_BO_PRIORITY_APPLICATION_MAX)
++      return 0;
++   if (priority == RADV_BO_PRIORITY_QUERY_POOL)
++      return 1;
++   if (priority == RADV_BO_PRIORITY_DESCRIPTOR)
++      return (domain & RADEON_DOMAIN_VRAM) ? 2 : 3;
++   return (domain & RADEON_DOMAIN_VRAM) ? 4 : 5;
++}
+ 
+ /* A buffer freed while the GPU may still run submissions made before the free
+  * keeps its memory and its range until they have run, as the amdgpu kernel
+@@ -102,7 +119,6 @@
+                        enum radeon_bo_flag flags, unsigned priority, uint64_t replay_address,
+                        struct radeon_winsys_bo **out_bo)
+ {
+-   (void)priority;
+    struct radv_ps5_winsys *const ws = radv_ps5_winsys(rws);
+    *out_bo = NULL;
+ 
+@@ -172,6 +188,10 @@
+    }
+ 
+    p_atomic_add(&radv_ps5_allocated_bytes, bo->memory.bytes);
++   bo->account_row = (uint8_t)radv_ps5_account_row(priority, domain);
++   bo->account_size = bo->memory.bytes < (UINT64_C(1) << 20) ? 0 : bo->memory.bytes < (UINT64_C(16) << 20) ? 1 : 2;
++   p_atomic_add(&radv_ps5_account_bytes[bo->account_row][bo->account_size], bo->memory.bytes);
++   p_atomic_inc(&radv_ps5_account_count[bo->account_row][bo->account_size]);
+    if (domain & RADEON_DOMAIN_VRAM)
+       p_atomic_add(&ws->allocated_vram, bo->memory.bytes);
+    else
+@@ -199,6 +219,8 @@
+       return;
+    }
+    p_atomic_add(&radv_ps5_allocated_bytes, -(int64_t)bo->memory.bytes);
++   p_atomic_add(&radv_ps5_account_bytes[bo->account_row][bo->account_size], -(int64_t)bo->memory.bytes);
++   p_atomic_dec(&radv_ps5_account_count[bo->account_row][bo->account_size]);
+    if (bo->base.initial_domain & RADEON_DOMAIN_VRAM)
+       p_atomic_add(&ws->allocated_vram, -(int64_t)bo->memory.bytes);
+    else
+diff -ruN a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.h b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.h
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.h	2026-11-18 13:08:57.389139796 +0000
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_winsys.h	2026-11-18 13:08:57.417139783 +0000
+@@ -119,6 +119,8 @@
+    /* Host memory the application owns (buffer_from_ptr), which the buffer
+     * does not free. */
+    bool imported;
++   /* Its row and size class in radv_ps5_account_bytes (radv_ps5_bo.c). */
++   uint8_t account_row, account_size;
+ };
+ 
+ static inline struct radv_ps5_bo *

@@ -34,8 +34,17 @@ def main():
             raise SystemExit("%s takes dev.present_mu before it knows a submit is held" % name.split("(")[0][5:])
     submit = body(replay, "void submit_recording(")
     up = "pend_held.store(true, std::memory_order_release);"
-    if replay.count(up) != 1 or up not in submit:
-        raise SystemExit("pend_held is raised somewhere else than where submit_recording holds a submit")
+    # (ps5-overlap: and where replay_handle holds a parallel replay's segment, the same way: its command buffers in the list
+    # first, under dev.present_mu)
+    segs = body(replay, "const uint8_t* replay_handle(")
+    if up not in submit or replay.count(up) != 1 + (up in segs):
+        raise SystemExit("pend_held is raised somewhere else than where submit_recording or replay_handle's segments hold a submit")
+    if up in segs:
+        at = segs.index(up)
+        lock = segs.rfind("std::lock_guard lk(dev.present_mu);", 0, at)
+        push = segs.rfind("pend.cbs.push_back(cb[i]);", 0, at)
+        if not 0 <= lock < push < at:
+            raise SystemExit("a held segment must be in the list before it is said to be, under dev.present_mu")
     lock, push, raised = (submit.index(x) for x in ("std::lock_guard lk(dev.present_mu);", "pend.cbs.push_back(cb[i]);", up))
     mapped = submit.index("if (seq) map_recording();", raised)
     if not lock < push < raised < mapped:

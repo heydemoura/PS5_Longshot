@@ -41,6 +41,26 @@ public:
         node = &chunks.front();
     }
 
+    /// (longshot, PS5) as ReleaseContents, without the squash's allocation: the first chunk kept, emptied, the others freed.
+    /// A translation's pools are released in its destructor, where a std::bad_alloc from the squash ended the title
+    /// (2026-11-18, direct memory full)
+    void ReleaseContentsInPlace() {
+        if (chunks.empty()) {
+            return;
+        }
+        chunks.front().Release();
+        chunks.resize(1);
+        chunks.shrink_to_fit();
+        node = &chunks.front();
+    }
+
+    /// (longshot) the bytes its chunks hold, used or not: ReleaseContents keeps them all, squashed into one
+    [[nodiscard]] size_t CapacityBytes() const {
+        size_t n = 0;
+        for (const Chunk& c : chunks) n += c.num_objects;
+        return n * sizeof(Storage);
+    }
+
 private:
     struct NonTrivialDummy {
         NonTrivialDummy() noexcept {}

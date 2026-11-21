@@ -129,7 +129,41 @@ int64_t steady_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 std::atomic<int64_t> last_log_ms{0};   // (when logf last wrote: the preparation's status line comes after a silence)
+/// (longshot) Lines left out before they are formatted. RX_VK_LOG_LEVEL=<0-4>: the most detailed level written (error 0 ..
+/// trace 4; on the PS5 info, 2, elsewhere all). RX_VK_QUIET_STATS=1: the periodic statistics in play left out too, a frame's and
+/// every 600 submits' reports (2026-11-18 on the PS5: 33000 lines in 45 minutes, most of them these, each formatted and sent
+/// through the platform layer's pipe to the kernel log while the game ran). Warnings and errors always written
+static bool log_left_out(LogLevel level, const char* fmt) {
+    static const int most = [] {
+        const char* e = std::getenv("RX_VK_LOG_LEVEL");
+        if (e && *e) return std::atoi(e);
+#ifdef __PROSPERO__
+        return (int)log_info;
+#else
+        return (int)log_trace;
+#endif
+    }();
+    // (a level out of range is info, as vlogf writes it: not left out for being past the most detailed level)
+    if ((int)level < (int)log_error || (int)level > (int)log_trace) level = log_info;
+    if ((int)level > most) return true;
+    if (level <= log_warn) return false;
+    static const bool quiet = std::getenv("RX_VK_QUIET_STATS") && std::atoi(std::getenv("RX_VK_QUIET_STATS")) != 0;
+    if (!quiet || !fmt) return false;
+    static const char* const periodic[] = {
+        "vk: %zu textures retired", "vk: replay reads of guest memory as submitted", "vk: mirror syncs (600 submits)",
+        "vk:   read live, by pool", "vk: imports: %zu live", "vk: batched submits: %lld flushes", "vk: readbacks of GPU results",
+        "vk:   (its written part", "vk: capture: a submit", "vk: a capture taken (ms)", "vk: a submit's memory work",
+        "vk: frame interpolation: %", "vk: program picks:", "vk: a frame: ",
+        "vk: %lld presents, %.1f fps", "vk: the recording streams",
+        "vk: shadow staging (",
+    };
+    // (kept: a frame's replay time, its GPU time and the host's GPU waits, the three that say where a frame's time goes)
+    for (const char* p : periodic)
+        if (!std::strncmp(fmt, p, std::strlen(p))) return true;
+    return std::strstr(fmt, "re-uploaded (its memory") != nullptr;
+}
 static void vlogf(LogLevel level, const char* fmt, std::va_list a) {
+    if (log_left_out(level, fmt)) return;
     static const char* const tags[] = {"[error] ", "[warn] ", "", "[debug] ", "[trace] "};
     char b[1024];
     const int n = std::snprintf(b, sizeof b, "%s", tags[level >= log_error && level <= log_trace ? level : log_info]);
@@ -1667,6 +1701,9 @@ __attribute__((visibility("default")))
 extern "C" int sceKernelUsleep(unsigned microseconds);
 extern "C" void hos_ps5_klog_now(const char* fmt, ...);
 extern "C" void ps5_heap_trim(void) __attribute__((weak));   // (PS5_PayloadSDK 55a2de0 and later)
+// (how long one wait may last on this thread: a texture upload waits 1 s, vk_texture.cpp upload)
+thread_local uint32_t ps5_new_wait_ms = 10000;
+extern "C" void hos_ps5_swap_need(size_t bytes);
 static void ps5_new_waits() {
     using clk = std::chrono::steady_clock;
     static thread_local clk::time_point first, last;
@@ -1677,7 +1714,8 @@ static void ps5_new_waits() {
         if (told++ < 20) hos_ps5_klog_now("[ps5] operator new: no memory: waiting for some");
         if (ps5_heap_trim) ps5_heap_trim();
     }
-    if (now - first > std::chrono::seconds(10)) {
+    hos_ps5_swap_need(16u << 20);   // (the game's cold pages to the swap file: host/ps5/guest_swap_ps5.inc, a pass a try)
+    if (now - first > std::chrono::milliseconds(ps5_new_wait_ms)) {
         last = {};
         throw std::bad_alloc();
     }

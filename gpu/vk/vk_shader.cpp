@@ -726,9 +726,23 @@ struct Translation {
         for (const auto* block : program.blocks) bytes += block->Instructions().size() * sizeof(Shader::IR::Inst);
         program = {};
         if (bytes > kSparePoolBytes) return;
+#ifdef __PROSPERO__
+        // (PS5: emptied in place, nothing allocated in a destructor: object_pool.h ReleaseContentsInPlace)
+        pools->flow_blocks.ReleaseContentsInPlace();
+        pools->blocks.ReleaseContentsInPlace();
+        pools->insts.ReleaseContentsInPlace();
+#else
         pools->flow_blocks.ReleaseContents();
         pools->blocks.ReleaseContents();
         pools->insts.ReleaseContents();
+#endif
+#ifdef __PROSPERO__
+        // (PS5) the live IR above leaves out what dead code elimination and merged blocks used, which the pools keep: a
+        // spare is kept by what its chunks hold, and one a thread, not three. The translator's spares held ~73 MiB of the
+        // heap, growing, when direct memory ran out (2026-11-18, host/ps5/heap_sites_ps5.cpp)
+        const size_t held = pools->flow_blocks.CapacityBytes() + pools->blocks.CapacityBytes() + pools->insts.CapacityBytes();
+        if (held > kSparePoolBytes || !spare_pools().empty()) return;
+#endif
         spare_pools().push_back(std::move(pools));
     }
 };
@@ -1348,7 +1362,7 @@ uint64_t translator_stamp() {
     // the programs already cached. tests/test_program_stamp_knobs.py checks the translator's switches against this list)
     for (char** e = _environ; e && *e; e++)
         for (const char* pre : {"RX_VK_MMA", "RX_VK_NATIVE", "RX_VK_NAN", "RX_VK_TASK_CAP", "RX_VK_NETWORK", "RX_VK_GP_", "RX_VK_FOLLOW", "RX_VK_NO_FOLLOW", "RX_VK_NO_F16", "RX_VK_SHARED", "RX_VK_MESH", "RX_VK_NO_INVARIANT", "RX_VK_MARKERS",
-                                "RX_VK_NO_CBUF_LOAD_RULE", "RX_VK_PTR_SPLIT_FALLBACK", "RX_VK_ALL_GLOBAL_PROGS", "RX_VK_NO_EXTREGS", "RX_VK_NO_DRAW_PARAMS", "RX_VK_MISS_LOG", "RX_VK_BLOCK_PROBE", "EDEN_"})
+                                "RX_VK_NO_CBUF_LOAD_RULE", "RX_VK_NO_FRAG_LOAD_RULE", "RX_VK_PTR_SPLIT_FALLBACK", "RX_VK_ALL_GLOBAL_PROGS", "RX_VK_NO_EXTREGS", "RX_VK_NO_DRAW_PARAMS", "RX_VK_MISS_LOG", "RX_VK_BLOCK_PROBE", "EDEN_"})
             if (!strncmp(*e, pre, strlen(pre))) add(*e, strlen(*e));
     return h;
 }

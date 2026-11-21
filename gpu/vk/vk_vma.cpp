@@ -53,7 +53,12 @@ constexpr unsigned kImageBlockMb = 32;
 #else
 constexpr unsigned kImageBlockMb = 128;
 #endif
-const uint64_t kImageBlock = (getenv("RX_VK_IMAGE_BLOCK_MB") ? (uint64_t)std::max(16, atoi(getenv("RX_VK_IMAGE_BLOCK_MB"))) : kImageBlockMb) << 20;
+// (read at first use, not by an initialiser at namespace scope: that runs before main, before the game folder's env file
+// (host/hos_main.c load_longshot_env), and RX_VK_IMAGE_BLOCK_MB there was not seen)
+uint64_t image_block() {
+    static const uint64_t v = (getenv("RX_VK_IMAGE_BLOCK_MB") ? (uint64_t)std::max(16, atoi(getenv("RX_VK_IMAGE_BLOCK_MB"))) : kImageBlockMb) << 20;
+    return v;
+}
 
 // (longshot) and the render targets' images in blocks of their own (texture_get's for a target: OoT's transient ones, made and let go
 // all the time). In the same blocks as the textures that stay, each one gone left a hole beside a texture that kept its block: the
@@ -81,9 +86,9 @@ VmaPool target_images_pool() {
     if (vmaFindMemoryTypeIndexForImageInfo(vma, &rep, &ai, &type) != VK_SUCCESS) return VK_NULL_HANDLE;
     VmaPoolCreateInfo pi{};
     pi.memoryTypeIndex = type;
-    pi.blockSize = kImageBlock;
+    pi.blockSize = image_block();
     if (vmaCreatePool(vma, &pi, &target_image_pool) != VK_SUCCESS) target_image_pool = VK_NULL_HANDLE;
-    logf("vk: render targets' images from blocks of their own (%llu MB, memory type %u)%s", (unsigned long long)(kImageBlock >> 20),
+    logf("vk: render targets' images from blocks of their own (%llu MB, memory type %u)%s", (unsigned long long)(image_block() >> 20),
          type, target_image_pool ? "" : ": not made");
     return target_image_pool;
 }
@@ -98,7 +103,7 @@ static size_t blocks_at_start(bool holds_textures) {
     for (uint32_t h = 0; h < dev.memory.memoryHeapCount; h++)
         if (dev.memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) heap = std::max<uint64_t>(heap, dev.memory.memoryHeaps[h].size);
     if (const char* e = getenv("RX_VK_IMAGE_PREALLOC")) return (size_t)std::max(0, atoi(e));
-    return (size_t)vram_compact::blocks_at_start(heap, kImageBlock, holds_textures,
+    return (size_t)vram_compact::blocks_at_start(heap, image_block(), holds_textures,
                                                  dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU);
 }
 /// The pool with n blocks made now, or empty when there is no room for them (its blocks made as needed); the blocks made
@@ -127,9 +132,9 @@ VmaPool images_pool() {
     if (vmaFindMemoryTypeIndexForImageInfo(vma, &rep, &ai, &type) != VK_SUCCESS) return VK_NULL_HANDLE;
     VmaPoolCreateInfo pi{};
     pi.memoryTypeIndex = type;
-    pi.blockSize = kImageBlock;
+    pi.blockSize = image_block();
     const size_t n = make_pool(pi, blocks_at_start(!vram_compact::enabled(getenv("RX_VK_COMPACT"))), image_pool);
-    logf("vk: images from a pool of %llu MB blocks (memory type %u), %zu made at the start%s", (unsigned long long)(kImageBlock >> 20), type,
+    logf("vk: images from a pool of %llu MB blocks (memory type %u), %zu made at the start%s", (unsigned long long)(image_block() >> 20), type,
          n, image_pool ? "" : ": not made");
     return image_pool;
 }
@@ -158,10 +163,10 @@ VmaPool textures_pool() {
     if (vmaFindMemoryTypeIndexForImageInfo(vma, &rep, &ai, &type) != VK_SUCCESS) return VK_NULL_HANDLE;
     VmaPoolCreateInfo pi{};
     pi.memoryTypeIndex = type;
-    pi.blockSize = kImageBlock;
-    texture_pool_kept = make_pool(pi, blocks_at_start(true), texture_pool) * kImageBlock;
+    pi.blockSize = image_block();
+    texture_pool_kept = make_pool(pi, blocks_at_start(true), texture_pool) * image_block();
     logf("vk: textures from a pool of their own, %llu MB blocks (RX_VK_COMPACT), %llu made at the start%s",
-         (unsigned long long)(kImageBlock >> 20), (unsigned long long)(texture_pool_kept / kImageBlock), texture_pool ? "" : ": not made");
+         (unsigned long long)(image_block() >> 20), (unsigned long long)(texture_pool_kept / image_block()), texture_pool ? "" : ": not made");
     return texture_pool;
 }
 bool textures_pool_usage(uint64_t* block_bytes, uint64_t* free_bytes, uint64_t* kept_bytes) {
@@ -232,6 +237,14 @@ bool create_image(const VkImageCreateInfo& ci, VkImage& image, VmaAllocation& al
     // each would be thousands)
     if (!dedicated && (uint64_t)ci.extent.width * ci.extent.height * ci.extent.depth * ci.arrayLayers >= (256u << 10) &&
         hos_ps5_direct_room() < ps5_tex_reserve())
+        dedicated = true;
+    // (and a texture of 64K texels and up always, not only once memory is short: at an area change on 2026-11-18 the new
+    // area's textures were made while 1.7 GB was free, into the blocks; then 992 MB of blocks held 600 MB of textures, the
+    // 559 the eviction let go left holes, and the game's next pages found 9 MiB. RX_VK_PS5_OWN_TEXELS=<n>: from n texels,
+    // 0 = only when short, as before. Render targets stay in the blocks: ~25 are made and destroyed a second)
+    static const uint64_t own_from = getenv("RX_VK_PS5_OWN_TEXELS") ? (uint64_t)atoll(getenv("RX_VK_PS5_OWN_TEXELS")) : 65536;
+    if (!dedicated && textures && !target && own_from &&
+        (uint64_t)ci.extent.width * ci.extent.height * ci.extent.depth * ci.arrayLayers >= own_from)
         dedicated = true;
 #endif
     VmaAllocationCreateInfo ai{};

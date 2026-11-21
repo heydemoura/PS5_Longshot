@@ -14,7 +14,12 @@ namespace mkwvk {
 
 /// What the counter shows (fps_stats::Level): set by the menu, read at every present
 extern std::atomic<int> fps_level_now;
-inline bool fps_breakdown_on() { return fps_level_now.load(std::memory_order_relaxed) >= fps_stats::kBreakdown; }
+/// (ps5-overlap) RX_VK_FPS_LOG=<seconds>: the Breakdown measured whatever the counter shows, and its means logged every that
+/// many seconds (vk_fps.cpp fps_presented). Set at the first present
+extern std::atomic<bool> fps_log_forced;
+inline bool fps_breakdown_on() {
+    return fps_level_now.load(std::memory_order_relaxed) >= fps_stats::kBreakdown || fps_log_forced.load(std::memory_order_relaxed);
+}
 
 int64_t fps_clock();   // (ns, the clock the frames are stamped with)
 /// At the game's present (vk_replay.cpp present), on the thread that presents: the frame since the last one, into the ring

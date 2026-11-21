@@ -1,0 +1,147 @@
+EglantinePS5's RADV memory fixes (its tools/patch-radv-wsi.py DRIVER_ADAPTATIONS), carried by
+~/longshot/ps5/scripts/radv_eg_port.py:
+- the winsys takes 16 KiB pieces when no large one is free (EDEN_RADV_FINE_PIECES=0: off)
+- a command buffer's upload buffer that stays mostly unused is given back at reset (EDEN_RADV_UPLOAD_TRIM_KIB=<n>)
+- a shader arena that cannot be made fails the shader instead of the process; a compute pipeline whose shader
+  did not upload is not built
+Longshot ran out of direct memory 9 min in on 2026-11-18 with 120 MiB free in 323 pieces, none over 4 MiB.
+
+diff -ruN a/src/amd/vulkan/radv_cmd_buffer.c b/src/amd/vulkan/radv_cmd_buffer.c
+--- a/src/amd/vulkan/radv_cmd_buffer.c	2026-11-18 11:33:12.881972617 +0000
++++ b/src/amd/vulkan/radv_cmd_buffer.c	2026-11-18 11:26:01.254035479 +0000
+@@ -1324,6 +1324,33 @@
+    memset(&cmd_buffer->state.render, 0, sizeof(cmd_buffer->state.render));
+ }
+ 
++#include <stdlib.h>
++
++static void
++eden_upload_trim(struct radv_cmd_buffer *cmd_buffer)
++{
++   static int64_t limit = -1;
++   if (limit < 0) {
++      const char *const value = getenv("EDEN_RADV_UPLOAD_TRIM_KIB");
++      limit = value ? (int64_t)strtoull(value, NULL, 10) << 10 : 0;
++   }
++   if (!limit || !cmd_buffer->upload.upload_bo)
++      return;
++   if (cmd_buffer->upload.size <= (uint64_t)limit || (uint64_t)cmd_buffer->upload.offset * 4 >= cmd_buffer->upload.size) {
++      cmd_buffer->upload.small_recordings = 0;
++      return;
++   }
++   if (++cmd_buffer->upload.small_recordings < 64)
++      return;
++   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
++   radv_rmv_log_command_buffer_bo_destroy(device, cmd_buffer->upload.upload_bo);
++   radv_bo_destroy(device, &cmd_buffer->vk.base, cmd_buffer->upload.upload_bo);
++   cmd_buffer->upload.upload_bo = NULL;
++   cmd_buffer->upload.map = NULL;
++   cmd_buffer->upload.size = 0;
++   cmd_buffer->upload.small_recordings = 0;
++}
++
+ static void
+ radv_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer, UNUSED VkCommandBufferResetFlags flags)
+ {
+@@ -1371,6 +1398,7 @@
+    memset(&cmd_buffer->queue_state, 0, sizeof(cmd_buffer->queue_state));
+    memset(&cmd_buffer->state, 0, sizeof(cmd_buffer->state));
+ 
++   eden_upload_trim(cmd_buffer);
+    if (cmd_buffer->upload.upload_bo)
+       radv_cs_add_buffer(device->ws, cs->b, cmd_buffer->upload.upload_bo);
+    cmd_buffer->upload.offset = 0;
+diff -ruN a/src/amd/vulkan/radv_cmd_buffer.h b/src/amd/vulkan/radv_cmd_buffer.h
+--- a/src/amd/vulkan/radv_cmd_buffer.h	2026-11-18 11:33:12.885972616 +0000
++++ b/src/amd/vulkan/radv_cmd_buffer.h	2026-11-18 11:26:01.258035478 +0000
+@@ -515,6 +515,8 @@
+    uint64_t size;
+    struct radeon_winsys_bo *upload_bo;
+    struct list_head list;
++   /* EglantinePS5: recordings in a row that used under a quarter of it (eden_upload_trim). */
++   unsigned small_recordings;
+ };
+ 
+ struct radv_cmd_stream {
+diff -ruN a/src/amd/vulkan/radv_pipeline_compute.c b/src/amd/vulkan/radv_pipeline_compute.c
+--- a/src/amd/vulkan/radv_pipeline_compute.c	2026-11-18 11:33:12.885972616 +0000
++++ b/src/amd/vulkan/radv_pipeline_compute.c	2026-11-18 11:26:01.258035478 +0000
+@@ -212,12 +212,18 @@
+ 
+    cs_stage.feedback.duration += os_time_get_nano() - stage_start;
+ 
+-   if (!skip_shaders_cache) {
++   if (!pipeline->base.shaders[MESA_SHADER_COMPUTE]) {
++      fprintf(stderr, "radv/ps5: compute pipeline %016llx not built: %s; refused, not cached\n",
++              (unsigned long long)pipeline->base.pipeline_hash,
++              cs_binary ? "the shader's upload failed (shader memory)" : "the compiler gave no binary");
++      result = vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
++   } else if (!skip_shaders_cache) {
+       radv_pipeline_cache_insert(device, cache, &pipeline->base);
+    }
+ 
+    free(cs_binary);
+-   if (radv_can_dump_shader_stats(&device->compiler_info, cs_stage.nir)) {
++   if (pipeline->base.shaders[MESA_SHADER_COMPUTE] &&
++       radv_can_dump_shader_stats(&device->compiler_info, cs_stage.nir)) {
+       radv_dump_shader_stats(device, &pipeline->base, pipeline->base.shaders[MESA_SHADER_COMPUTE], stderr);
+    }
+    radv_pipeline_stage_finish(&cs_stage);
+diff -ruN a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
+--- a/src/amd/vulkan/radv_shader.c	2026-11-18 11:33:12.885972616 +0000
++++ b/src/amd/vulkan/radv_shader.c	2026-11-18 11:26:01.262035477 +0000
+@@ -1169,8 +1169,12 @@
+    return arena;
+ 
+ fail:
+-   if (alloc)
++   fprintf(stderr, "radv/ps5: shader arena of %u bytes not made (out of memory)\n", arena_size);
++   if (alloc) {
++      if (free_list)
++         remove_hole(free_list, alloc);
+       free_block_obj(device, alloc);
++   }
+    if (arena && arena->bo)
+       radv_bo_destroy(device, NULL, arena->bo);
+    free(arena);
+diff -ruN a/src/amd/vulkan/winsys/ps5/radv_ps5_platform.c b/src/amd/vulkan/winsys/ps5/radv_ps5_platform.c
+--- a/src/amd/vulkan/winsys/ps5/radv_ps5_platform.c	2026-11-18 11:33:12.885972616 +0000
++++ b/src/amd/vulkan/winsys/ps5/radv_ps5_platform.c	2026-11-18 11:26:01.258035478 +0000
+@@ -545,7 +545,8 @@
+ radv_ps5_map_free_at(uint8_t *at, uint64_t bytes, int64_t physical)
+ {
+    void *address = at;
+-   if (sceKernelMapDirectMemory(&address, bytes, RADV_PS5_PROTECTION, 0, physical, RADV_PS5_LARGE_BYTES) != 0)
++   const uint64_t grain = (((uintptr_t)at | bytes) % RADV_PS5_LARGE_BYTES) ? RADV_PS5_PAGE_BYTES : RADV_PS5_LARGE_BYTES;
++   if (sceKernelMapDirectMemory(&address, bytes, RADV_PS5_PROTECTION, 0, physical, grain) != 0)
+       return false;
+    if (address == at)
+       return true;
+@@ -591,13 +592,23 @@
+       /* The largest free range now; another thread may take it first. */
+       int64_t start = -1;
+       size_t largest = 0;
+-      if (sceKernelAvailableDirectMemorySize(0, pool, RADV_PS5_LARGE_BYTES, &start, &largest) != 0)
+-         break;
+-      const uint64_t take = MIN2(bytes - offset, (uint64_t)largest & ~(RADV_PS5_LARGE_BYTES - 1));
++      uint64_t grain = RADV_PS5_LARGE_BYTES, take = 0;
++      if (sceKernelAvailableDirectMemorySize(0, pool, grain, &start, &largest) == 0)
++         take = MIN2(bytes - offset, (uint64_t)largest & ~(grain - 1));
++      if (take == 0) {
++         const char *const fine = getenv("EDEN_RADV_FINE_PIECES");
++         if (fine && fine[0] == '0')
++            break;
++         grain = RADV_PS5_PAGE_BYTES;
++         largest = 0;
++         if (sceKernelAvailableDirectMemorySize(0, pool, grain, &start, &largest) != 0)
++            break;
++         take = MIN2(bytes - offset, (uint64_t)largest & ~(grain - 1));
++      }
+       if (take == 0)
+          break;
+       int64_t physical = -1;
+-      if (sceKernelAllocateDirectMemory(0, pool, take, RADV_PS5_LARGE_BYTES, RADV_PS5_DIRECT_TYPE, &physical) != 0) {
++      if (sceKernelAllocateDirectMemory(0, pool, take, grain, RADV_PS5_DIRECT_TYPE, &physical) != 0) {
+          misses++;
+          continue;
+       }

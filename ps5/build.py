@@ -190,6 +190,11 @@ def jobs_for(rt64, gen_dir):
         mdigest = tree_digest(os.path.join(MIHAWKGEN, "framegen")) + vk_digest
         for s in MIHAWKGEN_SOURCES:
             out.append((s, os.path.join(OUT, "obj", "mihawkgen_" + os.path.basename(s)[:-4] + ".o"), mfl, mdigest))
+    # (the console's C++ host files, host/ps5/*.cpp: the platform heap's meter, heap_sites_ps5.cpp)
+    cxx_fl = COMMON + ["-I" + PS5, "-std=c++20", "-O2", "-fexceptions", "-fcxx-exceptions"]
+    for s in sorted(f for f in os.listdir(PS5) if f.endswith(".cpp")):
+        out.append((os.path.join(PS5, s), os.path.join(OUT, "obj", "host_ps5_" + s[:-4] + ".o"), cxx_fl,
+                    tree_digest(PS5)))
     return out
 
 
