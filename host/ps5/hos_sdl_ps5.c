@@ -197,7 +197,12 @@ int hos_sdl_pads_list(int32_t *ids, int *opens, int max) {
     ids[0] = 1, opens[0] = 0;
     return 1;
 }
-void *hos_sdl_pad_open(int what) { (void)what; return &pad_token; }
+static int pad_sensors;   /* the motion sensors pad_sdl.c asked on: 1 << HOS_SDL_SENSOR_ACCEL | 1 << HOS_SDL_SENSOR_GYRO */
+void *hos_sdl_pad_open(int what) {
+    (void)what;
+    pad_sensors = 0;   /* (pad_sdl.c asks for the motion sensors afresh after each open) */
+    return &pad_token;
+}
 void hos_sdl_pad_close(void *pad) { (void)pad; }
 int hos_sdl_pad_connected(void *pad) { (void)pad; return (pad_players() & 1) != 0; }
 void hos_sdl_pads_update(void) { pad_poll(&pad_now); }
@@ -225,10 +230,54 @@ void hos_sdl_pad_rumble(void *pad, uint16_t low, uint16_t high, uint32_t ms) {
 int hos_sdl_pad_type(void *pad) { (void)pad; return 0; }
 int hos_sdl_pad_has_effect(void) { return 0; }
 int hos_sdl_pad_effect(void *pad, const void *data, int size) { (void)pad, (void)data, (void)size; return 0; }
-/* shortcut: no motion yet (scePadReadState's sensors); the game sees a pad lying still */
-int hos_sdl_pad_has_sensor(void *pad, int type) { (void)pad, (void)type; return 0; }
-int hos_sdl_pad_sensor_enable(void *pad, int type, int on) { (void)pad, (void)type, (void)on; return 0; }
-int hos_sdl_pad_sensor(void *pad, int type, float *data, int n) { (void)pad, (void)type, (void)data, (void)n; return 0; }
+/* The DualSense's motion sensors to the motion controls (host/pad_sdl.c, host/hos_motion.h): the game's gyro aiming, as on
+   a PC with a DualSense through SDL. platform.c turns them on (pad_motion) and reads them with each sample (acceleration in
+   G, angular velocity in rad/s); they are taken here as SDL's axes (+X right, +Y out of the face buttons, +Z toward the
+   player) and units (m/s^2, rad/s), as SavageWind's and EdGlantine's PS5 ports take them. The Motion controls row and its
+   sensitivity and invert rows apply as on a PC. HOS_PS5_GYRO=0: no sensor reported, as before (a pad lying still).
+   The "ps5: pad: motion:" lines (3 s and 20 s after the sensors come on) check the axes: a pad lying face up on a table
+   reads about (0, +1, 0) G when they are SDL's. */
+static double pad_motion_since;   /* when the sensors came on (now_seconds) */
+static int pad_motion_said;       /* the axes' check lines given */
+static int gyro_allowed(void) {
+    static int allowed = -1;
+    if (allowed < 0) {
+        const char *e = getenv("HOS_PS5_GYRO");
+        allowed = !(e && e[0] == '0');
+        if (!allowed) hos_log("ps5: pad: motion sensors not reported (HOS_PS5_GYRO=0)");
+    }
+    return allowed;
+}
+static int sensor_type(int type) { return type == HOS_SDL_SENSOR_ACCEL || type == HOS_SDL_SENSOR_GYRO; }
+int hos_sdl_pad_has_sensor(void *pad, int type) {
+    (void)pad;
+    return sensor_type(type) && gyro_allowed() && (pad_players() & 1) != 0;
+}
+int hos_sdl_pad_sensor_enable(void *pad, int type, int on) {
+    (void)pad;
+    if (!sensor_type(type) || !gyro_allowed()) return 0;
+    const int want = on ? pad_sensors | 1 << type : pad_sensors & ~(1 << type);
+    const int was_on = pad_sensors != 0;
+    if (!pad_motion(want != 0)) return 0;   /* (one switch for both sensors; pad_motion does nothing twice) */
+    if (want && !was_on) pad_motion_since = now_seconds(), pad_motion_said = 0;
+    pad_sensors = want;
+    return 1;
+}
+int hos_sdl_pad_sensor(void *pad, int type, float *data, int n) {
+    (void)pad;
+    if (!data || n < 3 || !sensor_type(type) || !(pad_sensors & 1 << type) || !(pad_players() & 1)) return 0;
+    const float *const v = type == HOS_SDL_SENSOR_ACCEL ? pad_now.accel : pad_now.gyro;
+    const float scale = type == HOS_SDL_SENSOR_ACCEL ? 9.80665f : 1.0f;   /* (G to SDL's m/s^2; rad/s as SDL has them) */
+    for (int i = 0; i < 3; i++) data[i] = v[i] * scale;
+    if (type == HOS_SDL_SENSOR_GYRO && pad_motion_said < 2 &&
+        now_seconds() - pad_motion_since > (pad_motion_said ? 20.0 : 3.0)) {
+        pad_motion_said++;
+        hos_log("ps5: pad: motion: accel (%+.3f, %+.3f, %+.3f) G, gyro (%+.4f, %+.4f, %+.4f) rad/s (lying face up on a table "
+                "the accel reads about (0, +1, 0) when the axes are SDL's)", pad_now.accel[0], pad_now.accel[1],
+                pad_now.accel[2], pad_now.gyro[0], pad_now.gyro[1], pad_now.gyro[2]);
+    }
+    return 1;
+}
 
 /* ---- (longshot) what hos_sdl.h has gained since the port was written: nothing of it is on the console ---- */
 int hos_sdl_hint_override(const char *name, const char *value) { (void)name, (void)value; return 0; }
