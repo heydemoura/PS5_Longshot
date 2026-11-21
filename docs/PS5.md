@@ -85,7 +85,9 @@ together.
       10 s for some to come back. A save that holds 8.3 GB of game pages in the town now leaves it for Hyrule Field,
       and ran out there a minute later with 9.2 GB of game pages (before the images' own memory). `HOS_PS5_ZERO_SCAN=1`
       counts the game's backed 64 KiB units that hold only zeros: ~800 MiB of 7.5 GB in the town, 430 MiB of them
-      backed for the GPU's imports before the game wrote them. The mesh shaders' scratch ring is 128 MiB, where
+      backed for the GPU's imports before the game wrote them. So game memory is imported by 4 MB chunks here, not
+      16 (`RX_VK_IMPORT_CHUNK_MB`, and `RX_VK_IMPORT_SPAN_MB` 16, not 64): about 190 MiB more free at the end of a
+      walk in the town on a PS5 Pro. The mesh shaders' scratch ring is 128 MiB, where
       it was 320 (PS5_Mesa 0f86253: an entry of 64 KiB, the game's shaders keeping 20 KiB at most). Still open: the
       same save, left once the town has wholly loaded, ran out at the loading screen with 9.2 GB of game pages (before
       the smaller ring); the heap's 850 MiB in use, and textures other than ASTC are not yet made smaller for it

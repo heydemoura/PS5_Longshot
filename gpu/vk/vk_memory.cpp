@@ -2958,9 +2958,23 @@ void prefetch_chunks(uint64_t lo, uint64_t hi, uint64_t chunk) {
 /// one import. Only where the pools have mirrors (mirror_on): without them a chunk's padding costs no VRAM, and smaller chunks
 /// would only mean more imports. RX_VK_IMPORT_CHUNK_MB=16: as before
 bool mirror_on();
+// (PS5, after ProsperoHookshot 265c8c3d, iaminto) the console backs an import's whole range in the title's memory
+// (hos_ps5_commit_now), pages the game never touched among them, so a chunk's padding costs memory there as a mirror's
+// does: 4 MB, span 16. Measured there on a base PS5 (2026-11-20, one route a side): imported at the end 2720 MB in 80
+// against 2060 in 150, free memory 200-330 MiB more. On a PS5 Pro (2026-11-21, a 150 s walk in Castle Town at 3840x2160
+// with frame generation, two runs a side, interleaved), 16 against 4: free at the walk's end 2,264 / 2,261 against
+// 2,456 / 2,446 MiB, the game's backed pages 6,079 / 6,068 against 5,886 / 5,863 MiB, imported 1,472 / 1,504 MB in
+// 43 / 41 against 1,036 / 1,024 MB in 81 / 82, "memory short" lines 5 / 7 against 0 / 1, 36.1 / 36.2 against
+// 35.9 / 35.7 fps. RX_VK_IMPORT_CHUNK_MB=16 RX_VK_IMPORT_SPAN_MB=64: as before
+#ifdef __PROSPERO__
+constexpr bool kImportBacks = true;
+#else
+constexpr bool kImportBacks = false;
+#endif
 uint64_t import_chunk() {
     static const uint64_t chunk =
-        (uint64_t)(getenv("RX_VK_IMPORT_CHUNK_MB") ? std::max(0, atoi(getenv("RX_VK_IMPORT_CHUNK_MB"))) : mirror_on() ? 4 : 16) << 20;
+        (uint64_t)(getenv("RX_VK_IMPORT_CHUNK_MB") ? std::max(0, atoi(getenv("RX_VK_IMPORT_CHUNK_MB")))
+                                                   : mirror_on() || kImportBacks ? 4 : 16) << 20;
     return chunk;
 }
 /// (longshot) A game pool across a chunk's end had each chunk imported on its own, at the first binding in it, and a later
@@ -2968,7 +2982,8 @@ uint64_t import_chunk() {
 /// 0x1021ffff00+0x160 across 0x1022000000, 130-147 ms, the one hitch of a panning run in Kokiri. Up to this size an import
 /// takes the chunks of the game pools across its ends too (RX_VK_IMPORT_SPAN_MB, default 64; 0: not)
 uint64_t import_span() {
-    static const uint64_t span = (uint64_t)(getenv("RX_VK_IMPORT_SPAN_MB") ? std::max(0, atoi(getenv("RX_VK_IMPORT_SPAN_MB"))) : 64) << 20;
+    static const uint64_t span = (uint64_t)(getenv("RX_VK_IMPORT_SPAN_MB") ? std::max(0, atoi(getenv("RX_VK_IMPORT_SPAN_MB")))
+                                                                          : kImportBacks ? 16 : 64) << 20;   // (PS5: import_chunk)
     return span;
 }
 /// [lo, hi), chunk-aligned, grown over the game pools that run across its ends, while it stays within import_span (pools_mu held)
