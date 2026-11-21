@@ -40,7 +40,7 @@ MODELS = {
     "pro": {"name": "PS5 Pro", "attribute3": 0x8540040, "env": {}},
 }
 STEPS = ["Reading the game's program", "Translating it to C", "Compiling for the console", "Linking", "Making the title folder",
-         "Listing the game's shaders"]
+         "Listing the game's shaders", "Making button prompts"]
 
 
 class Stop(Exception):
@@ -165,6 +165,28 @@ def read_game(kit, work, game):
         raise Stop("the game file gave no program (exefs/main): is it the supported game and version?")
     open(mark, "w").write(stamp)
     return exefs
+
+
+def read_romfs(kit, work, game):
+    """Return the game's RomFS for build-time assets, or None for an extracted exefs folder."""
+    if os.path.isdir(game):
+        romfs = os.path.join(game, "romfs")
+        return romfs if os.path.isdir(romfs) else None
+    romfs = os.path.join(work, "game", "romfs")
+    stamp = "%d %d" % (os.path.getsize(game), int(os.path.getmtime(game)))
+    mark = os.path.join(work, "game", ".romfs.from")
+    if os.path.isdir(romfs) and os.path.exists(mark) and open(mark).read() == stamp:
+        say("RomFS already read, from this file")
+        return romfs
+    src, env = python_env(kit, work)
+    os.makedirs(os.path.join(work, "game"), exist_ok=True)
+    shutil.rmtree(romfs, ignore_errors=True)
+    run([sys.executable, "-I", "-u", os.path.join(src, "nx2", "nup.py"), game, "--only", "romfs", "--extract",
+         os.path.join(work, "game")], env=env, what="reading the game's resources")
+    if not os.path.isdir(romfs):
+        raise Stop("the game file gave no RomFS: is it the supported game and version?")
+    open(mark, "w").write(stamp)
+    return romfs
 
 
 def tree_key(*dirs):
@@ -584,6 +606,19 @@ def shader_lists(kit, work, game, app):
          "--out", app], env=env, what="listing the game's shaders")
 
 
+def prompts(kit, work, game, app):
+    """Make the controller-specific prompt files that host/prompts.c loads on the PS5."""
+    step(7)
+    romfs = read_romfs(kit, work, game)
+    if not romfs:
+        say("note: no RomFS given, so no button prompts: the game keeps its own icons")
+        return
+    src, env = python_env(kit, work)
+    out = os.path.join(app, "prompts")
+    run([sys.executable, "-I", "-u", os.path.join(src, "nx2", "prompt_assets.py"), "--romfs", romfs, "--out", out,
+         "--incremental"], env=env, what="making the button prompts")
+
+
 def build(a):
     kit = find_kit(a.kit)
     info = json.load(open(os.path.join(kit, "kit.json")))
@@ -607,6 +642,7 @@ def build(a):
     elf = link(kit, info, work, objects, lld, nm)
     app = title(kit, info, work, elf, native, out, a.model)
     shader_lists(kit, work, a.game, app)
+    prompts(kit, work, a.game, app)
     say("@@done " + app)
     return app
 

@@ -145,7 +145,8 @@ printf '%s\0' "${radv_link_inputs[@]}"
         return arg
 
     # ---- the lifter and what it reads ----
-    for rel in tracked("nx2", "host", "third_party/a64-kit", "assets/longshot.png", "assets/pipeline_states", "LICENSE"):
+    for rel in tracked("nx2", "host", "third_party/a64-kit", "third_party/kenney_input", "third_party/kenney_input_keyboard",
+                       "assets/longshot.png", "assets/pipeline_states", "LICENSE"):
         if rel.startswith("nx2/test_") or "/tests/" in rel:
             continue
         copy(os.path.join(ROOT, rel), os.path.join(kit, "src", rel))

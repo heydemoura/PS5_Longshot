@@ -40,7 +40,8 @@ DOWNLOADS = {   # name: (url, sha256)
     "appimagetool": ("https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage", "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"),
 }
 # (what the lifter imports, requirements.txt's pins, and the window)
-PACKAGES = ["lz4==4.4.5", "numpy==2.5.4", "capstone==5.0.9", "unicorn==2.1.4", "zstandard==0.25.0", "PyQt6==6.12.1"]
+PACKAGES = ["lz4==4.4.5", "numpy==2.5.4", "capstone==5.0.9", "unicorn==2.1.4", "zstandard==0.25.0", "PyQt6==6.12.1",
+            "fonttools==4.68.0", "pillow==13.0.0", "astc-encoder-py==0.1.12", "archspec==0.2.7", "texture2ddecoder==1.0.6"]
 LLVM_KEEP = {
     "linux-x64": ["bin/clang-23", "bin/clang", "bin/lld", "bin/ld.lld", "bin/llvm-nm", "lib/libclang-cpp.so.23.1",
                   "lib/libLLVM.so.23.1", "lib/clang/23/include", "LICENSE.TXT"],
