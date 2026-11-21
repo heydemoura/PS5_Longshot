@@ -46,6 +46,8 @@ struct pad {
    uint32_t pressed; /* buttons that went down since the last poll */
    float left_x, left_y, right_x, right_y; /* -1..1, a dead zone removed; y is down-positive */
    float l2, r2;                           /* 0..1 */
+   float accel[3]; /* G, the console's axes; 0 while the motion sensors are off (pad_motion) */
+   float gyro[3];  /* rad/s, the same */
 };
 
 /* Up to four players, one per signed-in user: the console pairs each controller
@@ -61,6 +63,11 @@ struct pad {
 bool pad_open(void);
 /* Read every player's controller; *pad is player 0's. Call once a frame. */
 void pad_poll(struct pad *pad);
+/* Turn player 0's motion sensors on or off (scePadSetMotionSensorState). Turning
+ * them on also turns the pad's own tilt correction and angular-velocity deadband
+ * off: host/hos_motion.h learns the gyroscope's resting rate and has a deadzone
+ * of its own. False when there is no controller or the console refused. */
+bool pad_motion(bool on);
 /* The players whose controller reported itself connected, a bit each (bit 0 is
  * player 0), as of the last pad_poll. */
 uint32_t pad_players(void);

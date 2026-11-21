@@ -38,6 +38,10 @@ int scePadClose(int32_t handle);
 int scePadSetVibrationMode(int32_t handle, int32_t mode);
 int scePadSetVibration(int32_t handle, const void *vibration);
 int scePadSetLightBar(int32_t handle, const void *color);
+int scePadSetMotionSensorState(int32_t handle, bool enabled);
+int scePadSetTiltCorrectionState(int32_t handle, bool enabled);
+int scePadSetAngularVelocityDeadbandState(int32_t handle, bool enabled);
+int scePadResetOrientation(int32_t handle);
 int sceAudioOutInit(void);
 int sceAudioOutOpen(int32_t user, int32_t type, int32_t index, uint32_t grain, uint32_t rate,
                     uint32_t format);
@@ -96,7 +100,11 @@ catchReturnFromMain(int status)
 struct pad_sample {
    uint32_t buttons;
    uint8_t left_x, left_y, right_x, right_y, l2, r2;
-   uint8_t reserved[66];
+   uint8_t padding[2];
+   float orientation[4]; /* x, y, z, w: the pad's own fusion, unused (host/hos_motion.h fuses the two below) */
+   float accel[3];       /* G, once scePadSetMotionSensorState has turned the sensors on */
+   float gyro[3];        /* rad/s */
+   uint8_t touch[24];
    int32_t connected;
    uint64_t timestamp_us;
    uint8_t extension[16];
@@ -106,6 +114,8 @@ struct pad_sample {
 _Static_assert(sizeof(struct pad_sample) == 120, "the console's pad samples are 120 bytes");
 _Static_assert(offsetof(struct pad_sample, connected) == 0x4c, "connection state sits at 0x4c");
 _Static_assert(offsetof(struct pad_sample, timestamp_us) == 0x50, "the timestamp sits at 0x50");
+_Static_assert(offsetof(struct pad_sample, accel) == 0x1c && offsetof(struct pad_sample, gyro) == 0x28,
+               "the motion sensors sit at 0x1c and 0x28 (SavageWind's runtime/ps5/input.c, EdGlantine's ps5_pad.hpp)");
 
 /* The two-motor rumble, as PS5_vkQuake and ProsperoLight drive it (the other
  * mode is the DualSense's haptics). */
@@ -123,6 +133,7 @@ struct pad_player_state {
    struct pad_sample last;
    struct pad_reading taken[64];
    int taken_count;
+   int32_t motion_handle; /* the handle pad_motion turned the sensors on for, -1 none */
 };
 
 static struct pad_player_state pad_states[PAD_PLAYERS];
@@ -151,7 +162,7 @@ static void
 pad_rest(struct pad_player_state *state)
 {
    memset(state, 0, sizeof(*state));
-   state->user = state->handle = -1;
+   state->user = state->handle = state->motion_handle = -1;
    state->last.left_x = state->last.left_y = state->last.right_x = state->last.right_y = 128;
 }
 
@@ -265,6 +276,11 @@ pad_fill(const struct pad_player_state *state, struct pad *pad)
    pad->right_y = stick(state->last.right_y);
    pad->l2 = state->last.l2 / 255.0f;
    pad->r2 = state->last.r2 / 255.0f;
+   const bool motion = state->handle >= 0 && state->motion_handle == state->handle;
+   for (int i = 0; i < 3; i++) {
+      pad->accel[i] = motion ? state->last.accel[i] : 0.0f;
+      pad->gyro[i] = motion ? state->last.gyro[i] : 0.0f;
+   }
 }
 
 void
@@ -291,9 +307,38 @@ pad_poll(struct pad *pad)
          state->connected = s->connected != 0;
          if (s->connected && !(s->buttons & PAD_INTERCEPTED))
             state->last = *s;
+         else if (s->connected) /* (the shell has the pad: the aim stops rather than keep the last turn) */
+            memset(state->last.gyro, 0, sizeof(state->last.gyro));
       }
    }
    (void)pad_player(0, pad);
+}
+
+bool
+pad_motion(bool on)
+{
+   struct pad_player_state *state = pad_state(0);
+   if (state == NULL)
+      return false;
+   if (on == (state->motion_handle == state->handle))
+      return true;
+   const int r = scePadSetMotionSensorState(state->handle, on);
+   if (r < 0) {
+      say("pad: motion sensors not turned %s (%#x)", on ? "on" : "off", (unsigned)r);
+      return false;
+   }
+   if (on) {
+      const int tilt = scePadSetTiltCorrectionState(state->handle, false);
+      const int deadband = scePadSetAngularVelocityDeadbandState(state->handle, false);
+      const int reset = scePadResetOrientation(state->handle);
+      state->motion_handle = state->handle;
+      say("pad: motion sensors on (tilt correction off %#x, angular-velocity deadband off %#x, orientation reset %#x)",
+          (unsigned)tilt, (unsigned)deadband, (unsigned)reset);
+   } else {
+      state->motion_handle = -1;
+      say("pad: motion sensors off");
+   }
+   return true;
 }
 
 uint32_t
