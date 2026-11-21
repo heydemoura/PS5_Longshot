@@ -511,9 +511,13 @@ static void load_longshot_env(void) {
     if (other && *other) {
         snprintf(path, sizeof path, "%s", other);
     } else {
+#ifdef __PROSPERO__   /* (the title folder, by its fixed name: this runs before main too, load_longshot_env_early) */
+        snprintf(path, sizeof path, "/app0/longshot_env.txt");
+#else
         DWORD n = hos_game_path_a(path, MAX_PATH);
         while (n && path[n - 1] != 92 && path[n - 1] != 47) n--;
         memcpy(path + n, "longshot_env.txt", 17);
+#endif
     }
     FILE *f = fopen(path, "r");
     if (!f) return;
@@ -556,6 +560,13 @@ static void load_longshot_env(void) {
     }
     fclose(f);
 }
+#ifdef __PROSPERO__
+/* (PS5) the renderer is linked into the title, not a DLL loaded later: its file-scope switches (RX_VK_IMAGE_BLOCK_MB,
+   RX_VK_STREAM_MB, the profiling ones) read the environment when the C++ objects are made, before main. Read here, ahead
+   of them (priority 101: before every constructor without one), longshot_env.txt sets those too; main reads it again,
+   which changes nothing. RX_VK_IMAGE_BLOCK_MB=16 left the pool at 32 MB blocks before this. */
+__attribute__((constructor(101))) static void load_longshot_env_early(void) { load_longshot_env(); }
+#endif
 
 /* Switches this build no longer reads, still set (in the environment or longshot_env.txt, as older issues told players):
    one log line each, naming what took its place, so a bug report shows the switch did nothing */
