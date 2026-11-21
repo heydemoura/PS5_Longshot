@@ -104,8 +104,8 @@ void load_fonts() {
 struct ScriptFonts {
     const char* lang;            // (vk_menu_i18n.h lang_code)
     const char* game[2];         // (the game's fonts by name: vk_game_font.h read_script)
-    const char* system[6];       // (the system's, by path: Windows' own folder, then Linux's usual places: Debian and
-                                 // Ubuntu, Arch, Fedora's two package layouts)
+    const char* system[12];      // (the system's, by path: PS5 title folder first, then Windows' own folder, then
+                                 // Linux's usual places: Debian and Ubuntu, Arch, Fedora's two package layouts)
 };
 #define CJK_LINUX "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", \
                   "/usr/share/fonts/google-noto-sans-cjk-fonts/NotoSansCJK-Regular.ttc",                                       \
@@ -113,10 +113,27 @@ struct ScriptFonts {
 constexpr ScriptFonts kScriptFonts[] = {
     // (Japanese: the system's alone. The game's UDShinGo is a subset of the kanji its own text uses: the menu's others came from
     // the system's font, of another design and size, beside them in one word)
-    {"ja", {nullptr, nullptr}, {"%WINDIR%\\Fonts\\YuGothM.ttc", "%WINDIR%\\Fonts\\meiryo.ttc", CJK_LINUX}},
-    {"zh-Hans", {"FZLTHB", nullptr}, {"%WINDIR%\\Fonts\\msyh.ttc", nullptr, CJK_LINUX}},
-    {"zh-Hant", {"DFPT_C8", nullptr}, {"%WINDIR%\\Fonts\\msjh.ttc", nullptr, CJK_LINUX}},
-    {"ko", {"AsiaKKRST-L", nullptr}, {"%WINDIR%\\Fonts\\malgun.ttf", nullptr, CJK_LINUX}},
+    {"ja", {nullptr, nullptr}, {
+#ifdef __PROSPERO__
+        "/app0/fonts/NotoSansCJK-Regular.ttc", "/app0/fonts/YuGothM.ttc", "/app0/fonts/meiryo.ttc",
+        "/app0/w/Fonts/YuGothM.ttc", "/app0/w/Fonts/meiryo.ttc",
+#endif
+        "%WINDIR%\\Fonts\\YuGothM.ttc", "%WINDIR%\\Fonts\\meiryo.ttc", CJK_LINUX}},
+    {"zh-Hans", {"FZLTHB", nullptr}, {
+#ifdef __PROSPERO__
+        "/app0/fonts/NotoSansCJK-Regular.ttc", "/app0/fonts/msyh.ttc", "/app0/w/Fonts/msyh.ttc",
+#endif
+        "%WINDIR%\\Fonts\\msyh.ttc", nullptr, CJK_LINUX}},
+    {"zh-Hant", {"DFPT_C8", nullptr}, {
+#ifdef __PROSPERO__
+        "/app0/fonts/NotoSansCJK-Regular.ttc", "/app0/fonts/msjh.ttc", "/app0/w/Fonts/msjh.ttc",
+#endif
+        "%WINDIR%\\Fonts\\msjh.ttc", nullptr, CJK_LINUX}},
+    {"ko", {"AsiaKKRST-L", nullptr}, {
+#ifdef __PROSPERO__
+        "/app0/fonts/NotoSansCJK-Regular.ttc", "/app0/fonts/malgun.ttf", "/app0/w/Fonts/malgun.ttf",
+#endif
+        "%WINDIR%\\Fonts\\malgun.ttf", nullptr, CJK_LINUX}},
     // (every other language: Latin letters with their accents and Cyrillic, which the game's Latin fonts may not all have)
     {"*", {nullptr, nullptr},
      {"%WINDIR%\\Fonts\\segoeui.ttf", nullptr, "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
