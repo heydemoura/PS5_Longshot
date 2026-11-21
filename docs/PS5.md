@@ -44,7 +44,7 @@ Upstream's Linux build is the base: `host/` with `host/posix`'s Win32 calls, and
 | Linux build | PS5 | File |
 | --- | --- | --- |
 | SDL3 or SDL2 (window, controllers, sound, microphones) | VK_KHR_display, the DualSense through scePad, sceAudioOut; no microphone | `host/ps5/hos_sdl_ps5.c`, `host/ps5/platform.c` (PS5_VulkanTemplate's) |
-| The guest window at 16 TiB, all of it readable, pages made on first touch | at 64 GiB, 64 GiB of it, reserved and committed in 64 KiB units of direct memory, as on Windows; large commits backed on first touch | `host/ps5/win32_ps5.c`, `host/hos.h`, `host/hos_main.c` |
+| The guest window at 16 TiB, all of it readable, pages made on first touch | at 64 GiB, 64 GiB of it, reserved and committed in 64 KiB units of direct memory, as on Windows; large commits backed on first touch. A unit's memory is zeroed before it is mapped where the game looks (`host/ps5/zero_first.h`; `HOS_PS5_ZERO_FIRST=0`: after, as it was, which lost the stores another thread made meanwhile; `HOS_PS5_ZERO_WAIT_US`, a test's, waits before the zeros) | `host/ps5/win32_ps5.c`, `host/hos.h`, `host/hos_main.c` |
 | `hookshot_vk.so` and `libvulkan.so.1` loaded at run time | linked in; `dlopen`/`dlsym` answer from a table | `host/ps5/win32_ps5.c` |
 | Thread and fiber stacks from mmap | reserved in full, 256 KiB backed and grown on fault, freed once the thread has ended; at most 16 MiB (`HOS_PS5_STACK_MB`) | `host/ps5/win32_ps5.c` |
 | futex, gettid, /proc, /sys | `_umtx_op`, `pthread_getthreadid_np`, the console's known layout | `host/posix/win32_posix.c` |

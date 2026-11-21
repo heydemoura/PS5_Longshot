@@ -29,6 +29,7 @@
 #include <ps5platform/heap.h>
 
 #include "win32_ps5.h"
+#include "zero_first.h"
 
 #undef dlopen
 #undef dlsym
@@ -117,6 +118,34 @@ static int64_t direct_take(uint64_t n, uint64_t *got) {
 }
 
 static double now_ms(void);
+/* (zero_first.h: the kernel's two calls. A mapping of this thread's own has no GPU bits and no fixed place) */
+static int guest_map(void **at, uint64_t size, int64_t phys, int fixed) {
+    return sceKernelMapDirectMemory(at, size, PS5_KERNEL_PROT_CPU_READ | PS5_KERNEL_PROT_CPU_WRITE | (fixed ? GPU_RW : 0),
+                                    fixed ? PS5_KERNEL_MAP_FIXED : 0, phys, UNIT);
+}
+static int guest_unmap(void *at, uint64_t size) { return sceKernelMunmap(at, size); }
+/* HOS_PS5_ZERO_FIRST=0: a unit's memory is zeroed after it is mapped where the game looks, as it was (zero_first.h says
+   what that lost). Asked at every commit until it says 0: the first commits come before longshot_env.txt is read */
+static int zero_first_on(void) {
+    static int off;
+    if (!off) {
+        const char *e = getenv("HOS_PS5_ZERO_FIRST");
+        if (e && !strcmp(e, "0")) off = 1;
+    }
+    return !off;
+}
+/* (a test) HOS_PS5_ZERO_WAIT_US=<microseconds>: that long passes before a unit's zeros are written, in either order. With
+   the order as it was (HOS_PS5_ZERO_FIRST=0) it widens the time in which the game reaches the unit before its zeros, to
+   see whether the stores lost there are what ends the game as a save loads; with the order on there is no such time */
+static void zero_wait(void) {
+    const char *e = getenv("HOS_PS5_ZERO_WAIT_US");
+    const int us = e ? atoi(e) : 0;
+    if (us <= 0) return;
+    const double until = now_ms() + us / 1000.0;
+    while (now_ms() < until) {}
+}
+static uint64_t commit_maps, commit_late, commit_say = 4096;   /* (mappings made; zeroed after they were mapped; the next count said) */
+static double commit_ms_all;
 /* Maps fresh zeroed memory over every reserved unit of [lo, hi); window_lock held */
 static int commit_units(uintptr_t lo, uintptr_t hi) {
     const double commit_t0 = now_ms();
@@ -139,15 +168,17 @@ static int commit_units(uintptr_t lo, uintptr_t hi) {
                 phys = free_units[free_count], got = k * UNIT;
             } else phys = direct_take(need, &got);
             if (phys < 0) return 0;   /* (commit_units_wait says so) */
-            void *want = (void *)(HOS_PS5_GUEST_LO + u * UNIT), *at = want;
-            const int r = sceKernelMapDirectMemory(&at, got, PS5_KERNEL_PROT_CPU_READ | PS5_KERNEL_PROT_CPU_WRITE | GPU_RW,
-                                                   PS5_KERNEL_MAP_FIXED, phys, UNIT);
-            if (r || at != want) {
+            void *want = (void *)(HOS_PS5_GUEST_LO + u * UNIT);
+            /* (zeroed before the game can reach it: the kernel hands direct memory out as it was left, PROBE.md, and a
+               store another thread made between the mapping and the zeros was wiped: zero_first.h) */
+            int r = 0;
+            const int how = ps5_map_zeroed(want, got, phys, zero_first_on(), guest_map, guest_unmap, zero_wait, &r);
+            commit_maps++, commit_late += how == 2;
+            if (!how) {
                 hos_ps5_klog_now("[ps5] guest commit: mapping %#llx+%#llx failed (%#x)", (unsigned long long)(uintptr_t)want,
                                  (unsigned long long)got, (unsigned)r);
                 return 0;
             }
-            memset(want, 0, got);   /* (the kernel hands direct memory out as it was left: PROBE.md) */
             for (uint64_t k = 0; k < got / UNIT; k++) {
                 unit_phys[u + k] = phys + (int64_t)(k * UNIT);
                 __atomic_store_n(&unit_state[u + k], U_COMMITTED, __ATOMIC_RELEASE);
@@ -159,6 +190,12 @@ static int commit_units(uintptr_t lo, uintptr_t hi) {
     }
     if (now_ms() - commit_t0 >= 20)
         hos_ps5_klog_now("[ps5] guest commit: %llu MiB backed in %.0f ms", (unsigned long long)(commit_bytes >> 20), now_ms() - commit_t0);
+    commit_ms_all += now_ms() - commit_t0;
+    if (commit_maps >= commit_say) {   /* (what the commits cost so far, and how many were zeroed in the game's sight) */
+        hos_ps5_klog_now("[ps5] guest commit: %llu mappings so far in %.0f ms, %llu of them zeroed after they were mapped",
+                         (unsigned long long)commit_maps, commit_ms_all, (unsigned long long)commit_late);
+        while (commit_say <= commit_maps) commit_say *= 2;
+    }
     return 1;
 }
 
