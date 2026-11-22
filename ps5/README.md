@@ -137,3 +137,10 @@ Notes from the PS5_Hookshot build on this console:
 
 - No game files, keys or built titles in this repository: everything a build makes comes from the game copy.
 - Longshot is GPL-3.0 (see `LICENSE`); the port keeps that licence.
+
+## CJK menu fonts
+
+PS5 titles do not have `%WINDIR%\Fonts` or `/usr/share/fonts`, so Chinese, Japanese, and Korean menu strings fall back to missing-glyph boxes unless a user-supplied CJK font is placed alongside the title.
+
+To enable full CJK glyphs on PS5 without shipping copyrighted font binaries, copy an open-source CJK font (such as `NotoSansCJK-Regular.ttc`) or your system font (`msyh.ttc`, `msjh.ttc`, `YuGothM.ttc`, `meiryo.ttc`, `malgun.ttf`) into `/data/homebrew/<TITLE_ID>/fonts/` (or `w/Fonts/`), which mounts at `/app0/fonts/` and `/app0/w/Fonts/` at runtime.
+
