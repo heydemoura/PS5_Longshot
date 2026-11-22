@@ -60,6 +60,9 @@ void hos_ps5_klog_now(const char *fmt, ...) {
     line[n] = '\n', line[n + 1] = 0;
     sceKernelDebugOutText(0, line);
 }
+/* (host/ps5/trace_ps5.c: a line in /app0/longshot_trace.txt, on the disk when it returns) */
+void hos_ps5_trace(const char *fmt, ...);
+void hos_ps5_trace_start(void);
 
 /* ---- the guest window ---------------------------------------------------------------------------------------- */
 enum { U_RESERVED = 0, U_COMMITTED = 1 };
@@ -602,6 +605,7 @@ uintptr_t hos_ps5_exe_base(void) {
 /* ---- the end: the shell closes the title (exit() and _exit are a crash report) ---- */
 void hos_ps5_exit(int code) {
     fprintf(stderr, "[ps5] exit %d: asking the shell to close the title\n", code);
+    hos_ps5_trace("exit %d: the title asked the console to close it", code);
     fflush(NULL);
     (void)sceSystemServiceLoadExec("exit", NULL);
     for (;;) sceKernelUsleep(100000);
@@ -1236,6 +1240,12 @@ static void *memory_floor_watch(void *unused) {
                     (unsigned long long)(floor >> 20), (unsigned long long)(sceKernelGetDirectMemorySize() >> 20),
                     (unsigned long long)(committed_bytes >> 20), (unsigned long long)(heap.mapped_bytes >> 20),
                     (unsigned long long)(__atomic_load_n(&radv_ps5_allocated_bytes, __ATOMIC_RELAXED) >> 20));
+            hos_ps5_trace("memory floor: %llu MiB of direct memory free (largest piece %llu MiB, %llu pieces), under the floor "
+                          "of %llu MiB: the title closes itself (guest pages %llu MiB, heap %llu MiB, the driver's buffers %llu MiB)",
+                          (unsigned long long)(room >> 20), (unsigned long long)(largest >> 20), (unsigned long long)pieces,
+                          (unsigned long long)(floor >> 20), (unsigned long long)(committed_bytes >> 20),
+                          (unsigned long long)(heap.mapped_bytes >> 20),
+                          (unsigned long long)(__atomic_load_n(&radv_ps5_allocated_bytes, __ATOMIC_RELAXED) >> 20));
             {   /* (what the first start's pipeline build has under way, if it is building: gpu/vk/vk_draw.cpp) */
                 extern void rx_vk_inflight(char *out, size_t n) __attribute__((weak));
                 char inflight[1024];
@@ -1262,6 +1272,7 @@ static void *memory_floor_watch(void *unused) {
 }
 /* (host/hos_main.c: after longshot_env.txt is read, which may set the floor) */
 void hos_ps5_memory_floor_start(void) {
+    hos_ps5_trace_start();   /* (its own switch, HOS_PS5_TRACE; before the floor's: the trace is there with the floor off too) */
     if (!floor_bytes()) {
         fprintf(stderr, "[ps5] memory floor: off (HOS_PS5_MEM_FLOOR_MB=0)\n");
         return;

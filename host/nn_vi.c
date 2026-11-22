@@ -221,7 +221,14 @@ void hos_vi_native_acquire(int active) {
 volatile uint64_t hos_mkw_pacer;
 /* HOS_SCAN_DT=<file prefix> (diagnostic): writes every float in guest memory between ~0.015 and ~0.04, with its
    address, four times 300 presents apart: the game's frame step is either one exact 1/60 or follows the frames */
+#ifdef __PROSPERO__
+volatile long long hos_vi_presents;   /* (the pictures presented so far: host/ps5/trace_ps5.c watches it for a stall) */
+#endif
 static void scan_dt(long long presents) {
+#ifdef __PROSPERO__
+    /* (every present comes through here, first thing in hos_vi_native_presented) */
+    __atomic_store_n(&hos_vi_presents, presents, __ATOMIC_RELAXED);
+#endif
     static long long first; static const char *prefix; static int scans, read_env;
     if (!read_env) read_env = 1, prefix = getenv("HOS_SCAN_DT");
     if (!prefix) return;
