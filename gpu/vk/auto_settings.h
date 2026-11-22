@@ -30,6 +30,7 @@ struct Hardware {
     uint32_t ram_mb = 0;        // (0: not known)
     int threads = 0;            // (0: not known)
     int screen_w = 0, screen_h = 0;   // (the desktop's size in pixels; 0: not known)
+    bool ps5_pro = false;       // (PS5: the title runs with the Pro's memory, host/ps5/win32_ps5.c hos_ps5_pro_mode)
     int refresh_hz = 0;
 };
 
@@ -41,6 +42,7 @@ struct Choice {
     int tier = 0;               // (the preset whose scaling holds: 1 Minimum ... 5 Ultra; VRAM budgets: texture_budget.h)
     int upscaler = 0;
     int resolution = 0;         // (0: the tier's own, as the preset sets it)
+    bool dynamic = false;       // (the Render resolution at Auto, the game's dynamic resolution, over the two above)
     char why[480] = {};
 };
 
@@ -107,6 +109,12 @@ inline Choice choose(const Hardware& h) {
     if (true) {
         c.upscaler = FSR3;
         add(c, "AMD FSR 3.1");
+        // (PS5 Pro: the Render resolution at Auto. With the Pro's 3200x1800 (hos_wide_size.h hos_output_pro) the game drew
+        // 2400x1350 through an evening's play, 31-38 fps in its heavy areas, 2026-11-21; the tier's 100% draws 3200x1800)
+        if (h.ps5_pro) {
+            c.dynamic = true;
+            add(c, "PS5 Pro: Render resolution Auto");
+        }
     } else
 #endif
     if (c.tier >= 2 && h.rtx && h.dlss_built) {
@@ -154,7 +162,7 @@ inline uint64_t fingerprint(const Hardware& h, uint32_t vendor_id, uint32_t devi
     const uint64_t parts[] = {vendor_id, device_id, h.vram_mb >> 8, (uint64_t)h.screen_w, (uint64_t)h.screen_h,
                               (uint64_t)h.dlss_built, (uint64_t)h.fsr4_built, (uint64_t)h.mesh_native,
 #ifdef __PROSPERO__
-                              3,   // (PS5: the choice's own number, raised when the console's rule changes: chosen again)
+                              4,   // (PS5: the choice's own number, raised when the console's rule changes: chosen again)
 #endif
                               };
     for (uint64_t p : parts) f = (f ^ p) * 1099511628211ull;

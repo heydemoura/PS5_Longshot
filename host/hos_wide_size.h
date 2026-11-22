@@ -23,8 +23,28 @@ static inline int hos_output_size_valid(uint32_t w, uint32_t h) {
    16:9 size too; 1280 x 800 and 1920 x 1200 did so before. A screen not known (0 x 0), or of no size the game takes, gets
    2560 x 1440 too. host/nn_applet.c at boot and the Insert menu's first start (gpu/vk/vk_menu.cpp menu_init) take it alike,
    so the run and the menu agree with no restart. */
+/* (PS5 Pro) Its size when none is chosen: 3200 x 1800 on a 16:9 screen of 3840 x 2160 or more, else as it is. On a PS5 Pro
+   with a 3840 x 2160 screen (2026-11-21, AMD FSR 3.1, an evening's play in the same areas) 3200 x 1800 ran at 3840 x
+   2160's frame rate or a little over it (31-38 fps against 30-35), with about 1 GiB more of the title's memory free at the
+   same age of the session, the driver's video memory at its allowance and not half over it (2.6 against 3.8 of 2.5 GB),
+   and no texture made smaller in its first ten minutes where 3840 x 2160 made them smaller from the second. 2560 x 1440
+   leaves more memory still, for a softer picture. *w x *h: the size as hos_output_default has it, changed or not */
+static inline void hos_output_pro(uint32_t sw, uint32_t sh, uint32_t *w, uint32_t *h) {
+    sw &= ~7u, sh &= ~7u;
+    const double r = sh ? (double)sw / (double)sh : 0.0, game = 16.0 / 9.0;   /* (16:9 within 1 %: hos_output_own_shape's) */
+    if ((uint64_t)sw * sh >= 3840ULL * 2160 && r <= game * 1.01 && r >= game * 0.99) *w = 3200, *h = 1800;
+}
+#ifdef __PROSPERO__
+#ifdef __cplusplus
+extern "C"
+#endif
+int hos_ps5_pro_mode(void);   /* (host/ps5/win32_ps5.c: the title has the Pro's memory) */
+#endif
 static inline void hos_output_default(uint32_t sw, uint32_t sh, uint32_t *w, uint32_t *h) {
     *w = 2560, *h = 1440;
+#ifdef __PROSPERO__
+    if (hos_ps5_pro_mode()) hos_output_pro(sw, sh, w, h);
+#endif
     sw &= ~7u, sh &= ~7u;
     if ((uint64_t)sw * sh < 2560ULL * 1440 && hos_output_size_valid(sw, sh)) *w = sw, *h = sh;
 }

@@ -49,6 +49,7 @@ Upstream's Linux build is the base: `host/` with `host/posix`'s Win32 calls, and
 | Thread and fiber stacks from mmap | reserved in full, 256 KiB backed and grown on fault, freed once the thread has ended; at most 16 MiB (`HOS_PS5_STACK_MB`) | `host/ps5/win32_ps5.c` |
 | futex, gettid, /proc, /sys | `_umtx_op`, `pthread_getthreadid_np`, the console's known layout | `host/posix/win32_posix.c` |
 | `_exit` | the shell's exit (`sceSystemServiceLoadExec("exit")`) | `host/ps5/win32_ps5.c` |
+| A new install's Output resolution is 2560x1440 (or the screen's where smaller) | the same; on a PS5 Pro with a 3840x2160 screen, 3200x1800, and Auto's Render resolution is Auto (dynamic): the frame rate of 3840x2160 with about 1 GiB more memory free | `host/hos_wide_size.h`, `gpu/vk/auto_settings.h` |
 
 **Why the window moved.** The console grants no address space at or above 1 TiB, RADV keeps [8, 12) GiB for its
 32-bit window and [256, 512) GiB for device memory, and the platform's heap reserves 16 GiB at 128 GiB. At 64 GiB with

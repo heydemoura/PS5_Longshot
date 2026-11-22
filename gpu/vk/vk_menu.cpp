@@ -1062,6 +1062,7 @@ void apply_auto() {
     if (c.tier == 1) opts.upscale = 0, opts.sharpness = 0;   // (the plain scale, as RX_VK_LOW_SPEC: the lightest)
     opts.handheld = 0;   // (docked: the handheld profile gave a GTX 1050 a black picture; the Render resolution lightens the card)
     if (c.resolution) opts.resolution = ur::snap_render(c.upscaler, c.resolution);
+    if (c.dynamic) opts.resolution = 0;   // (Auto, the game's dynamic resolution: the PS5 Pro's, auto_settings.h)
     auto_tuned = 0;   // (chosen again: measured again in play)
     auto_tuning = {};
     opts.preset = kAutoPreset;   // (apply_preset set the tier's number)
@@ -5175,7 +5176,8 @@ void menu_init() {
         host_screen_size(&sw, &sh);   // (not known: 0 x 0, the game's 2560x1440)
         hos_output_default(sw, sh, &w, &h);
         opts.output_res = output_choice_of(w, h);
-        logf("vk: the Output resolution: none chosen, %ux%u (the game's 2560x1440, or the screen's where smaller)", w, h);
+        logf("vk: the Output resolution: none chosen, %ux%u (the game's 2560x1440, or the screen's where smaller; a PS5 Pro's "
+             "3200x1800 on a 3840x2160 screen)", w, h);
     }
     // An opt-in profile for 4 GB cards: keep existing options authoritative, but make a first run usable on
     // low-VRAM hardware without requiring the menu to render first.
