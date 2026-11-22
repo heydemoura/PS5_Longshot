@@ -68,8 +68,9 @@ together.
 - [x] The runtime and the Vulkan back end compile for the console
 - [x] Link
 - [x] First boot on the Pro: title, menus and movies at 60 fps; play in Link's house and Kokiri Forest
-- [x] Foliage drawn every other frame only (2026-11-10): gone with storage buffers bound from multiples of 256; the cause is
-      not established, see "Open questions"
+- [x] Foliage drawn every other frame only (2026-11-10): gone in Kokiri Forest with storage buffers bound from multiples of
+      256, and in the Sacred Meadow with the page table of guest memory on the console's guest layout (2026-11-16); the
+      cause is under "Open questions"
 - [x] Frame generation: [PS5_MihawkGen](https://github.com/mihawk-99/PS5_MihawkGen) makes the frames between the game's (below)
 - [x] Stalls of 1.8 s in play: the test tools' own (below), none in a player's run
 - [ ] Frame rate in play: 33-40 fps in Kokiri Forest where the PC build is GPU-bound at 60 (shown at twice that with frame
@@ -169,12 +170,15 @@ recorder thread alone with the console's defaults, and a base PS5 with this buil
 
 ## Open questions
 
-- **The foliage fault's cause.** `minStorageBufferOffsetAlignment` is 4 on the console; the culling pass that left one of the
-  game's two list sets empty has its table bound at +0x9c0 of a page, and binding from multiples of 256 instead
-  (gpu/vk/vk_main.cpp) fills the list. `RX_VK_SSBO_ALIGN=64` does not, but 0x9c0 is a multiple of 64, so that binding is
-  unchanged. A test in PS5_Vulkan's own suite reads and writes storage and uniform buffers bound at these offsets correctly,
-  so this is not the driver's offset handling. The likely cause is what the program reads just below the table, which the PC
-  serves another way; not confirmed.
+- **The foliage fault's cause (answered 2026-11-16).** A program that follows a pointer no bound buffer holds reads it
+  through the page table of guest memory, whose two windows were the PC's: 8 GB from 0x1000000000 and 4 GB from
+  0x7f00000000 (spirv_emit_context.cpp `kGuestPages*`, gpu/vk/page_table_census.h `kPageWindows`). The console's guest
+  window is 64 GiB, with its heap from 0x400000000 (host/hos.h): no address of the game's was in either window, no page
+  was mapped and every followed pointer read 0, which left the culling pass's lists empty. Under `__PROSPERO__` the windows
+  are now 8 GB from 0x400000000 and 4 GB from 0xf00000000 (tests/test_ps5_page_windows.py). Binding from multiples of 256
+  (gpu/vk/vk_main.cpp) had taken the fault away in Kokiri Forest only: in the Sacred Meadow, with the camera on the crowns,
+  `RX_VK_FLASH` counted 400 flashes in 400 presents before the windows changed and 0 in about 2,000 after. Not retested:
+  the console's windows with the binding from multiples of 256 taken out.
 
 ## Driver and SDK gaps (PS5_Vulkan, PS5_PayloadSDK)
 
