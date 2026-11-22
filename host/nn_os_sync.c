@@ -20,6 +20,7 @@ enum { K_MUTEX = 1, K_COND, K_EVENT, K_SEMA, K_QUEUE, K_RWLOCK, K_MULTIWAIT, K_H
 typedef struct Obj {
     uint64_t key;
     int kind;
+    uint32_t ix;   /* (mutex: its place in mx_objs once numbered, 0: none: obj_mutex_ix. Kept when the object is reused) */
     SRWLOCK lk;
     CONDITION_VARIABLE cv;
     /* mutex / rwlock */
@@ -195,9 +196,75 @@ static Obj *obj_lookup(uint64_t key, int kind);
    direct-mapped cache per thread answers those. An entry holds while its object is still that address's and of the
    kind asked for (objects are reused, never freed: spares). HOS_NO_OBJ_CACHE=1: off. */
 static Obj *obj_nockpt(uint64_t key, int kind);
+static int mx_ix_on(void);
+static Obj *obj_mutex_ix(uint64_t key);
 static Obj *obj(uint64_t key, int kind) {
     hos_vcore_checkpoint();   /* (virtual cores: every nn::os call, where a better waiter takes the core) */
+    if (kind == K_MUTEX && key && mx_ix_on()) return obj_mutex_ix(key);
     return obj_nockpt(key, kind);
+}
+/* (after ProsperoHookshot 3ed454af, iaminto, GPL-3.0; HOS_MUTEX_IX: on by default on the PS5, off elsewhere) A mutex's
+   host object found by an index kept in its nn::os::MutexType + 8, the SDK's nesting-count word, unused here (the count
+   is Obj::count). Checked against Obj::key and Obj::kind, so a copied, zeroed or reused mutex falls back to obj_nockpt
+   and is numbered again. Only for obj's nn::os calls: obj_nockpt, used under host locks, stays as it was.
+   Measured there on a base PS5 (2026-11-21, Hyrule Field, the index off and on twice for 58 s each): the lookups 1.3 ms
+   a frame of the frame's path without it and 0.14 ms with it (thousands of mutexes over six job threads: the per-thread
+   cache answered about half). Not yet measured on this tree */
+#define MX_IX_OFFSET 8
+#define MX_IX_CAP (1u << 20)
+/* (made at the first look with the index on, not static: 8 MB of the executable's writable segment otherwise, and the
+   console maps that segment at the load from what the title has left) */
+static Obj **mx_objs;
+static volatile long mx_next = 1;
+static volatile int mx_ix_state = -1;   /* (-1: not read yet) */
+static int mx_ix_table(void) {   /* (the index's table, made once; 0: none, the index stays off) */
+    if (__atomic_load_n(&mx_objs, __ATOMIC_ACQUIRE)) return 1;
+    Obj **table = (Obj **)calloc(MX_IX_CAP, sizeof *table), **none = NULL;
+    if (!table) return 0;
+    if (!__atomic_compare_exchange_n(&mx_objs, &none, table, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) free(table);
+    return 1;
+}
+static int mx_ix_wanted(void) {
+#ifdef __PROSPERO__
+    return !getenv("HOS_MUTEX_IX") || env_on("HOS_MUTEX_IX");   /* (unset: on; 0, off, false, no: off) */
+#else
+    return env_on("HOS_MUTEX_IX");
+#endif
+}
+static int mx_ix_on(void) {
+    int on = __atomic_load_n(&mx_ix_state, __ATOMIC_ACQUIRE);
+    if (on >= 0) return on;
+    on = mx_ix_wanted() && mx_ix_table();   /* (no table: off, as without the switch) */
+    __atomic_store_n(&mx_ix_state, on, __ATOMIC_RELEASE);
+    return on;
+}
+static Obj *obj_mutex_ix(uint64_t key) {
+    const int kind = K_MUTEX;
+    uint32_t *at = (uint32_t *)GP(key + MX_IX_OFFSET);
+    const uint32_t ix = __atomic_load_n(at, __ATOMIC_RELAXED);
+    if (ix && ix < MX_IX_CAP) {
+        Obj *o = __atomic_load_n(&mx_objs[ix], __ATOMIC_ACQUIRE);
+        if (o && __atomic_load_n(&o->key, __ATOMIC_RELAXED) == key && __atomic_load_n(&o->kind, __ATOMIC_ACQUIRE) == K_MUTEX)
+            return o;
+    }
+    Obj *o = obj_nockpt(key, kind);
+    uint32_t mine = __atomic_load_n(&o->ix, __ATOMIC_RELAXED);
+    if (!mine && __atomic_load_n(&mx_next, __ATOMIC_RELAXED) < (long)MX_IX_CAP) {
+        const long n = __sync_fetch_and_add(&mx_next, 1);
+        if (n < (long)MX_IX_CAP) {
+            uint32_t none = 0;
+            if (__atomic_compare_exchange_n(&o->ix, &none, (uint32_t)n, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+                __atomic_store_n(&mx_objs[n], o, __ATOMIC_RELEASE);
+                mine = (uint32_t)n;
+            } else {
+                mine = none;   /* (another thread numbered it first: its number) */
+            }
+        }
+    }
+    if (mine && __atomic_load_n(&mx_objs[mine], __ATOMIC_RELAXED) == o &&
+        __atomic_load_n(at, __ATOMIC_RELAXED) != mine)
+        __atomic_store_n(at, mine, __ATOMIC_RELAXED);
+    return o;
 }
 /* obj without the checkpoint, for lookups under a host lock: a checkpoint there can give the core up and wait for one
    while the lock is held, and a thread that holds a core can then block on that lock (wait_any's scan under mw_lock vs
@@ -555,6 +622,8 @@ HLE(_ZN2nn2os15InitializeMutexEPNS0_9MutexTypeEbi) {
 }
 HLE(_ZN2nn2os13FinalizeMutexEPNS0_9MutexTypeE) {
     if (watched(ARG(0))) watch_log("finalize", ARG(0), 0, c, NULL);
+    /* (the index leaves the game's word as the game left it for the SDK: zero) */
+    if (ARG(0) && mx_ix_on()) __atomic_store_n((uint32_t *)GP(ARG(0) + MX_IX_OFFSET), 0u, __ATOMIC_RELAXED);
     drop(ARG(0));
 }
 HLE(_ZN2nn2os9LockMutexEPNS0_9MutexTypeE) {

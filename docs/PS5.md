@@ -48,6 +48,7 @@ Upstream's Linux build is the base: `host/` with `host/posix`'s Win32 calls, and
 | `hookshot_vk.so` and `libvulkan.so.1` loaded at run time | linked in; `dlopen`/`dlsym` answer from a table | `host/ps5/win32_ps5.c` |
 | Thread and fiber stacks from mmap | reserved in full, 256 KiB backed and grown on fault, freed once the thread has ended; at most 16 MiB (`HOS_PS5_STACK_MB`) | `host/ps5/win32_ps5.c` |
 | futex, gettid, /proc, /sys | `_umtx_op`, `pthread_getthreadid_np`, the console's known layout | `host/posix/win32_posix.c` |
+| A mutex's object looked up by its address at every lock (a per-thread cache, then the shared table) | found by an index kept in the game's own mutex (`HOS_MUTEX_IX`, on here; `=0` is the lookup) | `host/nn_os_sync.c` |
 | `_exit` | the shell's exit (`sceSystemServiceLoadExec("exit")`) | `host/ps5/win32_ps5.c` |
 
 **Why the window moved.** The console grants no address space at or above 1 TiB, RADV keeps [8, 12) GiB for its
