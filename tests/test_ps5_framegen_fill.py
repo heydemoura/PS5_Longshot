@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 def main():
     host = (ROOT / "host" / "hos_main.c").read_text(encoding="utf-8")
     menu = (ROOT / "gpu" / "vk" / "vk_menu.cpp").read_text(encoding="utf-8")
+    # (the row's own texts are in its module since the menu was split: gpu/vk/menu/framegen.cpp)
+    row = (ROOT / "gpu" / "vk" / "menu" / "framegen.cpp").read_text(encoding="utf-8")
     header = (ROOT / "gpu" / "vk" / "vk_menu.h").read_text(encoding="utf-8")
     console = re.search(r"#ifdef __PROSPERO__[^\n]*\n\s*int framegen = (\d+);\n#else\n\s*int framegen = (\d+);\n#endif", header)
     saved = re.search(r'fprintf\(f, "options_version=(\d+)\\n"\);', menu[menu.index("void save() {"):])
@@ -27,7 +29,7 @@ def main():
         (bool(saved) and int(saved.group(1)) >= 7, "save() writes an options_version below 7"),
         (bool(re.search(r"#ifdef __PROSPERO__\n(?:\s*//[^\n]*\n)*\s*if \(version < 7\) opts\.framegen = 2;\n#endif", menu)),
          "an options file from before version 7 loses the console's 2x"),
-        ('"Fill to %d fps"' in menu and '"%dx (game at %d fps)"' in menu,
+        ('"Fill to %d fps"' in row and '"%dx (game at %d fps)"' in row,
          "the console's Frame generation values do not say what they do to the game's rate"),
     ]
     bad = [why for ok, why in checks if not ok]

@@ -42,6 +42,13 @@ std::unordered_map<uint64_t, std::vector<int>> regs_by_serial;
 std::atomic<uint64_t> reg_gen{1};   // (bumped by every texture registration: resolved handles go stale)
 std::atomic<uint64_t> samp_gen{1};  // (bumped when a sampler registration's contents change: sampler_for's cache, vk_draw.cpp)
 // (and a version a slot: caches of what a slot resolves to check theirs, not every registration's)
+// The order of the two bumps is part of what their readers rely on: a writer changes the slot, bumps the slot's version,
+// and bumps reg_gen LAST, all under reg_mu. The readers (program_for in vk_shader.cpp, the descriptor reuse in vk_draw.cpp)
+// read reg_gen first, without the lock, then check or resolve the slots, and keep the result under the reg_gen they read.
+// So a reader that saw the new reg_gen finds every slot version already new and resolves the new contents, and one that
+// saw the old reg_gen looks again once it changes. With reg_gen bumped first, a reader between the two bumps would read
+// the new reg_gen and the slot's old version, take what it had cached for that version (texture_answer, a pick's handles)
+// as checked, and keep it under the new reg_gen: nothing would make it look again until the next registration.
 constexpr int kSlotVersions = 1 << 20;
 std::unique_ptr<std::atomic<uint32_t>[]> slot_versions{new std::atomic<uint32_t>[kSlotVersions]()};
 // (longshot, RX_VK_SAMPLER_CACHE: the same for sampler ids, so what a sampler id resolves to can be cached and checked
@@ -112,11 +119,11 @@ uint32_t compute_ssbo_table(const NvnState& s, uint32_t* count, uint32_t* layout
     return l.ssbo_at();
 }
 
-/// (longshot, #940) For the seed's compute programs (vk_shader.cpp seed_compute), whether c0+offset holds a buffer's address in play:
+/// (longshot) For the seed's compute programs (vk_shader.cpp seed_compute), whether c0+offset holds a buffer's address in play:
 /// the address word of an entry of the uniform or storage buffer table its control section lays out. Nothing is bound before the
 /// game, so the storage buffer pass's port (EDEN_NX2_GM_LEGACY=0), which binds an access to a pointer only when that pointer is
-/// mapped (Env::IsCbufStorageBufferPointer), found none and left every access to the run-time search, under the key play then used
-/// the program by. Answered from the layout, the prepared program comes out as play translates it
+/// mapped (Env::IsCbufStorageBufferPointer), would find none and leave every access to the run-time search, under the key play then
+/// uses the program by. Answered from the layout, the prepared program comes out as play translates it
 bool seed_cs_buffer_word(uint32_t offset) {
     if (!seed_cs_control || (offset & 15)) return false;
     const CsLayout l = cs_layout_of(seed_cs_control + 0x58);
@@ -130,8 +137,7 @@ const void* descriptor_ok(const void* p, size_t n) {
     if (q >= base && q + n <= base + host->guest_size()) return p;
     // (the host's own copies: registrations made before the renderer started, kept by host/rx_backend.c. A registration's
     // pointer is a host pointer, never a GPU address: asked as one (host->gpu_ptr), a heap address between 16 MB and 512 GB,
-    // as Windows gives them, named guest memory, and the registration was copied from there, all zero: the game's sampler
-    // 258 filtered nearest and texture slot 0x102 had no image, issue 1117's blocky halos)
+    // as Windows gives them, names guest memory, and the registration would be copied from there, all zero: blocky halos)
     MEMORY_BASIC_INFORMATION mi{};
     if (VirtualQuery(p, &mi, sizeof mi) == sizeof mi && mi.State == MEM_COMMIT &&
         (mi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY)) && !(mi.Protect & PAGE_GUARD) &&
@@ -181,7 +187,7 @@ void register_texture_copy(int id, const nvn_tex& tex, const nvn_view* v) {
     r.released = false;
     regs_by_serial[t->serial].push_back(id);
     slot_versions[id].fetch_add(1, std::memory_order_acq_rel);
-    reg_gen++;
+    reg_gen++;   // (after the slot's version: the note at reg_gen)
 }
 uint32_t texture_slot_version(int id) {
     return id >= 0 && id < kSlotVersions ? slot_versions[id].load(std::memory_order_acquire) : 0;
@@ -222,7 +228,7 @@ void texture_released(uint64_t serial) {
     if (it == regs_by_serial.end()) return;
     for (int id : it->second)
         if (id >= 0 && (size_t)id < tex_regs.size()) tex_regs[id].released = true, slot_versions[id].fetch_add(1);
-    reg_gen++;
+    reg_gen++;   // (after the slots' versions: the note at reg_gen)
 }
 bool texture_of(int id, nvn_tex* t, nvn_view* v, bool* has_view) {
     std::lock_guard lk(reg_mu);

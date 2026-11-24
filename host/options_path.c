@@ -11,12 +11,15 @@
      place, a shortcut, the tools) keeps its folder's.
    Chosen with no side effect, before anything reads it. The build's own choice stays in the game folder's file: compile_shaders=,
    which make_game.py writes there (gpu/vk/vk_draw.cpp compile_all). A game folder's file from before is copied once into the
-   user folder when that has none (hos_options_carry). */
+   user folder when that has none (hos_options_carry), whole or not at all (host/hos_atomic_file.h): a kill in the copy leaves no
+   file there, and the next start copies again. */
 #include "hos_paths.h"   /* (first: windows.h, host/posix's on Linux) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "options_path.h"
+#include "prepare_args.h"
+#include "hos_atomic_file.h"
 
 #ifdef _WIN32
 #define SEP '\\'
@@ -83,7 +86,9 @@ void hos_options_choose(int argc, char **argv) {
        the image) */
     const char *user = NULL, *image = NULL;
     for (int i = 1; i < argc; i++) {
-        if ((!strcmp(argv[i], "--romfs") || !strcmp(argv[i], "--compile-shaders")) && i + 1 < argc) i++;
+        if ((!strcmp(argv[i], "--romfs") || !strcmp(argv[i], "--compile-shaders") || hos_prepare_arg_switch(argv[i])) &&
+            i + 1 < argc)
+            i++;   /* (and a supervised preparation's own, prepare_args.h: their values are no image) */
         else if (!strcmp(argv[i], "--user") && i + 1 < argc) user = argv[++i];
         else if (!strcmp(argv[i], "--trace") || !strcmp(argv[i], "--prepare-shaders")) continue;
         else if (!image) image = argv[i];
@@ -139,7 +144,7 @@ void hos_options_carry(void) {
     char *slash = folder + strlen(folder);
     while (slash > folder && !is_sep(slash[-1])) slash--;
     if (slash > folder) slash[-1] = 0, CreateDirectoryA(folder, NULL);   /* (hos_main.c made the user folder: in case) */
-    if (CopyFileA(from, file, TRUE)) {
+    if (hos_atomic_copy_file(from, file)) {
         hos_log("options: the settings in %s were copied to %s, where every build the launcher starts reads them now (the game "
                 "folder's copy is no longer read, but for compile_shaders=)", from, file);
         return;

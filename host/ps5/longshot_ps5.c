@@ -46,6 +46,15 @@ struct passwd *getpwuid(uid_t uid) { (void)uid; return NULL; }
 
 /* ---- the control bridge's game state (host/control.c): host/hos_main.c has it with the debug tools, which are built on
    Windows and Linux only. Nothing is known and nothing is asked here ---- */
+/* (the Discord status' figures, host/discord_rpc.c: not known here, as hos_oot_state) */
+int hos_oot_stats(int *life, int *max_life, int *rupees, int *tokens, int *pieces) {
+    if (life) *life = -1;
+    if (max_life) *max_life = -1;
+    if (rupees) *rupees = -1;
+    if (tokens) *tokens = -1;
+    if (pieces) *pieces = -1;
+    return 0;
+}
 int hos_oot_state(int *event, int *loading, int *child) {
     if (event) *event = 0;
     if (loading) *loading = 0;
