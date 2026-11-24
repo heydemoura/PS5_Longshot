@@ -21,7 +21,7 @@ RUN_ALL_ARGS = ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"]
 
 ROOT = Path(__file__).resolve().parents[1]
 # (tests/import_reach_test.cpp: one case each, each in a process of its own; "header" only where import_reach.h exists)
-CASES = ["lookup", "query", "note", "drain", "background", "prefetch", "retire"]
+CASES = ["span", "lookup", "query", "note", "drain", "background", "prefetch", "retire"]
 ADD = "std::map<uint64_t, Pool>::iterator imported_add("
 TAKE = "std::map<uint64_t, Pool>::node_type imported_take("
 
@@ -45,7 +45,8 @@ def excerpts(memory):
         start = memory.index("import_reach::Reach live_reach;")
         code += memory[start:memory.index(";", start) + 1] + "\n" + block(memory, ADD) + "\n" + block(memory, TAKE) + "\n"
     for marker in ("void retire_pool(std::map<uint64_t, Pool>::iterator it) {", "void bg_drain(", "void prefetch_chunks(",
-                   "void span_game_pools(", "Pool* pool_lookup(uint64_t guest, uint64_t size) {", "Pool* pool_of(",
+                   "void span_game_pools(", "Pool* pool_lookup(uint64_t guest, uint64_t size) {",
+                   "Pool* pool_of(uint64_t guest, uint64_t size) {",
                    "bool import_in_background(", "void memory_note_gpu_write(", "int memory_guest_imported("):
         code += block(memory, marker) + "\n"
     return types, code, reach

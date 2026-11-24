@@ -38,7 +38,7 @@ def main():
     p.add_argument("--cxx", default="g++")
     a = p.parse_args()
     framegen = (VK / "vk_framegen.cpp").read_text(encoding="utf-8")
-    menu = (VK / "vk_menu.cpp").read_text(encoding="utf-8")
+    menu = (VK / "menu" / "framegen.cpp").read_text(encoding="utf-8")   # (the rows' texts: a module since upstream v3.1.0)
     compiled(r"""#include "fg_by.h"
 using namespace mkwvk::fg_by;
 static_assert(level_next(0, 1024, 1024) == 0 && level_next(0, 1023, 1024) == 1, "down to the light one under the line");

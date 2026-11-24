@@ -1,6 +1,7 @@
 """Compile and run the VRAM compaction's rules (gpu/vk/vram_compact.h; no game/GPU required), and check that vk_texture.cpp and
 vk_vma.cpp still use them: the textures in a pool of their own unless RX_VK_COMPACT=0, nothing of that pool freed while a pass is
-open, and the budget holding the driver's count with the textures' free space alone taken off.
+open, and the budget holding the driver's count with the textures' free space alone taken off, with no texture floor once the
+count is past the allowance (#939).
 
 python -I -B tests/test_vram_compact.py [--cxx g++]
 """
@@ -43,7 +44,7 @@ def check_source():
         raise SystemExit("vk_texture.cpp: the dead list is no longer held while a compaction pass is open")
     need("vk_texture.cpp: texture_frame()", frame,
          ["vram_compact::reclaimable(block_free, pool_free)", "vram_compact::pressed(used, allowed)",
-          "vram_compact::held_budget(budget, total_bytes, used, reclaim, allowed, pct)", 'getenv("RX_VK_COMPACT_PCT")',
+          "vram_compact::held_budget(budget, total_bytes, used, reclaim, allowed, pct, active_floor)", 'getenv("RX_VK_COMPACT_PCT")',
           # (the hold lets go of the excess alone, not of an eighth of the cache; the driver's limit still asks for 7/8)
           "if (held < budget) budget = evict_to = held;",
           # (the hold's pass: every dead render target, and live textures only for the excess left and only long unused ones;
@@ -55,15 +56,19 @@ def check_source():
           # (and what the other rules ask on their own is kept from before the hold's lines, the 97% rule's with it, for the
           # pass's third tier: a texture unused for the eviction's own time goes for that part)
           "uint64_t rule_budget = budget;", "rule_budget = std::min(rule_budget, total_bytes > over ? total_bytes - over : 0);",
-          "const uint64_t size_budget = budget;", 'getenv("RX_VK_EVICT_EXCESS")',
-          "const uint64_t rule_to = excess_only ? vram_compact::rule_target(total_bytes, size_budget, rule_budget)",
-          ": vram_compact::rule_target(total_bytes, rule_budget);",
+          "const uint64_t size_budget = budget;",
+          "const uint64_t rule_to = vram_compact::rule_target(total_bytes, size_budget, rule_budget);",
           "if (to == UINT64_MAX || vram_compact::hold_met(total_bytes, hold_live, hold_dead, to)) continue;",
           # (the reserve: a lower line that sets the budget too, the hold's own line kept for the textures not long unused;
           # the driver's limit, when it asks for more, clears both)
-          "hold_to = evict_to;", "vram_compact::reserve_pct(pct));", "if (reserve < budget) budget = evict_to = reserve;",
+          "hold_to = evict_to;", "vram_compact::reserve_pct(pct), active_floor);", "if (reserve < budget) budget = evict_to = reserve;",
           "if (budget < evict_to) evict_to = hold_to = 0;",
-          "if (by_hold && !overwritten) hold_live += tex->bytes + tex->pad;"])
+          "if (by_hold && !overwritten && !obsolete) hold_live += tex->bytes + tex->pad;",
+          # (past the allowance no floor holds the textures: the 90% rule's and the hold's dynamic floor, the 97% rule's own)
+          "const uint64_t active_floor = known ? vram_compact::floor_within(dynamic_floor, used, allowed) : 0;",
+          "const uint64_t floor = vram_compact::count_line_floor(used, allowed);"])
+    if "vram_compact::texture_min_floor(allowed)" in frame:
+        raise SystemExit("vk_texture.cpp: texture_frame takes the fixed texture floor past the allowance (count_line_floor)")
     # (and a live texture is judged by the hold only once it is known whether a render target drew over it)
     if not frame.index("const bool overwritten = shifted || drawn_over(tex);") < frame.index("vram_compact::hold_target(frame_no - last"):
         raise SystemExit("vk_texture.cpp: the hold's pass judges a texture before it knows whether it is a dead render target")

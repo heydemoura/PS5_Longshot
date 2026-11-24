@@ -26,6 +26,9 @@ RUN_ALL_ARGS = ["--cxx", "{cxx}"]
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# (env_on, the switches' rule, before the code cut out of the sources: gpu/vk/compat/longshot_env.h)
+ENV_ON_H = str(Path(__file__).resolve().parents[1] / "gpu" / "vk" / "compat" / "longshot_env.h")
+
 
 def block(source, marker):
     start = source.index(marker)
@@ -54,10 +57,14 @@ typedef struct { void *p; } CONDITION_VARIABLE, *PCONDITION_VARIABLE;
 typedef struct { uint64_t x[32]; volatile int poll; } Ctx;
 static int64_t now_ns = 1000000000;
 static int64_t hos_now_ns(void) { return now_ns; }
+static volatile int hos_fps_timing;   /* (host/hos_thread.c: the FPS counter's Breakdown off, so no frame-trace times) */
 enum { HOS_CHAIN_WAIT = 1, HOS_CHAIN_WOKE, HOS_CHAIN_SIGNAL, HOS_CHAIN_SLEEP, HOS_CHAIN_AWAKE, HOS_CHAIN_PRESENT };
 #define HOS_CHAIN(kind, key) ((void)(kind), (void)(key))   /* (HOS_CHAIN off: host/hos.h) */
 static int escapes_logged;
 static void hos_log(const char *fmt, ...) { if (strstr(fmt, "ran without a core")) escapes_logged++; }
+/* (host/profiling.c: the profiling mode off, so a long wait is no event) */
+static const char *hos_profiling_dir(void) { return 0; }
+static void hos_profiling_event(const char *fmt, ...) { (void)fmt; }
 static int hos_cores(void) { return 2; }
 static int sleeps;
 static void (*on_sleep)(void);   /* (what the other threads do during one look: only the test sets it) */
@@ -71,11 +78,16 @@ static BOOL SleepConditionVariableSRW(PCONDITION_VARIABLE cv, PSRWLOCK lk, DWORD
     return 1;
 }
 static void WakeConditionVariable(PCONDITION_VARIABLE cv) { (void)cv; }
-static void AcquireSRWLockExclusive(PSRWLOCK l) { (void)l; }
+static unsigned locks;
+static void AcquireSRWLockExclusive(PSRWLOCK l) { (void)l; ++locks; }
 static void ReleaseSRWLockExclusive(PSRWLOCK l) { (void)l; }
 @STRUCT@
 static HosThread *cur;
 @CORE@
+static volatile int core_tls_slot = -1;
+static SRWLOCK tls_slot_lock = SRWLOCK_INIT;
+static int core_tls_alias_now(void) { return 1; }
+static int hos_thread_wrapper_mask(HosThread *t, uint32_t *out) { (void)t; (void)out; return 0; }
 @VCORES@
 static int bad;
 static void check(int ok, const char *what) { if (!ok) { printf("FAIL: %s\n", what); bad = 1; } }
@@ -164,6 +176,13 @@ int main(int argc, char **argv) {
     HosThread h0, h1, t, u;
     thread(&h0, "holder0", 16, 1), thread(&h1, "holder1", 16, 2), thread(&t, "waiter", 16, 3);
 
+    cur = &h0;
+    hos_vcore_back();
+    const unsigned before_yield = locks;
+    hos_vcore_yield();
+    check(locks == before_yield && h0.vc_held, "an uncontended guest yield must keep its core without a scheduler lock");
+    hos_vcore_away();
+
     escape(&t, &h0, &h1);   /* a block of the escaped thread (hos_sleep_ns, hos_thread_wait, the NVN waits, ...) */
     const int away = hos_vcore_away();
     check(away == 1, "hos_vcore_away tells an escaped thread to take a core after its block");
@@ -243,7 +262,7 @@ def main():
         folder = Path(temporary)
         (folder / "fixture.cpp").write_text(fixture, encoding="utf-8")
         exe = folder / ("fixture.exe" if os.name == "nt" else "fixture")
-        subprocess.run([compiler, "-std=c++17", "-O1", "-w", str(folder / "fixture.cpp"), "-o", str(exe)], check=True,
+        subprocess.run([compiler, "-std=c++17", "-O1", "-w", "-include", ENV_ON_H, str(folder / "fixture.cpp"), "-o", str(exe)], check=True,
                        timeout=120)
         result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
         print(result.stdout, end="")

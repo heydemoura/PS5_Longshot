@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "../gpu/vk/fallback_size_policy.h"
+#include "../gpu/vk/fallback_lanes.h"         // (and whether it has no subgroup instruction)
 #ifdef _WIN32
 #include <io.h>
 #else
@@ -76,7 +77,7 @@ constexpr VkResult VK_SUCCESS = 0;
 bool gate_held = false;   // (Windows Intel: a worker inside the compiler, so a gate that is only tried comes back busy)
 struct IntelDriverGate {
     bool busy = false;
-    explicit IntelDriverGate(bool ask = false) : busy(ask && gate_held) {}
+    explicit IntelDriverGate(bool ask = false, bool /*prepare_ok*/ = false) : busy(ask && gate_held) {}
 };
 thread_local uint64_t module_program = 0;
 bool driver_faulted_program(uint64_t) { return false; }
@@ -103,6 +104,15 @@ std::atomic<int64_t> st_cache_hits{0};
 bool disk_zstd = false;
 constexpr size_t kZstdHead = 20;
 constexpr uint32_t kCompressedKind = 16;
+// (the shader store, gpu/vk/spirv_pack.h, as vk_progcache.cpp has it: on when the runner names a folder for it, a second
+// argument. Each stage's SPIR-V is then a reference to it, and every read takes it from there)
+#include "../gpu/vk/spirv_pack.h"
+// (never destroyed, as vk_progcache.cpp's: destroyed at exit, after the main thread's read handle, it would close that handle
+// a second time)
+spirv_pack::Store& store = *new spirv_pack::Store;
+bool store_on = false;
+constexpr uint64_t kStoreWords = 1ull << 63;
+constexpr int64_t kInStore = 1ll << 62;
 extern "C" {
 size_t ZSTD_compressBound(size_t n) { return 2 * n + 64; }
 size_t ZSTD_compress(void* dst, size_t cap, const void* src, size_t n, int) {   // (value, run of 1-255) pairs
@@ -140,6 +150,7 @@ struct { int64_t play_loads = 0, play_load_ns = 0; } census;
 std::atomic<bool> programs_in_play{false};
 void programs_load_wait(uint64_t) {}
 void module_id_learned(uint64_t, uint64_t, VkShaderModule) {}   // (shader module identifiers, vk_programs.cpp: none here)
+void descriptor_arrays_note(const Program&) {}   // (the census of indexed descriptor arrays, vk_programs.cpp: none here)
 // (every byte the loader reads from the cache file)
 size_t bytes_read = 0;
 static size_t counted_fread(void* to, size_t size, size_t n, FILE* f) {
@@ -195,8 +206,13 @@ static Program* pick(std::vector<std::unique_ptr<Program>>& variants, uint8_t bo
     return nullptr;
 }
 int main(int argc, char** argv) {
-    CHECK(argc == 2);
+    CHECK(argc == 2 || argc == 3);
     whole_variants = !std::strcmp(argv[1], "whole");
+    if (argc == 3) {
+        CHECK(store.open(argv[2]));
+        store_on = true;
+    }
+    // (with the store, the code is read from it and not from the file: bytes_read counts the file's reads alone)
     disk_in = disk_out = std::tmpfile();
     CHECK(disk_in);
     // key 7: twelve variants. Two fit a texture of type 4 (the first of them in the file is the one taken); one has a head past
@@ -222,9 +238,11 @@ int main(int argc, char** argv) {
         CHECK(st.info.texture_descriptors.size() == 2 && st.info.image_descriptors.size() == 1);
         CHECK(st.info.handle_programs.size() == 1 && st.info.handle_programs[0] == (std::vector<uint32_t>{mark, 2, 3}));
         CHECK(st.c1 == (std::vector<uint8_t>{(uint8_t)mark, (uint8_t)(mark + 1)}));
+        // (a whole read's stage code: a place in the store, marked so, with the store; else a place in the file)
+        CHECK(!whole_variants || (st.code_words == kWords && ((st.code_at & kInStore) != 0) == store_on));
     }
     if (whole_variants) {
-        CHECK(load_modules == 11 && load_bytes > 11 * kWords * 4);
+        CHECK(load_modules == 11 && (store_on || load_bytes > 11 * kWords * 4));
     } else {
         // no code read: the long-headed variant alone is read whole (and made), the others by their head and descriptors
         // (and the record cut short is read once more, whole, to be refused as before)
@@ -265,7 +283,7 @@ int main(int argc, char** argv) {
     if (!whole_variants) {
         // six different variants were taken (types 4, 1, 11, 9, 3, and 4 and 1 again): five modules made after the load, one each
         CHECK(created == load_modules + 5);
-        CHECK(bytes_read - load_bytes - busy_bytes == 5 * kWords * 4);
+        CHECK(bytes_read - load_bytes - busy_bytes == (store_on ? 0 : 5 * kWords * 4));
     }
     // a key that is not a compute program's, and a compute key borrowed whole (the prepare's): as before, either way
     {
@@ -304,8 +322,11 @@ int main(int argc, char** argv) {
         CHECK(cut);
         std::FILE* was = disk_in;
         disk_in = cut;   // (an empty file in its place)
+        const std::string folder = store.folder();
+        if (store_on) store.close();   // (and the store gone: its code is there)
         CHECK(!program_cache_complete(*v[0]) && v[0]->failed && !v[0]->stages[0].module);
         CHECK(!program_cache_complete(*v[0]));
+        if (store_on) CHECK(store.open(folder));
         disk_in = was;
         std::fclose(cut);
     }
@@ -323,6 +344,8 @@ int main(int argc, char** argv) {
         // program keeps the record's place (negative) and the code's offset; completing it reads and unpacks it again and makes
         // the module from the same code a plain read gives
         disk_zstd = true;
+        const bool store_was = store_on;   // (the compressed cache has no store: disk_init opens none with it)
+        store_on = false;
         save(22, 1, 700);
         save(22, 2, 701, 2);
         const std::vector<DiskRecord> recs = disk_records.at(22);
@@ -347,6 +370,7 @@ int main(int argc, char** argv) {
         uint64_t none = 0;
         CHECK(!program_cache_variant(disk_in, 22, bad, &none));
         disk_zstd = false;
+        store_on = store_was;
     }
     std::printf("modules %u, bytes read at the load %zu of %zu\n", load_modules, load_bytes, file_bytes);
     return 0;

@@ -78,8 +78,8 @@ inline const char* corner_name(int v) {
 /// is written (the game's own time, until then in the renderer's part)
 enum Part { kGame, kRender, kGpuWait, kPace, kWaitRender, kWaitGpu, kWaitMain, kParts };
 /// (longshot) The render thread's frame (threaded rendering): its recording and submitting (what is left), its waits for the
-/// parallel replay's workers, for the GPU (a recording slot), and for work (idle). Over the same present-to-present span
-enum RenderPart { kRtWork, kRtWorkers, kRtGpu, kRtIdle, kRtParts };
+/// GPU (a recording slot) and for work (idle). Over the same present-to-present span
+enum RenderPart { kRtWork, kRtGpu, kRtIdle, kRtParts };
 
 struct Frame {
     int64_t at_ns = 0;          // (its present)
@@ -201,9 +201,10 @@ void columns(const Ring<N>& r, int64_t now, int64_t window, int count, int* out,
     }
 }
 
-/// The Game frame rate cap row's rate (0 60, then 90, 120, 144, 165, 240; 6 Uncapped: 0, no rate); HOS_FPS_MAX over it
+/// The Game frame rate cap row's rate (-1 30, 0 60, then 90, 120, 144, 165, 240; 6 Uncapped: 0, no rate); HOS_FPS_MAX over it
 /// (env_max, 0 when not set: host/nn_vi.c fps_max's rules, 1000 and over is uncapped)
 inline int cap_rate(int fps_cap, int env_max = 0) {
+    if (env_max == 30 || (fps_cap == -1 && env_max <= 0)) return 30;
     static const int rates[] = {60, 90, 120, 144, 165, 240, 0};
     if (env_max > 0) return env_max >= 1000 ? 0 : std::max(env_max, 60);
     return fps_cap >= 0 && fps_cap <= 6 ? rates[fps_cap] : 60;   // (a value this build does not know: 60, as the host)

@@ -4,10 +4,13 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 
 RUN_ALL_ARGS = ["--cc", "clang", "--cxx", "{cxx}"]
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'tests'))
+from menu_model_fixture import menu_text  # noqa: E402
 
 def source_contracts():
     menu = (ROOT / 'gpu/vk/vk_menu.cpp').read_text(encoding='utf-8')
@@ -15,24 +18,27 @@ def source_contracts():
     api = (ROOT / 'gpu/vk/vk_api.h').read_text(encoding='utf-8')
     build = (ROOT / 'nx2/build.py').read_text(encoding='utf-8')
     devices = (ROOT / 'host/audio_output_devices.c').read_text(encoding='utf-8')
-    assert re.search(r'\{TAB_AUDIO, "Microphone", &opts\.mic,', menu)
-    assert 'TAB_GAMEPLAY, "Microphone"' not in menu
-    assert re.search(r'\{TAB_AUDIO, "Output device", &output_pick,', menu)
-    assert re.search(r'\{TAB_AUDIO, "Speaker layout", &opts\.audio_output,', menu)
+    # (the rows: vk_menu.cpp's and its modules', #1633: the Audio tab's are gpu/vk/menu/audio.cpp's)
+    rows = menu_text(ROOT)
+    assert re.search(r'\{TAB_AUDIO, "Microphone", &opts\.mic,', rows)
+    assert 'TAB_GAMEPLAY, "Microphone"' not in rows
+    assert re.search(r'\{TAB_AUDIO, "Output device", &output_pick,', rows)
+    assert re.search(r'\{TAB_AUDIO, "Speaker layout", &opts\.audio_output,', rows)
     assert 'if (r.value == &opts.audio_output) return "audio_output";' in menu
     tick = menu[menu.index('void menu_tick()'):]
     assert tick.count('refresh_outputs();') == 1, 'Device discovery must not poll on the render-frame path'
     assert 'if (open_now.load()) refresh_outputs();' in tick, 'Refresh on explicit menu opening'
     assert 'r.value != &output_pick' in menu and 'audio_output_device_id=%s' in menu
     assert 'output_forced()' in menu and 'audio_output_device_name' in menu
-    assert '#define MKWVK_API_VERSION 24' in api
+    assert int(re.search(r'#define MKWVK_API_VERSION (\d+)', api).group(1)) >= 26
+    assert api.index('int (*take_text)') < api.index('int (*audio_output_count)')
     backend = (ROOT / 'host/rx_backend.c').read_text(encoding='utf-8')
     check_host_callbacks(api, backend)
     assert '#include "options_path.h"' in devices and 'hos_options_file()' in devices
     assert 'hos_game_path_a' not in devices
-    assert re.search(r'\{TAB_AUDIO, "Speaker layout", &opts\.audio_output, 0, 3,', menu)
+    assert re.search(r'\{TAB_AUDIO, "Speaker layout", &opts\.audio_output, 0, 3,', rows)
     assert 'audio_mono(pcm, FRAME, out_channels, rx_option(HOS_OPT_AUDIO_OUTPUT, 0) == 3);' in audio
-    assert '"vk_api.h"' in build and 'LONGSHOT_SHADER_STAMP' in build
+    assert 'translator_files.stamp(vk)' in build and 'LONGSHOT_SHADER_STAMP' in build
     assert 'DRV_QUERYFUNCTIONINSTANCEID' in devices and 'calloc(total ? total : 1' in devices
     assert 'waveOutOpen' not in devices and 'SDL_OpenAudio' not in devices
     mixer = audio[audio.index('static DWORD WINAPI renderer_main'):]
@@ -56,9 +62,15 @@ def check_host_callbacks(api, backend):
     table = [value.strip() for value in body.split(',') if value.strip()]
     expected = {'take_text': 'host_take_text', 'options_path': 'hos_options_file',
                 'audio_output_count': 'hos_audio_output_count', 'audio_output_info': 'hos_audio_output_info',
-                'audio_output_select': 'hos_audio_output_select', 'audio_output_state': 'hos_audio_output_state'}
+                'audio_output_select': 'hos_audio_output_select', 'audio_output_state': 'hos_audio_output_state',
+                'mic_test': 'hos_mic_test', 'perf_info': 'hos_perf_info',
+                'main_thread_times': 'host_main_thread_times', 'out_of_memory': 'host_out_of_memory',
+                'monitor_count': 'hos_monitor_count',
+                'monitor_info': 'hos_monitor_info', 'monitor_select': 'hos_monitor_select',
+                'perf_tracking': 'hos_perf_tracking'}
     assert len(fields) == len(table), 'Host interface/initializer lengths differ'
-    assert fields[-6:] == list(expected), 'Playback callbacks must follow take_text and options_path'
+    start = fields.index('take_text')   # (later versions append their own after these)
+    assert fields[start:start + len(expected)] == list(expected), 'Append monitor callbacks after out-of-memory without shifting earlier callbacks'
     for field, value in expected.items():
         assert table[fields.index(field)] == value, 'Wrong host callback slot: ' + field
 
@@ -69,11 +81,26 @@ PARSER = r'''
 #include <stddef.h>
 #include "audio_output_devices.h"
 #include "gpu/vk/vk_api.h"
-_Static_assert(MKWVK_API_VERSION == 24, "playback callbacks need a new ABI version");
+_Static_assert(MKWVK_API_VERSION >= 26, "performance info needs a new ABI version");
+_Static_assert(MKWVK_API_VERSION >= 30, "opt-in pose sampling extends the performance ABI");
 _Static_assert(offsetof(MkwVkHost, options_path) == offsetof(MkwVkHost, take_text) + sizeof(((MkwVkHost *)0)->take_text),
                "keep the version-23 settings path after text input");
 _Static_assert(offsetof(MkwVkHost, audio_output_count) == offsetof(MkwVkHost, options_path) + sizeof(((MkwVkHost *)0)->options_path),
                "append playback after the existing settings path");
+_Static_assert(offsetof(MkwVkHost, mic_test) == offsetof(MkwVkHost, audio_output_state) + sizeof(((MkwVkHost *)0)->audio_output_state),
+               "append microphone test after playback without shifting earlier callbacks");
+_Static_assert(offsetof(MkwVkHost, perf_info) == offsetof(MkwVkHost, mic_test) + sizeof(((MkwVkHost *)0)->mic_test),
+               "append performance info after the microphone test without shifting earlier callbacks");
+_Static_assert(offsetof(MkwVkHost, main_thread_times) == offsetof(MkwVkHost, perf_info) + sizeof(((MkwVkHost *)0)->perf_info),
+               "append the main thread's times after performance info without shifting earlier callbacks");
+_Static_assert(offsetof(MkwVkHost, out_of_memory) == offsetof(MkwVkHost, main_thread_times) + sizeof(((MkwVkHost *)0)->main_thread_times),
+               "append the renderer's out-of-memory stop after the main thread's times without shifting earlier callbacks");
+_Static_assert(offsetof(MkwVkHost, monitor_count) == offsetof(MkwVkHost, out_of_memory) + sizeof(((MkwVkHost *)0)->out_of_memory),
+               "append monitor selection without shifting the out-of-memory callback");
+_Static_assert(offsetof(MkwVkHost, monitor_info) == offsetof(MkwVkHost, monitor_count) + sizeof(((MkwVkHost *)0)->monitor_count),
+               "monitor info slot follows monitor count");
+_Static_assert(offsetof(MkwVkHost, monitor_select) == offsetof(MkwVkHost, monitor_info) + sizeof(((MkwVkHost *)0)->monitor_info),
+               "monitor select slot follows monitor info");
 int main(void) {
     char id[HOS_OUTPUT_ID_CAP] = "old";
     assert(audio_output_copy_id(id, sizeof id, "opaque=id") && !strcmp(id, "opaque=id"));
@@ -119,6 +146,7 @@ Host h{count,info,select_output,status,now},*host=&h;
 namespace i18n { const char* tr(const char* text) { return text; } }
 @GLOBALS@
 struct Row{int*value;int hi;}; Row rows[]={{&output_pick,0}};
+void menu_row_top(const int* value,int hi){for(Row& r:rows)if(r.value==value)r.hi=hi;}   // (vk_menu.cpp's)
 @HELPERS@
 int main(){
     for(int i=0;i<80;i++)names.push_back({"id-"+std::to_string(i),i<2?"Duplicate":"Output "+std::to_string(i)});
@@ -163,8 +191,12 @@ def main():
         src, exe = work/'parser.c', work/'parser.exe'
         src.write_text(PARSER, encoding='utf-8')
         run([args.cc,'-std=c11','-Wall','-Wextra','-Werror','-I',ROOT,'-I',header,src,'-o',exe]);run([exe])
-        globals_text=menu[menu.index('// The playback row stores'):menu.index('constexpr int kMaxMics')]
-        helpers=menu[menu.index('void refresh_outputs()'):menu.index('void mic_tell_host()')]
+        # (the playback row's code: the Audio module's, gpu/vk/menu/audio.cpp, #1633)
+        module = (ROOT / 'gpu/vk/menu/audio.cpp').read_text(encoding='utf-8')
+        pick = re.search(r'^int output_pick = 0;.*\n', module, re.M)
+        assert pick, 'gpu/vk/menu/audio.cpp: no output_pick'
+        globals_text=pick.group(0)+module[module.index('// The playback row stores'):module.index('// (longshot) the Microphone row:')]
+        helpers=module[module.index('void refresh_outputs()'):module.index('void mic_tell_host()')]
         src,exe=work/'menu.cpp',work/'menu.exe'
         src.write_text(MENU.replace('@GLOBALS@',globals_text).replace('@HELPERS@',helpers),encoding='utf-8')
         run([args.cxx,'-std=c++17','-Wall','-Wextra','-Werror','-I',header,src,'-o',exe]);run([exe])

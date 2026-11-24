@@ -40,7 +40,13 @@ extern uint8_t *window;
 #define RET(v) (c->x[0] = (uint64_t)(v))
 #define GP(a) ((void *)(window + (a)))
 #define HOS_WRITTEN(p, n) ((void)0)
+typedef struct HleCount { const char *name; long calls; } HleCount;   /* (host/hos.h's, HOS_HLE_STATS) */
+static int hos_hle_stats = 1;
+static inline void hos_hle_counted(HleCount *h, void (*fn)(Ctx *c), Ctx *c) { h->calls++; fn(c); }
+static void hos_log(const char *fmt, ...) { (void)fmt; }   /* (nn_libc.c logs its first call) */
 #define ENTRY_HOOK_SYM(sym) int entry_sym_##sym(Ctx *c)
+#define ENTRY_HOOK_SYM_FROM(sym, min) int entry_sym_##sym(Ctx *c)
+#define A64_POLL(c) ((void)(c))
 static inline void *hos_guest_range(uint64_t a, uint64_t n) { return a < WINDOW && n <= WINDOW - a ? GP(a) : (void *)0; }
 '''
 
@@ -92,7 +98,10 @@ def main():
     fs = (ROOT / "host" / "nn_fs.c").read_text(encoding="utf-8")
     read_at = block(fs, "static uint64_t read_at(")
     check("if (!hos_guest_range(buf, size)) return 0;" in read_at, "read_at writes into a buffer it did not check")
-    write = block(fs, "HLE(_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE)")
+    # (the HLE hands its work to fs_write_file through save_handle_call, which takes the save lock for a staged save)
+    hle = block(fs, "HLE(_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE)")
+    check("save_handle_call(c, fs_write_file)" in hle, "WriteFile does not run fs_write_file")
+    write = block(fs, "static void fs_write_file(Ctx *c, Handle *fh)")
     check("hos_guest_range(ARG(2), ARG(3))" in write, "WriteFile reads a buffer it did not check")
     size = block(fs, "HLE(_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE)")
     check("LARGE_INTEGER sz = {0};" in size, "GetFileSize can answer with the host stack's bytes")

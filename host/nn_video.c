@@ -78,7 +78,7 @@ typedef struct { uint8_t *rgba, *nv12; int w, h; int64_t pts; int last; } Pictur
 /* a submission waiting to be decoded (pkt NULL: the stream's end) */
 typedef struct Pending { AVPacket *pkt; struct Pending *next; } Pending;
 #ifdef _WIN32
-/* (longshot, issue 380) once, when Windows has no AV1 decoder: OoT's movies are AV1, and Windows decodes it only with
+/* (longshot) once, when Windows has no AV1 decoder: OoT's movies are AV1, and Windows decodes it only with
    Microsoft's free "AV1 Video Extension" (preinstalled on most PCs, not all). Yes opens its Store page */
 static DWORD WINAPI av1_notice(LPVOID unused) {
     (void)unused;
@@ -95,7 +95,7 @@ void *mf_av1_open(int w, int h);
 void mf_av1_decode(void *m, const uint8_t *data, size_t n, int64_t pts, mf_av1_picture_fn fn, void *user);
 void mf_av1_flush(void *m);
 void mf_av1_close(void *m);
-/* (longshot) an AV1 decoder of our own, when FFmpeg has none: dav1d (host/dav1d_av1.c, when the build has it, issue 2316), else
+/* (longshot) an AV1 decoder of our own, when FFmpeg has none: dav1d (host/dav1d_av1.c, when the build has it), else
    Media Foundation. The same calls for both */
 typedef struct {
     const char *name;
@@ -116,6 +116,8 @@ static const Av1Decoder av1_decoders[] = {
 #endif
     {"Media Foundation", mf_av1_open, mf_av1_decode, mf_av1_flush, mf_av1_close},
 };
+
+static int64_t movie_totals[5];   /* (longshot) the performance summary's: hos_movie_stats, below */
 
 typedef struct {
     AVCodecContext *ctx;
@@ -177,8 +179,7 @@ static void set_host(uint64_t obj, uint32_t magic, void *p) {
         if (i == nhost_objs) {
             if (nhost_objs == cap_host_objs) {
                 cap_host_objs = cap_host_objs ? cap_host_objs * 2 : 16;
-                host_objs = (HostObj *)realloc(host_objs, cap_host_objs * sizeof *host_objs);
-                if (!host_objs) hos_fatal(NULL, "video: out of memory");
+                host_objs = (HostObj *)hos_xrealloc(host_objs, cap_host_objs * sizeof *host_objs, "video: decoder table");
             }
             nhost_objs++;
         }
@@ -214,13 +215,12 @@ HLE(_ZN2nn5codec31CalculateDecoderImagePoolBufferEPmS1_RKNS0_27VideoDecoderImage
 /* InitializeDecoderImagePool(pool, void* memory, size, Preference const&, u32 count) */
 HLE(_ZN2nn5codec26InitializeDecoderImagePoolEPNS0_25VideoDecoderImagePoolTypeEPvmRKNS0_27VideoDecoderImagePreferenceEj) {
     const Pref *p = (const Pref *)GP(ARG(3));
-    Pool *o = (Pool *)calloc(1, sizeof *o);
-    if (!o) hos_fatal(NULL, "video: out of memory for an image pool");
+    Pool *o = (Pool *)hos_xcalloc(1, sizeof *o, "video: image pool");
     o->w = p->magic == PREF_MAGIC && p->w ? p->w : 1280, o->h = p->magic == PREF_MAGIC && p->h ? p->h : 720;
     o->format = p->magic == PREF_MAGIC ? (int)p->format : 2;
     o->count = (int)ARG(4) > 0 ? (int)ARG(4) : 1;
     o->rgba = (uint8_t *)calloc((size_t)o->count, (size_t)o->w * o->h * 4);
-    /* (longshot, issue 342: an allocation that failed went on as a NULL picture, and the movie thread read address 0) */
+    /* (longshot: an allocation that failed must not go on as a NULL picture, which the movie thread would read at address 0) */
     o->nv12 = (uint8_t *)calloc((size_t)o->count, (size_t)o->w * o->h * 3 / 2);
     /* (longshot) video black, not zeros. A buffer the game takes before the decoder's first picture is shown as it is
        (dec_acquire: "nothing decoded, the buffer again", up to ~100 ms into a movie's start), and NV12 zeros are bright
@@ -348,7 +348,7 @@ static void dec_init_sized(Ctx *c, enum AVCodecID id, const char *what, int w, i
     for (size_t i = 0; !d->ctx && !d->mf && id == AV_CODEC_ID_AV1 && i < sizeof av1_decoders / sizeof av1_decoders[0]; i++)
         if ((d->mf = av1_decoders[i].open(w, h))) d->av1 = &av1_decoders[i];
 #ifdef _WIN32
-    if (!d->ctx && !d->mf && id == AV_CODEC_ID_AV1) {   /* (issue 380: no AV1 decoder in Windows: the movies were black, with sound) */
+    if (!d->ctx && !d->mf && id == AV_CODEC_ID_AV1) {   /* (no AV1 decoder in Windows: the movies would be black, with sound) */
         static volatile LONG told;
         if (!InterlockedExchange(&told, 1)) {
             hos_log("video: no AV1 decoder: install Microsoft's free AV1 Video Extension for the movies");
@@ -425,7 +425,7 @@ static void queue_frame(Dec *d, const AVFrame *f) {
     const int nv12_src = f->format == AV_PIX_FMT_NV12;
     const int yuv420 = f->format == AV_PIX_FMT_YUV420P || f->format == AV_PIX_FMT_YUVA420P;
     const char *rgba_env = getenv("HOS_VIDEO_RGBA");
-    const int force_rgba = rgba_env && atoi(rgba_env) != 0;
+    const int force_rgba = rgba_env && !env_value_off(rgba_env);
     const int lazy_rgba = !force_rgba && (nv12_src || yuv420);
     if (!lazy_rgba && (!d->sws || d->sws_w != w || d->sws_h != h || d->sws_fmt != f->format)) {
         if (d->sws) sws_freeContext(d->sws);
@@ -437,8 +437,9 @@ static void queue_frame(Dec *d, const AVFrame *f) {
     const size_t nv12_size = (size_t)w * h * 3 / 2;
     p.rgba = lazy_rgba ? NULL : (uint8_t *)malloc((size_t)w * h * 4);
     p.nv12 = (uint8_t *)malloc(nv12_size);
-    if (!p.nv12 || (!lazy_rgba && !p.rgba)) {   /* (out of memory: this frame is dropped, not written through NULL; issue 342) */
+    if (!p.nv12 || (!lazy_rgba && !p.rgba)) {   /* (out of memory: this frame is dropped, not written through NULL) */
         static volatile LONG told;
+        __atomic_add_fetch(&movie_totals[1], 1, __ATOMIC_RELAXED);
         if (InterlockedIncrement(&told) <= 4) hos_log("video: no memory for a %dx%d frame: dropped", w, h);
         free(p.rgba), free(p.nv12);
         return;
@@ -548,12 +549,21 @@ static void decode_next(Dec *d) {
         }
         const int64_t ns = hos_now_ns() - t0;
         d->decode_ns += ns;
+        __atomic_add_fetch(&movie_totals[3], ns, __ATOMIC_RELAXED);   /* (the performance summary's: hos_movie_stats) */
         if (ns > d->decode_worst_ns) d->decode_worst_ns = ns;
         if (picture) d->recent_ns = d->recent_ns ? (d->recent_ns * 7 + ns) / 8 : ns;   /* (about the last 8) */
         free(n);
     }
 }
-/* (longshot, issue 2316) one line when a movie stops: its decoder, the time it took for each submission against the time
+/* (longshot) every movie's totals this session, for the performance summary (hos_perf_info, gpu/vk/perf_report.cpp): pictures
+   shown (taken by the game), skipped to keep up with the sound (and dropped for want of memory), shown late (50 ms or more
+   after the one before), decoding time in ns, decoders that did not start. Added as each happens, so a movie still playing
+   at a summary counts too (movie_totals: above) */
+void hos_movie_stats(int64_t out[5]) {
+    for (int i = 0; i < 5; i++) out[i] = __atomic_load_n(&movie_totals[i], __ATOMIC_RELAXED);
+}
+void hos_movie_fallback(void) { __atomic_add_fetch(&movie_totals[4], 1, __ATOMIC_RELAXED); }
+/* (longshot) one line when a movie stops: its decoder, the time it took for each submission against the time
    between the movie's pictures, and the pictures the catch-up skipped. A decoder slower than the movie leaves the picture
    behind the sound, whatever the catch-up does: the line says which it was in a report's longshot_log.txt */
 static void movie_report(Dec *d) {
@@ -744,8 +754,8 @@ static void dec_acquire(Ctx *c) {
     if (!d) { RET(RESULT_NO_OUTPUT); return; }
     /* (the library aborts on any failure here: the hardware call waits for a picture. Up to ~100 ms for one decoded
        by another thread's submission. Then a free buffer as it was, so the caller is never refused) */
-    /* (longshot, #1929) and no virtual core held through it: the decoding blocks (dav1d waits for its own frame
-       threads), and with the core held the movie thread kept it 100-270 ms on Linux while a thread waiting for that core
+    /* (longshot) and no virtual core held through it: the decoding blocks (dav1d waits for its own frame
+       threads), and with the core held the movie thread would keep it 100-270 ms while a thread waiting for that core
        ran without one. It is taken again only once d->lock is let go, as in hos_cv_sleep: waiting for a core while
        holding the lock could stall a thread that holds a core and waits for the lock (dec_submit) */
     const int away = hos_vcore_away();
@@ -792,8 +802,8 @@ static void dec_acquire(Ctx *c) {
         RET(0);
         return;
     }
-    {   /* (longshot) The game takes one picture a frame, and the sound plays on: under 60 fps the movie fell behind its
-           sound (the intro "slow motion, audio ahead", issues 146 and 179). Pictures already decoded are skipped.
+    {   /* (longshot) The game takes one picture a frame, and the sound plays on: under 60 fps the movie would fall behind
+           its sound. Pictures already decoded are skipped.
            Decoding the next one in order to skip it is not, when that decode takes longer than the gap between
            pictures: the clock gains the decode and the picture is thrown away, so the next acquire is further behind
            (Windows, Intel UHD, 19.5 ms a picture against 16.7, skipped 1933 of 2221). The decode time is the recent
@@ -821,12 +831,13 @@ static void dec_acquire(Ctx *c) {
             skipped++;
         }
         d->skipped += skipped;
+        __atomic_add_fetch(&movie_totals[1], skipped, __ATOMIC_RELAXED);
         if (skipped && video_log()) hos_log("video: %d pictures skipped to catch up with the movie's clock", skipped);
     }
     Picture *p = &d->queue[d->qhead];
     Pool *o = (Pool *)host_of(d->slots[slot], POOL_MAGIC);
     /* (the picture at the pool's size: rows and columns past either are left out) */
-    const int ok = o->nv12 != NULL && p->nv12 != NULL;   /* (an allocation that failed: nothing copied; issue 342) */
+    const int ok = o->nv12 != NULL && p->nv12 != NULL;   /* (an allocation that failed: nothing copied) */
     const int w = !ok ? 0 : p->w < o->w ? p->w : o->w, h = !ok ? 0 : p->h < o->h ? p->h : o->h;
     for (int y = 0; y < h; y++) {
         if (p->rgba && o->rgba) memcpy(o->rgba + (size_t)y * o->w * 4, p->rgba + (size_t)y * p->w * 4, (size_t)w * 4);
@@ -859,6 +870,8 @@ static void dec_acquire(Ctx *c) {
         if (gap > d->gap_worst_ns) d->gap_worst_ns = gap;
         if (d->out_ns) d->gaps[now - d->clock_ns >= 5000000000ll][gap < 20000000 ? 0 : gap < 50000000 ? 1 : gap < 90000000 ? 2 : 3]++;
         d->out_ns = now;
+        __atomic_add_fetch(&movie_totals[0], 1, __ATOMIC_RELAXED);   /* (shown: a picture the game took) */
+        if (gap >= 50000000) __atomic_add_fetch(&movie_totals[2], 1, __ATOMIC_RELAXED);   /* (and late) */
     }
     {   /* (longshot) HOS_VIDEO_LOG: the picture's time against this decoder's movie clock, to see it fall behind the sound */
         if (video_log() && d->acquires % 60 == 0) {
