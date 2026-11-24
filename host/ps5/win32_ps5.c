@@ -600,8 +600,10 @@ uintptr_t hos_ps5_exe_base(void) {
 }
 
 /* ---- the end: the shell closes the title (exit() and _exit are a crash report) ---- */
+void hos_ps5_mic_end(void);   /* (host/ps5/hos_sdl_ps5.c: the microphone's port closed, its thread ended; HOS_PS5_MIC=1) */
 void hos_ps5_exit(int code) {
     fprintf(stderr, "[ps5] exit %d: asking the shell to close the title\n", code);
+    hos_ps5_mic_end();   /* (300 ms at most; nothing when the microphone was never opened) */
     fflush(NULL);
     (void)sceSystemServiceLoadExec("exit", NULL);
     for (;;) sceKernelUsleep(100000);
@@ -615,6 +617,7 @@ void hos_ps5_exit(int code) {
 static void notify_player(const char *text);
 void hos_ps5_restart(const char *why) {
     fprintf(stderr, "[ps5] restart: %s: the title starts again\n", why);
+    hos_ps5_mic_end();   /* (the microphone's port given back first: the start it makes opens its own) */
     fflush(NULL);
     /* (the start it makes knows itself by this file, which host/hos_main.c deletes: LoadExec's arguments do not reach it) */
     FILE *m = fopen("/app0/restarted.txt", "w");

@@ -453,7 +453,7 @@ def link(kit, info, work, objects, lld, nm):
             "fnmatch", "isatty", "pthread_setname_np", "timegm", "syscall", "pipe2", "accept4", "posix_fadvise", "getpwuid",
             "umask"])) + "};\n")
     elf = os.path.join(out, "llvm-pie.elf")
-    stubs = [os.path.join(kit, "lib", "stubs", n) for n in ("libSceAgc.so", "libSceAgcDriver.so")]
+    stubs = [os.path.join(kit, "lib", "stubs", n) for n in ("libSceAgc.so", "libSceAgcDriver.so", "libSceAudioIn.so")]
     sdk_lib = os.path.join(kit, "sdk", "target", "lib")
     args = (["-m", "elf_x86_64", "-pie", "--eh-frame-hdr", "-z", "max-page-size=0x4000", "-mllvm", "-emulated-tls"] +
             [place(a) for a in lk["script"]] + [place(a) for a in lk["flags"]] +
@@ -494,6 +494,7 @@ def title(kit, info, work, elf, native, out, model):
     new = os.path.join(work, "eboot.elf.new")
     run([native, "link", "--in", elf, "--out", new, "--stub-dir", stub_dir,
          "--stub", os.path.join(kit, "lib", "stubs", "libSceAgc.so"), "--stub", os.path.join(kit, "lib", "stubs", "libSceAgcDriver.so"),
+         "--stub", os.path.join(kit, "lib", "stubs", "libSceAudioIn.so"),
          "--module-sdk", "0x02000009", "--companion-sdk", "0x08050001", "--file-name", "eboot.elf"], what="the console's executable")
     run([native, "self", "--sign", "--in", new, "--out", os.path.join(app, "eboot.bin"), "--magic", "0x1D3D154F"], what="signing")
     run([native, "self", "--inspect", "--file", os.path.join(app, "eboot.bin")], what="the check of eboot.bin")

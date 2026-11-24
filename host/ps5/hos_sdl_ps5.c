@@ -2,11 +2,15 @@
    PS5_VulkanTemplate's titles make it: skills/ps5-homebrew/references/vulkan-on-radv.md), the controller is the
    DualSense of the user who started the title (scePad, host/ps5/platform.c), and the sound is the system user's main
    port (sceAudioOut, 48 kHz stereo 16-bit). Everything that reads these (host/posix/display_sdl.c, host/pad_sdl.c,
-   win32_posix.c's waveOut) is the Linux build's, unchanged. No keyboard, mouse or microphone on the console here.
+   win32_posix.c's waveOut) is the Linux build's, unchanged. No keyboard or mouse on the console here; the microphone is
+   that DualSense's, with HOS_PS5_MIC=1 (host/ps5/ps5_mic.h).
 
    HOS_PS5_DISPLAY=<width>x<height>: the display mode (3840x2160, 2560x1440 or 1920x1080; default 1920x1080, the size
    the renderer's default output 2048x1152 is closest to). The 59.94 Hz mode of that size is taken: the game paces to
-   60. */
+   60.
+
+   HOS_PS5_MIC=1 (in longshot_env.txt): the ocarina hears player 0's DualSense microphone (sceAudioIn). Off by default:
+   the game is told there is no microphone, as before, and nothing calls sceAudioIn. */
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 
@@ -23,13 +27,16 @@
 PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance instance, const char *name);   /* (RADV, linked in) */
 
 int hos_sdl_load(void) { return 3; }   /* (SDL3's numbering for everything below) */
+static void mic_start(void);
 int hos_sdl_init(uint32_t subsystems) {
     static int pads;
-    if ((subsystems & HOS_SDL_GAMEPAD) && !pads) pads = 1, pad_open();
+    /* (the microphone's port right after the controllers: early, before the game's memory is taken; HOS_PS5_MIC=1 only) */
+    if ((subsystems & HOS_SDL_GAMEPAD) && !pads) pads = 1, pad_open(), mic_start();
     return 1;
 }
 void hos_sdl_hint(const char *name, const char *value) { (void)name, (void)value; }
-const char *hos_sdl_error(void) { return "not on the console"; }
+static const char *last_error = "not on the console";   /* (or why the microphone was not opened: nn_audio_in.c logs it) */
+const char *hos_sdl_error(void) { return last_error; }
 void hos_sdl_identity(const char *name, const char *app_id) { (void)name, (void)app_id; }
 
 /* ---- the display ---- */
@@ -178,16 +185,81 @@ int hos_sdl_audio_open(int freq, int channels, int s16, void (*pull)(void *user,
 }
 int hos_sdl_audio_channels(void) { return 2; }
 
-/* ---- microphones: none ---- */
-int hos_sdl_mic_list(uint32_t *ids, char (*names)[128], int max) { (void)ids, (void)names, (void)max; return 0; }
-void *hos_sdl_mic_open(uint32_t id, int freq, int channels, uint16_t sdl_format) {
-    (void)id, (void)freq, (void)channels, (void)sdl_format;
-    return NULL;
+/* ---- the microphone: player 0's DualSense's, through sceAudioIn, with HOS_PS5_MIC=1 (host/nn_audio_in.c's streams: the
+   ocarina played by voice or humming). host/ps5/ps5_mic.h (GPL-3.0-or-later; from Grapnel, after mihawk-99's PS5_RetroArch)
+   does the work; here are the console's calls it is given. The list has one microphone, "DualSense microphone", while
+   player 0's controller is there; the default (id 0) is the same one, so the menu's Microphone row works as on a PC.
+   Without the switch the game is told there is none, as before, and nothing calls sceAudioIn: only the module comes in
+   with the title's other system modules (ps5/stubs/audio_in_link_stub.c). The switch is read at the first call, from
+   hos_sdl_init's controllers (after longshot_env.txt is read) or the game's first microphone. HOS_PS5_MIC_TYPE=0: the
+   voice-chat port type tried before the general one ---- */
+int sceAudioInInit(void);
+int sceAudioInOpen(int32_t user, int32_t type, int32_t index, uint32_t grain, uint32_t rate, uint32_t param);
+int sceAudioInInput(int32_t port, void *pcm);
+int sceAudioInGetSilentState(int32_t port);
+int sceAudioInClose(int32_t port);
+int sceUserServiceGetInitialUser(int32_t *user_id);
+uint64_t hos_ps5_direct_room(void);   /* (host/ps5/win32_ps5.c) */
+#include "ps5_mic.h"
+#include "../../gpu/vk/compat/longshot_env.h"   /* (env_on: the switches' one rule) */
+static int mic_pad_there;   /* (player 0's controller, as the last hos_sdl_pads_update saw it: the list's thread is another) */
+static int32_t mic_user(void) {   /* (player 0's: the user who started the title, whose controller platform.c opened) */
+    int32_t user = -1;
+    return sceUserServiceGetInitialUser(&user) < 0 ? -1 : user;
 }
-int hos_sdl_mic_available(void *mic) { (void)mic; return 0; }
-int hos_sdl_mic_read(void *mic, void *dst, int bytes) { (void)mic, (void)dst, (void)bytes; return 0; }
-void hos_sdl_mic_clear(void *mic) { (void)mic; }
-void hos_sdl_mic_close(void *mic) { (void)mic; }
+static int mic_player(void) { return __atomic_load_n(&mic_pad_there, __ATOMIC_RELAXED); }
+static int mic_thread(void *(*main)(void *)) {   /* (once for the run) */
+    pthread_t t;
+    pthread_attr_t a;
+    pthread_attr_init(&a);
+    pthread_attr_setstacksize(&a, 128 << 10);
+    pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);
+    const int r = pthread_create(&t, &a, main, NULL);
+    pthread_attr_destroy(&a);
+    return r;
+}
+static int64_t mic_now_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000000000LL + t.tv_nsec;
+}
+static const char *mic_memory(char *buf, size_t cap) {
+    snprintf(buf, cap, " (direct memory free: %llu MiB)", (unsigned long long)(hos_ps5_direct_room() >> 20));
+    return buf;
+}
+static const HosPs5MicOps *mic_ops(void) {
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    static HosPs5MicOps o;
+    static int made;
+    pthread_mutex_lock(&mu);
+    if (!made) {
+        const char *type = getenv("HOS_PS5_MIC_TYPE");
+        o = (HosPs5MicOps){sceAudioInInit, sceAudioInOpen, sceAudioInInput, sceAudioInGetSilentState, sceAudioInClose, mic_user,
+                           mic_player, mic_thread, mic_now_ns, hos_log, mic_memory, env_on("HOS_PS5_MIC"),
+                           !(type && type[0] == '0')};
+        made = 1;
+    }
+    pthread_mutex_unlock(&mu);
+    return &o;
+}
+static void mic_start(void) {   /* (hos_sdl_init's controllers: the port made early, before the game's memory is taken) */
+    static int done;
+    if (__atomic_exchange_n(&done, 1, __ATOMIC_ACQ_REL)) return;
+    hos_ps5_mic_prepare(mic_ops());
+}
+int hos_sdl_mic_list(uint32_t *ids, char (*names)[128], int max) { return hos_ps5_mic_list(mic_ops(), ids, names, max); }
+void *hos_sdl_mic_open(uint32_t id, int freq, int channels, uint16_t sdl_format) {
+    void *const mic = hos_ps5_mic_open(mic_ops(), id, freq, channels, sdl_format);
+    if (!mic) last_error = hos_ps5_mic_error();
+    return mic;
+}
+int hos_sdl_mic_available(void *mic) { return hos_ps5_mic_available(mic); }
+int hos_sdl_mic_read(void *mic, void *dst, int bytes) { return hos_ps5_mic_read(mic, dst, bytes); }
+void hos_sdl_mic_clear(void *mic) { hos_ps5_mic_clear(mic); }
+void hos_sdl_mic_close(void *mic) { hos_ps5_mic_close(mic); }
+/* (host/ps5/win32_ps5.c, the title closing or starting again: the port closed, the capture thread ended; 300 ms at most,
+   nothing when the microphone was never opened) */
+void hos_ps5_mic_end(void) { hos_ps5_mic_shutdown(); }
 
 /* ---- the controller: player 0's DualSense, as SDL3 numbers a gamepad's buttons and axes ---- */
 static struct pad pad_now;
@@ -200,7 +272,10 @@ int hos_sdl_pads_list(int32_t *ids, int *opens, int max) {
 void *hos_sdl_pad_open(int what) { (void)what; return &pad_token; }
 void hos_sdl_pad_close(void *pad) { (void)pad; }
 int hos_sdl_pad_connected(void *pad) { (void)pad; return (pad_players() & 1) != 0; }
-void hos_sdl_pads_update(void) { pad_poll(&pad_now); }
+void hos_sdl_pads_update(void) {
+    pad_poll(&pad_now);
+    __atomic_store_n(&mic_pad_there, (pad_players() & 1) != 0, __ATOMIC_RELAXED);   /* (the microphone's list) */
+}
 int hos_sdl_pad_button(void *pad, int button) {
     (void)pad;
     /* SOUTH EAST WEST NORTH BACK GUIDE START LSTICK RSTICK LSHOULDER RSHOULDER UP DOWN LEFT RIGHT: the touch pad's click

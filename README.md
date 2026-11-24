@@ -247,8 +247,8 @@ or opens a page, Cross (the Switch's B) goes back or closes the menu.
 | **Volume**, **Text speed**, **Field of view**, **Camera** rows | The game's own; nothing console-specific. |
 
 **What does not apply:** NVIDIA DLSS, AMD FSR 4, Intel XeSS, NVIDIA Reflex and AMD Anti-Lag (PC graphics cards'),
-Fullscreen and V-Sync (the console has one display mode at a time), the keyboard and mouse rows, the microphone, motion
-controls (the DualSense's sensors are not read yet) and the Discord status.
+Fullscreen and V-Sync (the console has one display mode at a time), the keyboard and mouse rows, the microphone unless
+it is turned on ([Controls](#controls)), motion controls (the DualSense's sensors are not read yet) and the Discord status.
 
 Your choices are saved in `longshot_options.ini` in the title's folder on the console
 ([Where the files go](#where-the-files-go)). To go back to the defaults, delete that file.
@@ -272,8 +272,15 @@ The DualSense of the user who started the title. By default the buttons sit wher
 | + | Options |
 | Sticks, stick clicks, D-pad | The same |
 
-Rumble goes to the controller. Motion controls, the touch pad's surface and the microphone are not read. The menu's
-Controls tab can move the buttons.
+Rumble goes to the controller. Motion controls and the touch pad's surface are not read. The menu's Controls tab can
+move the buttons.
+
+**Microphone (off by default):** with a line `HOS_PS5_MIC=1` in `longshot_env.txt`, the game hears the DualSense's own
+microphone, the controller of the user who started the title, for the ocarina played by voice (hum, whistle or play an
+instrument near the controller, with the game's own microphone option on). The menu's Audio tab then lists it as
+"DualSense microphone" in the **Microphone** row. The controller's mute button cuts it: the game then hears silence,
+and what it had not read yet is dropped. The voice never leaves the console: nothing is recorded to a file or sent
+anywhere.
 
 ## Mods
 
