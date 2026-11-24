@@ -43,7 +43,7 @@ Upstream's Linux build is the base: `host/` with `host/posix`'s Win32 calls, and
 
 | Linux build | PS5 | File |
 | --- | --- | --- |
-| SDL3 or SDL2 (window, controllers, sound, microphones) | VK_KHR_display, the DualSense through scePad, sceAudioOut; no microphone | `host/ps5/hos_sdl_ps5.c`, `host/ps5/platform.c` (PS5_VulkanTemplate's) |
+| SDL3 or SDL2 (window, controllers, sound, microphones) | VK_KHR_display, the DualSense through scePad, sceAudioOut; the DualSense's microphone through sceAudioIn with `HOS_PS5_MIC=1` (below) | `host/ps5/hos_sdl_ps5.c`, `host/ps5/platform.c` (PS5_VulkanTemplate's), `host/ps5/ps5_mic.h` |
 | The guest window at 16 TiB, all of it readable, pages made on first touch | at 64 GiB, 64 GiB of it, reserved and committed in 64 KiB units of direct memory, as on Windows; large commits backed on first touch | `host/ps5/win32_ps5.c`, `host/hos.h`, `host/hos_main.c` |
 | `hookshot_vk.so` and `libvulkan.so.1` loaded at run time | linked in; `dlopen`/`dlsym` answer from a table | `host/ps5/win32_ps5.c` |
 | Thread and fiber stacks from mmap | reserved in full, 256 KiB backed and grown on fault, freed once the thread has ended; at most 16 MiB (`HOS_PS5_STACK_MB`) | `host/ps5/win32_ps5.c` |
@@ -167,6 +167,31 @@ either way; the replay's time a frame 22.6 and 23.4 ms without, 19.7 and 20.2 wi
 PS5, #40 reports 21 to 22 fps going to 25 to 28 with those settings at 1920x1080 and 120 Hz. Not yet measured: the
 recorder thread alone with the console's defaults, and a base PS5 with this build.
 
+## Microphone
+
+The ocarina can be played by voice (humming, whistling or an instrument, with the game's own microphone option on), as on
+a PC, with `HOS_PS5_MIC=1` in `longshot_env.txt`; without it the game is told there is no microphone, as before. With it,
+the DualSense of the user who started the title is listed as "DualSense microphone" (the menu's Microphone row: Default
+is the same one) and read through sceAudioIn (`host/ps5/ps5_mic.h`, GPL-3.0-or-later):
+
+- the service and a port for that user are made once, early (with the controllers, after main: a port opened late, under
+  the game's memory, can be refused), and kept parked while the game does not listen; one capture thread for the run;
+- each of the game's streams reads its own copy, in the format it asked, and never waits;
+- a silent state but 0 (muted with the controller's button, no microphone, another application has it) gives silence and
+  drops what was queued;
+- the port is closed at the exit and at a restart (`hos_ps5_exit`, `hos_ps5_restart`);
+- nothing is written or sent: the log (`ps5: mic:` lines) has counts and levels, never a sample.
+
+The link takes a stub of libSceAudioIn (`ps5/stubs/audio_in_link_stub.c`: the payload SDK has none) beside AGC's, in
+`ps5/tools/link.sh` and the builder's kit. `HOS_PS5_MIC_TYPE=0` tries the voice-chat port type before the general one.
+`tests/test_ps5_microphone.py` runs `ps5_mic.h` on a PC with stand-ins for sceAudioIn.
+
+It comes from [Grapnel](https://github.com/morpheus302/PS5_Grapnel)'s port (`host/posix/ps5_mic.h` there), where it was
+played on a PS5 Slim, firmware 12.60, after mihawk-99's [PS5_RetroArch](https://github.com/mihawk-99/PS5_RetroArch)
+(`src/microphone_ps5.cpp`, `tooling/ps5-stubs/audio_in_link_stub.c`, GPL-3.0-or-later);
+[ProsperoCraft](https://github.com/mateo-cogeanu/ProsperoCraft)'s notes on the console's microphone service showed that
+the port is best made early and kept.
+
 ## Open questions
 
 - **The foliage fault's cause.** `minStorageBufferOffsetAlignment` is 4 on the console; the culling pass that left one of the
@@ -186,7 +211,7 @@ recorder thread alone with the console's defaults, and a base PS5 with this buil
 ## Known gaps
 
 - Motion controls: the game sees a pad lying still (scePad's sensors are not read yet).
-- Microphone (humming the ocarina): none.
+- Microphone (humming the ocarina): off by default ([Microphone](#microphone)); not yet run from this repository's build.
 - `RX_VK_FORCE_MESH_FALLBACK=1` (upstream's compute mesh path) ran out of memory in Link's house.
 - Preparing every shader before play (`hookshot_shaders.bin` beside `eboot.bin`, from `nx2/shader_census.py` on the PC) works and
   shows its progress, but its 4,128 compute programs alone go at ~1.3 a second.

@@ -28,11 +28,13 @@ cc() { PS5_PAYLOAD_SDK="$sdk" sh "$vulkan/tooling/prospero-clang18" "$@"; }
 cc -std=c++20 -O2 -fno-exceptions -fno-rtti -c "$native/app_crt.cpp" -o "$work/link/obj/app_crt.o"
 stub() {   # RADV calls AGC, which the SDK has no stubs for: these name its imports
     local library=$1 source=$2
-    cc -std=c11 -O2 -fPIC -c "$vulkan/$source" -o "$work/link/obj/${library}_stub.o"
+    cc -std=c11 -O2 -fPIC -c "$source" -o "$work/link/obj/${library}_stub.o"
     "$sdk/bin/prospero-lld" --shared -soname "${library}.prx" -o "$work/link/stubs/${library}.so" "$work/link/obj/${library}_stub.o"
 }
-stub libSceAgc vendor/ps5/sdk/stubs/agc_canary_link_stub.c
-stub libSceAgcDriver vendor/ps5/sdk/stubs/agc_driver_canary_link_stub.c
+stub libSceAgc "$vulkan/vendor/ps5/sdk/stubs/agc_canary_link_stub.c"
+stub libSceAgcDriver "$vulkan/vendor/ps5/sdk/stubs/agc_driver_canary_link_stub.c"
+# (and libSceAudioIn, the DualSense's microphone (host/ps5/ps5_mic.h): the SDK has no stub of it either; ours is in ps5/stubs/)
+stub libSceAudioIn "$root/ps5/stubs/audio_in_link_stub.c"
 # shellcheck source=/dev/null
 source "$vulkan/tools/radv-link.sh"
 radv_link_recipe "$vulkan" "$sdk" "$archive" || exit 2
@@ -47,13 +49,14 @@ link() {
     "$work/link/obj/app_crt.o" @"$work/objects.txt" \
     "$ffmpeg/lib/libavcodec.a" "$ffmpeg/lib/libswscale.a" "$ffmpeg/lib/libavutil.a" "$ffmpeg/lib/libdav1d.a" \
     "$root/.local/ps5-deps/zstd/lib/libzstd.a" \
-    "$work/link/stubs/libSceAgc.so" "$work/link/stubs/libSceAgcDriver.so" \
+    "$work/link/stubs/libSceAgc.so" "$work/link/stubs/libSceAgcDriver.so" "$work/link/stubs/libSceAudioIn.so" \
     "${radv_link_inputs[@]}" \
     --as-needed "$sdk"/target/lib/*.so
 }
 link
-# What the modules a title loads export: the SDK's stubs but libkernel_sys's and libScePosixForWebKit's, and AGC's.
-for library in "$sdk"/target/lib/*.so "$work/link/stubs/libSceAgc.so" "$work/link/stubs/libSceAgcDriver.so"; do
+# What the modules a title loads export: the SDK's stubs but libkernel_sys's and libScePosixForWebKit's, AGC's and AudioIn's.
+for library in "$sdk"/target/lib/*.so "$work/link/stubs/libSceAgc.so" "$work/link/stubs/libSceAgcDriver.so" \
+        "$work/link/stubs/libSceAudioIn.so"; do
     case ${library##*/} in libkernel_sys.so | libScePosixForWebKit.so) continue ;; esac
     "$sdk/bin/llvm-nm" -D --defined-only "$library" 2>/dev/null | awk '{ print $NF }'
 done | sort -u > "$work/link/exported.txt"
@@ -77,7 +80,7 @@ if [[ -n $null_imports ]]; then
 fi
 "$tool" link --in "$work/link/llvm-pie.elf" --out "$work/eboot.elf.new" \
     --stub-dir "$sdk/target/lib" --stub "$work/link/stubs/libSceAgc.so" \
-    --stub "$work/link/stubs/libSceAgcDriver.so" --module-sdk 0x02000009 \
+    --stub "$work/link/stubs/libSceAgcDriver.so" --stub "$work/link/stubs/libSceAudioIn.so" --module-sdk 0x02000009 \
     --companion-sdk 0x08050001 --file-name eboot.elf
 title_id=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["titleId"])' "$param")
 app="$root/dist/$title_id"

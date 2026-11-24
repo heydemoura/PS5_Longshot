@@ -67,15 +67,17 @@ def main():
 
     # ---- libraries ----
     vulkan, sdk = os.path.abspath(b.VULKAN), os.path.abspath(b.SDK)
-    # (the CRT and the stubs that name AGC's imports, as ps5/tools/link.sh makes them)
+    # (the CRT and the stubs that name AGC's imports and the microphone's libSceAudioIn's, as ps5/tools/link.sh makes them)
     cc = lambda *args: subprocess.run(["sh", os.path.join(vulkan, "tooling", "prospero-clang18")] + list(args), check=True,
                                       env=dict(os.environ, PS5_PAYLOAD_SDK=sdk, PS5_CLANG=os.environ.get("PS5_CLANG") or shutil.which("clang")))
     cc("-std=c++20", "-O2", "-fno-exceptions", "-fno-rtti", "-c", os.path.join(vulkan, "tooling", "native", "app_crt.cpp"),
        "-o", os.path.join(kit, "obj", "app_crt.o"))
     os.makedirs(os.path.join(kit, "lib", "stubs"))
-    for lib, src in (("libSceAgc", "agc_canary_link_stub.c"), ("libSceAgcDriver", "agc_driver_canary_link_stub.c")):
+    for lib, src in (("libSceAgc", os.path.join(vulkan, "vendor", "ps5", "sdk", "stubs", "agc_canary_link_stub.c")),
+                     ("libSceAgcDriver", os.path.join(vulkan, "vendor", "ps5", "sdk", "stubs", "agc_driver_canary_link_stub.c")),
+                     ("libSceAudioIn", os.path.join(ROOT, "ps5", "stubs", "audio_in_link_stub.c"))):
         o = os.path.join(kit, "lib", "stubs", lib + "_stub.o")
-        cc("-std=c11", "-O2", "-fPIC", "-c", os.path.join(vulkan, "vendor", "ps5", "sdk", "stubs", src), "-o", o)
+        cc("-std=c11", "-O2", "-fPIC", "-c", src, "-o", o)
         subprocess.run([os.path.join(sdk, "bin", "prospero-lld"), "--shared", "-soname", lib + ".prx", "-o",
                         os.path.join(kit, "lib", "stubs", lib + ".so"), o], check=True)
         os.remove(o)
@@ -126,7 +128,7 @@ printf '%s\0' "${radv_link_inputs[@]}"
     exported = set()
     libs = sorted(f for f in os.listdir(os.path.join(sdk, "target", "lib")) if f.endswith(".so"))
     for lib in [os.path.join(sdk, "target", "lib", f) for f in libs if f not in ("libkernel_sys.so", "libScePosixForWebKit.so")] + \
-            [os.path.join(kit, "lib", "stubs", n) for n in ("libSceAgc.so", "libSceAgcDriver.so")]:
+            [os.path.join(kit, "lib", "stubs", n) for n in ("libSceAgc.so", "libSceAgcDriver.so", "libSceAudioIn.so")]:
         out = subprocess.run([os.path.join(sdk, "bin", "llvm-nm"), "-D", "--defined-only", lib], capture_output=True, text=True).stdout
         exported.update(l.split()[-1] for l in out.splitlines() if l.strip())
     with open(os.path.join(kit, "link", "exported.txt"), "w") as f:
