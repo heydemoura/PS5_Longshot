@@ -643,7 +643,7 @@ A movie whose pictures take longer to decode than the time between them is shown
 has moved on: on a slow CPU the opening used to drop most of its pictures. How fast the decoder is counts from its recent
 pictures, so a slow first picture does not stop a decoder that keeps up from catching up later, and catching up takes at
 most one picture's time in a frame. With a decoder slower than the movie, the picture can fall behind the sound.
-`HOS_VIDEO_NO_CATCHUP=1` skips nothing. Each picture is waited for for about a tenth of a second
+`HOS_VIDEO_NO_CATCHUP=1` skips nothing. Each picture is waited for about a tenth of a second
 (`HOS_VIDEO_ACQUIRE_TRIES=1`: a count of sleeps instead of the clock). After a movie stops or is flushed, and nothing new
 has been submitted, there is no wait. The first picture can still be black on some PCs; why is not known yet.
 
