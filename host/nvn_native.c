@@ -19,12 +19,17 @@
    own procs (program builders, native images, sparse tile layouts, recording modes). The SDK's exports reach the
    same functions as the proc table (nvn2_dispatch, from gen/nvn2_exports.c). */
 #include "hos.h"
+#include "shadow_slot.h"   /* (the storage a character's shadow map reserves) */
 #include "../gpu/render/rx_nvn.h"
 #include "../gpu/vk/vk_api.h"   /* (HOS_OPT_RENDER_THREAD: the present poll, nvnEventGetValue) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
+#ifdef TRACY_ENABLE
+#define HT_WRAP_LOCKS   /* (LONGSHOT_TRACY: this file's locks that have to wait are zones) */
+#include "hos_tracy.h"
+#endif
 #ifndef LONGSHOT_ENV_H   /* (env_on: the switches' one rule) */
 #include "../gpu/vk/compat/longshot_env.h"
 #endif
@@ -187,7 +192,22 @@ NV(nvnDeviceInitialize) {
     RET(1);
 }
 NV(nvnDeviceFinalize) { ((nvn_dev *)P(0))->magic = 0; }
-NV(nvnDeviceGetProcAddress) { RET(U64(1) ? nvn_native_proc((const char *)GP(U64(1))) : 0); }
+/* (longshot) A proc name the game passes: read only inside guest memory and up to 255 characters, copied into out ("" when it
+   is not a string there). It was read in place to its end, which a pointer near the window's end (or no end) took past the
+   guest's memory into the host's */
+static const char *guest_name(uint64_t a, char *out, size_t cap) {
+    out[0] = 0;
+    const uint64_t room = a && a < (uint64_t)HOS_SPACE_END ? (uint64_t)HOS_SPACE_END - a : 0;
+    const size_t lim = room < cap ? (size_t)room : cap;
+    const char *s = lim ? (const char *)hos_guest_range(a, lim) : NULL;
+    const char *end = s ? (const char *)memchr(s, 0, lim) : NULL;
+    if (end) memcpy(out, s, (size_t)(end - s) + 1);
+    return out;
+}
+NV(nvnDeviceGetProcAddress) {
+    char name[256];
+    RET(U64(1) ? nvn_native_proc(guest_name(U64(1), name, sizeof name)) : 0);
+}
 /* (longshot) API version 231.40: OoT (SDK 22.2.8) skips its graphics setup unless the minor is >= 40 (main
    0x8348c11c); MKW's driver said 39, which MKW accepts too. */
 /* The Switch 2 NVN2 driver's device limits: its nvnDeviceGetInteger (sdk+0x65b680) run for every id under
@@ -248,6 +268,11 @@ NV(nvnDeviceSetWindowOriginMode) {
     ((nvn_dev *)P(0))->origin = U32(1);
     hos_log("nvn: window origin %s", U32(1) ? "upper left" : "lower left");
 }
+/* (longshot) what the game set (NVN's default, 0, before it sets one), as the driver answers. Without them a caller got
+   the "not implemented" stub's 0: lower left to a game that set upper left, so code that lays its own drawing over the
+   game's picture by the answer (a mod's overlay) drew it upside down */
+NV(nvnDeviceGetWindowOriginMode) { RET(((const nvn_dev *)P(0))->origin); }
+NV(nvnDeviceGetDepthMode) { RET(((const nvn_dev *)P(0))->depth_mode); }
 NV(nvnDeviceSetDepthMode) {
     ((nvn_dev *)P(0))->depth_mode = U32(1);
     const LONG was = InterlockedExchange(&depth_minus_w, U32(1) == NVN_DEPTH_MODE_NEAR_IS_MINUS_W);
@@ -275,6 +300,8 @@ NV(nvnMemoryPoolBuilderSetDefaults) { memset(P(0), 0, sizeof(nvn_pool_builder));
 NV(nvnMemoryPoolBuilderSetDevice) { ((nvn_pool_builder *)P(0))->dev = P(1); }
 NV(nvnMemoryPoolBuilderSetStorage) { ((nvn_pool_builder *)P(0))->mem = U64(1); ((nvn_pool_builder *)P(0))->size = U64(2); }
 NV(nvnMemoryPoolBuilderSetFlags) { ((nvn_pool_builder *)P(0))->flags = U32(1); }
+/* Prepare output descriptors before their pool or textures are registered with replay. */
+static char detached_descriptor_only;
 NV(nvnMemoryPoolInitialize) {
     const nvn_pool_builder *b = (const nvn_pool_builder *)P(1);
     nvn_pool *o = (nvn_pool *)P(0);
@@ -309,6 +336,7 @@ NV(nvnMemoryPoolInitialize) {
     gw(b->mem, o->size);   /* (longshot: the storage lies in guest memory) */
     o->mem = b->mem;
     o->gpu = b->mem;
+    if (u_ == &detached_descriptor_only) { RET(1); return; }
     hos_gpu_track(o->gpu, o->size, 1);   /* (the CPU's writes to it reach the renderer through write watch) */
     rx_nvn_pool_created(o->gpu, o->size);
     void hos_prompts_pool(uint64_t mem, uint64_t size);   /* (longshot, prompts.c: the button prompts' textures, changed in place) */
@@ -377,6 +405,10 @@ NV(nvnMemoryPoolGetBufferAddress) {
 NV(nvnMemoryPoolFlushMappedRange) {}   /* CPU writes are seen through write watch */
 NV(nvnMemoryPoolInvalidateMappedRange) {   /* the CPU is about to read what the GPU wrote */
     if (no_pool(c, "invalidate mapped range")) return;
+#ifdef TRACY_ENABLE
+    HT_ZONE(tz, "nvnMemoryPoolInvalidateMappedRange");   /* (a readback: may wait for the GPU) */
+    HT_ZONE_TEXTF(tz, "%llu bytes, lr %#llx", (unsigned long long)U64(2), (unsigned long long)c->x[30]);
+#endif
     const nvn_pool *o = (const nvn_pool *)P(0);
     if ((int64_t)U64(1) >= 0) rx_nvn_invalidate(o->gpu + U64(1), U64(2));
 }
@@ -471,9 +503,8 @@ NV(nvnBufferInitialize) {
     RET(1);
 }
 NV(nvnBufferFinalize) { memset(P(0), 0, sizeof(nvn_buffer)); }
-/* (longshot, issue 287) A buffer with no memory pool, mapped: the game filled 0x3d0 bytes at what it got back, 0, and crashed
-   on a scene change (Hyrule Castle / Castle Town / Hyrule Field, Kakariko day to night; thread OptimizeChangeBanc, right after
-   "flags of no memory pool"). Zeroed scratch memory in the game's address space instead, as large as the biggest asked for
+/* (longshot) A buffer with no memory pool, mapped: the game fills 0x3d0 bytes at what it gets back, and 0 crashes it on a
+   scene change (thread OptimizeChangeBanc, right after "flags of no memory pool"). Zeroed scratch memory in the game's address space instead, as large as the biggest asked for
    (never freed: it comes rarely), and who asked, once. */
 static uint64_t scratch_map(uint64_t size, uint64_t lr) {
     static SRWLOCK lock = SRWLOCK_INIT;
@@ -507,6 +538,10 @@ NV(nvnBufferGetMemoryOffset) { RET((uint64_t)((const nvn_buffer *)P(0))->off); }
 NV(nvnBufferGetSize) { RET(((const nvn_buffer *)P(0))->size); }
 NV(nvnBufferFlushMappedRange) {}
 NV(nvnBufferInvalidateMappedRange) {
+#ifdef TRACY_ENABLE
+    HT_ZONE(tz, "nvnBufferInvalidateMappedRange");   /* (a readback: may wait for the GPU) */
+    HT_ZONE_TEXTF(tz, "%llu bytes, lr %#llx", (unsigned long long)U64(2), (unsigned long long)c->x[30]);
+#endif
     const nvn_buffer *o = (const nvn_buffer *)P(0);
     if (o->pool) rx_nvn_invalidate(POOL(o->pool)->gpu + (uint64_t)o->off + U64(1), U64(2));
 }
@@ -538,8 +573,8 @@ NV(nvnSamplerPoolRegisterSampler) { rx_nvn_register_sampler(I(1), &((const nvn_s
 
 /* ---- textures ---- */
 /* (longshot) A texture builder of no address: a scratch one instead, said once. The game passed 0 after a long freeze (the
-   ocarina note sheet's first build, combat in Hyrule Field) and nvnTextureBuilderSetSwizzle read A64_MEM + 0x5c (issue 500);
-   a builder set up wrongly is a missing texture, not a crash. As PR 510 for memory pools. */
+   ocarina note sheet's first build, combat in Hyrule Field) and nvnTextureBuilderSetSwizzle read A64_MEM + 0x5c;
+   a builder set up wrongly is a missing texture, not a crash. As for memory pools. */
 static nvn_tex_builder *tb_or_scratch(void *p, uint64_t lr) {
     static nvn_tex_builder scratch;
     if (p) return (nvn_tex_builder *)p;
@@ -610,25 +645,46 @@ NV(nvnTextureBuilderGetPackagedTextureData) { RET(CTB(P(0))->pkg_data); }
 static int storage_class(const nvn_texdesc *d) { return d->target == NVN_TEXTURE_TARGET_BUFFER ? 0 : 1; }
 NV(nvnTextureBuilderGetStorageClass) { RET(storage_class(&CTB(P(0))->d)); }
 NV(nvnTextureBuilderGetFlags) { RET((uint32_t)CTB(P(0))->d.flags); }
-/* (longshot, issues 284 and 287) A size or alignment asked of no builder: the game passed 0 here while a scene loaded (thread
-   OptimizeChangeBanc, entering Castle Town), and the format read at +4 of it crashed the game. Size 0 then, and who asked, once */
+/* (longshot) A size or alignment asked of no builder: the game passes 0 here while a scene loaded (thread
+   OptimizeChangeBanc, entering Castle Town), and the format read at +4 of it would crash the game. Size 0 then, and who asked, once */
 static int no_builder(Ctx *c, const char *what) {
     if (c->x[0]) return 0;
     static int told;
     if (told++ < 4) hos_log("nvn: %s of no texture builder (lr %#llx): 0", what, (unsigned long long)c->x[30]);
     return 1;
 }
+/* (longshot) a character's shadow map reserves the storage of the next step of sides up (shadow_slot.h), so the render targets
+   the game makes after it keep their addresses while its side changes from frame to frame. HOS_SHADOW_BUCKET=<step>: the step
+   (384); 0: every texture its own size, as before. The layout of the side it reserves, or 0 when it reserves its own */
+static int shadow_slot_layout(const nvn_texdesc *d, nvn_texlayout *out) {
+    static int step = -1;
+    if (step < 0) {
+        const char *e = getenv("HOS_SHADOW_BUCKET");
+        step = e ? atoi(e) : HOS_SHADOW_SLOT_STEP;
+        if (step < 0) step = 0;
+    }
+    const uint32_t side = hos_shadow_slot_side(d->target == NVN_TEXTURE_TARGET_2D, d->format, d->levels, d->depth, d->width,
+                                               d->height, (uint32_t)step);
+    if (!side || side == d->width) return 0;
+    nvn_texdesc slot = *d;
+    slot.width = slot.height = side;
+    nvn_tex_layout(&slot, out);
+    return 1;
+}
 NV(nvnTextureBuilderGetStorageSize) {
     if (no_builder(c, "storage size")) { RET(0); return; }
-    nvn_texlayout L;
+    nvn_texlayout L, slot;
     nvn_tex_layout(&CTB(P(0))->d, &L);
     if (!L.bpb) hos_log("nvn: texture format %#x unknown: storage size 0", CTB(P(0))->d.format);
+    if (L.bpb && shadow_slot_layout(&CTB(P(0))->d, &slot) && slot.size > L.size) L.size = slot.size;
     RET(L.size);
 }
 NV(nvnTextureBuilderGetStorageAlignment) {
     if (no_builder(c, "storage alignment")) { RET(512); return; }
-    nvn_texlayout L;
+    nvn_texlayout L, slot;
     nvn_tex_layout(&CTB(P(0))->d, &L);
+    /* (the slot's alignment where it is the larger: one alignment for every side within a step, and the texture's own still met) */
+    if (L.bpb && shadow_slot_layout(&CTB(P(0))->d, &slot) && slot.align > L.align) L.align = slot.align;
     RET(L.align);
 }
 NV(nvnTextureBuilderGetZCullStorageSize) { RET(0); }   /* no ZCull: nothing to store */
@@ -726,6 +782,7 @@ NV(nvnTextureInitialize) {
         if (!o->gpu || !nvn_gpu_write(o->gpu, gw(b->pkg_data, o->L.size), o->L.size)) die("packaged texture data without storage");
     }
     o->serial = new_serial();
+    if (u_ == &detached_descriptor_only) { RET(1); return; }
     live_put(o);
     rx_nvn_texture_created(o);
     {   /* RX_NVN_WATCH_TEX=<w>x<h> (debugging): who writes the storage of textures that size (a page watch, with call
@@ -924,8 +981,17 @@ static void texels(Ctx *c, int write, int strided) {
                 (unsigned long long)chain[0], (unsigned long long)chain[1], (unsigned long long)chain[2],
                 (unsigned long long)chain[3], (unsigned long long)chain[4], (unsigned long long)chain[5]);
     }
+#ifdef TRACY_ENABLE
+    HT_ZONE(tz, "nvn texels");
+    HT_ZONE_TEXTF(tz, "%s", write ? "write" : "read");
+#endif
     if (write) rx_nvn_write_texels(t, level, layer0, r, data, row, img), watch_texels_source(t, data, img);
-    else rx_nvn_read_texels(t, level, layer0, r, data, row, img);
+    else {
+        /* (the texels land in a buffer of the game's choosing, which may be memory the GPU reads later, a pool it
+           uploads from: marked written after the copy, as any host write of guest memory the renderer may hold) */
+        rx_nvn_read_texels(t, level, layer0, r, data, row, img);
+        if (data) HOS_WRITTEN(data, (size_t)extent);
+    }
 }
 NV(nvnTextureReadTexels) { texels(c, 0, 0); }
 NV(nvnTextureReadTexelsStrided) { texels(c, 0, 1); }
@@ -996,7 +1062,7 @@ NV(nvnProgramFinalize) {
     ((nvn_prog *)P(0))->magic = 0;
 }
 /* HOS_SHADER_DUMP=<dir> (mkw-recomp, debugging): each stage's code (from its GPU address, up to 64 KiB while mapped)
-   and control section (0x800 bytes) as <code address>.code / .ctl, for gpu/shadertool */
+   and control section (0x800 bytes) as <code address>.code / .ctl, for offline inspection */
 static void dump_stage(uint64_t code, uint64_t ctl) {
     static const char *dir = (const char *)-1;
     if (dir == (const char *)-1) dir = getenv("HOS_SHADER_DUMP");
@@ -1066,11 +1132,14 @@ static CRITICAL_SECTION held_cs;
 static int held_ready, hold_on = -1;
 static void held_init(void) {
     if (!held_ready) { InitializeCriticalSection(&held_cs); held_ready = 1; }
-    if (hold_on < 0) { const char *e = getenv("HOS_NVN_HOLD"); hold_on = e && atoi(e) != 0; }   /* (off: see below) */
+    if (hold_on < 0) hold_on = env_on("HOS_NVN_HOLD");   /* (off: see below) */
 }
 static void held_flush(void) {
     held_init();
     if (!nheld) return;
+#ifdef TRACY_ENABLE
+    HT_SCOPE("nvn held_flush");
+#endif
     EnterCriticalSection(&held_cs);
     for (LONG i = 0; i < nheld; i++) rx_nvn_submit(held[i].h, held[i].n);
     nheld = 0;
@@ -1113,6 +1182,11 @@ NV(nvnSyncWait) {
     if (rx_nvn_wait(s->fence, 0)) { RET(NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED); return; }
     static int block = -1;   /* HOS_NVN_SYNC_BLOCK=1 (experiment): a poll waits for the GPU */
     if (block < 0) block = env_on("HOS_NVN_SYNC_BLOCK");
+#ifdef TRACY_ENABLE
+    HT_WAIT(tz, "nvnSyncWait");
+    HT_ZONE_TEXTF(tz, "fence %llu, timeout %.3f ms, lr %#llx", (unsigned long long)s->fence, U64(1) / 1e6,
+                  (unsigned long long)c->x[30]);
+#endif
     const int away = hos_vcore_away();
     const int64_t t0 = hos_now_ns();
     const int ok = rx_nvn_wait(s->fence, block ? ~0ull >> 1 : U64(1));
@@ -1145,12 +1219,10 @@ NV(nvnEventGetValue) {
            while this one is replayed, as far as the window's textures and the replay's queue let it */
         /* (longshot) RX_VK_ASYNC=1 (any value but 0), the render thread (gpu/vk/vk_replay.cpp async_on): the same, as its
            rule. The event is signalled by the GPU at the end of the frame's work, so the poll held the game until the replay
-           it had just handed over was recorded and run: 20 of a 37 ms frame asleep here on the older replay thread, which
-           polled (profiled; removed). Answered at once, the
+           it had just handed over was recorded and run (20 of a 37 ms frame asleep here). Answered at once, the
            presenting thread goes on to its present, where the render thread holds it while the present before is not
-           replayed (RX_VK_PRESENTS_AHEAD), and holds the present itself until the main thread's signal for the frame. The
-           idea of answering the poll from the present's hand-over is Hookshot PR 2910's (rx_release_due):
-           https://git.notrexed.dev/Hookshot/Hookshot/pulls/2910. HOS_PRESENT_NOWAIT=0 with the render thread (a test): polled, as before */
+           replayed (RX_VK_PRESENTS_AHEAD), and holds the present itself until the main thread's signal for the frame
+           (rx_release_due). HOS_PRESENT_NOWAIT=0 with the render thread (a test): polled */
         /* (longshot) whether the render thread runs is the renderer's to say, once (HOS_OPT_RENDER_THREAD: vk_replay.cpp
            async_on), not RX_VK_ASYNC read here: the Insert menu's Threaded rendering turns it on too, with the switch
            unset, and the poll must then be answered exactly as with RX_VK_ASYNC=1. Kept once the renderer has answered
@@ -1160,7 +1232,7 @@ NV(nvnEventGetValue) {
         int now = nowait;
         if (now < 0) {
             const char *e = getenv("HOS_PRESENT_NOWAIT");
-            now = e ? atoi(e) != 0 : rx_option(HOS_OPT_RENDER_THREAD, -1);
+            now = e ? !env_value_off(e) : rx_option(HOS_OPT_RENDER_THREAD, -1);
             if (now >= 0) nowait = now = now != 0;
         }
         if (now > 0 && (c->x[30] == 0x805904a0 || c->x[30] == 0x80590530)) { RET(1); return; }
@@ -1207,6 +1279,10 @@ NV(nvnQueueFinalize) { ((nvn_queue *)P(0))->magic = 0; }
 NV(nvnQueueGetError) { if (P(1)) memset(P(1), 0, sizeof(NVNqueueErrorInfo)); RET(NVN_QUEUE_GET_ERROR_RESULT_GPU_NO_ERROR); }
 NV(nvnQueueFlush) { held_flush(); }
 NV(nvnQueueFinish) {
+#ifdef TRACY_ENABLE
+    HT_WAIT(tz, "nvnQueueFinish");
+    HT_ZONE_TEXTF(tz, "lr %#llx", (unsigned long long)c->x[30]);
+#endif
     held_flush();
     const int away = hos_vcore_away();
     const int64_t t0 = hos_now_ns();
@@ -1241,10 +1317,10 @@ static unsigned pool_class(size_t n) {
     return c;
 }
 /* a block of at least n bytes; *cls its class (POOL_MAX + 1: from the heap, n bytes) */
-static void *pool_get(size_t n, unsigned *cls) {
+static void *pool_get(size_t n, unsigned *cls, const char *what) {   /* (never NULL: hos_xmalloc) */
     const unsigned c = pool_off() ? POOL_MAX + 1 : pool_class(n);
     *cls = c;
-    if (c > POOL_MAX) return malloc(n);
+    if (c > POOL_MAX) return hos_xmalloc(n, what);
     AcquireSRWLockExclusive(&pool_lock);
     void *b = pool_head[c];
     if (b) {
@@ -1252,7 +1328,7 @@ static void *pool_get(size_t n, unsigned *cls) {
         pool_bytes[c] -= (uint64_t)1 << c;
     }
     ReleaseSRWLockExclusive(&pool_lock);
-    return b ? b : malloc((size_t)1 << c);
+    return b ? b : hos_xmalloc((size_t)1 << c, what);
 }
 static void pool_put(void *b, unsigned cls) {
     if (!b) return;
@@ -1293,8 +1369,7 @@ static cmd_rec *cmd_adopt(nvn_cmd *o) {
     const uint32_t s = ncmd_free ? cmd_free[--ncmd_free] : cmd_next++;
     if ((s >> CMD_CHUNK_BITS) >= CMD_CHUNKS) die("too many command buffers");
     if (!cmd_chunks[s >> CMD_CHUNK_BITS]) {
-        cmd_rec *k = (cmd_rec *)calloc((size_t)1 << CMD_CHUNK_BITS, sizeof *k);
-        if (!k) die("command buffer table");
+        cmd_rec *k = (cmd_rec *)hos_xcalloc((size_t)1 << CMD_CHUNK_BITS, sizeof *k, "native NVN: command buffer table");
         cmd_chunks[s >> CMD_CHUNK_BITS] = k;
     }
     cmd_rec *r = cmd_slot(s);
@@ -1328,8 +1403,7 @@ static void cmd_release(nvn_cmd *o) {   /* the object's slot and recording buffe
     memset(r, 0, sizeof *r);
     if (ncmd_free == cap_cmd_free) {
         cap_cmd_free = cap_cmd_free ? cap_cmd_free * 2 : 256;
-        cmd_free = (uint32_t *)realloc(cmd_free, cap_cmd_free * sizeof *cmd_free);
-        if (!cmd_free) die("command buffer table");
+        cmd_free = (uint32_t *)hos_xrealloc(cmd_free, cap_cmd_free * sizeof *cmd_free, "native NVN: command buffer table");
     }
     cmd_free[ncmd_free++] = o->slot;
     ReleaseSRWLockExclusive(&cmd_lock);
@@ -1366,8 +1440,7 @@ static void cmd_reserve_rec(cmd_rec *o, size_t need) {
     if (!cap) cap = 64 << 10;
     while (used + need + OP_RESERVE > cap) cap *= 2;
     unsigned cls;
-    uint8_t *b = (uint8_t *)pool_get(cap, &cls);
-    if (!b) die("recording buffer (%zu bytes)", cap);
+    uint8_t *b = (uint8_t *)pool_get(cap, &cls, "native NVN: recording buffer");
     if (o->seg) {
         memcpy(b, o->seg, used);
         InterlockedAdd64(&seg_bytes, -(LONG64)(o->end - o->seg));
@@ -1436,9 +1509,8 @@ static size_t live_at(uint64_t h, size_t cap) { return (size_t)((h * 0x9E3779B97
 static void live_handle_add(uint64_t h) {   /* (copy_lock held exclusively) */
     if ((nlive + 1) * 2 > live_cap) {
         const size_t cap = live_cap ? live_cap * 2 : 65536;
-        uint64_t *t = (uint64_t *)calloc(cap, sizeof *t);
-        live_table *pub = (live_table *)malloc(sizeof *pub);
-        if (!t || !pub) die("recording handle set");
+        uint64_t *t = (uint64_t *)hos_xcalloc(cap, sizeof *t, "native NVN: recording handle set");
+        live_table *pub = (live_table *)hos_xmalloc(sizeof *pub, "native NVN: recording handle set");
         for (size_t i = 0; i < live_cap; i++) {
             if (!live_handles[i]) continue;
             size_t k = live_at(live_handles[i], cap);
@@ -1511,8 +1583,7 @@ static void free_dead_copies(void) {   /* (copy_lock held) */
 static void dead_copy_add(copy_prefix *p, uint64_t after) {   /* (copy_lock held) */
     if (ndead == cap_dead) {
         cap_dead = cap_dead ? cap_dead * 2 : 1024;
-        dead = (dead_copy *)realloc(dead, cap_dead * sizeof *dead);
-        if (!dead) die("recording copies let go");
+        dead = (dead_copy *)hos_xrealloc(dead, cap_dead * sizeof *dead, "native NVN: recording copies let go");
     }
     dead[ndead].p = p;
     dead[ndead].after = after;
@@ -1558,10 +1629,10 @@ static void release_copies(uint64_t lo, uint64_t hi) {
    or calling a recording waited behind it */
 #define SWEEP_EVERY 1024u
 #define SWEEP_SLICE 2688u   /* (65536 / 2688 * 1024: every bucket once in ~25,000 recordings) */
-static void sweep_overwritten_copies(void) {   /* (copy_lock held) */
+static size_t sweep_overwritten_copies(void) {   /* (copy_lock held) */
     static int off = -1;
     if (off < 0) off = env_on("HOS_NVN_NO_SWEEP");
-    if (off || !rec_buckets) return;
+    if (off || !rec_buckets) return 0;
     free_dead_copies();
     const uint64_t after = rx_nvn_pushed() + held_count();
     size_t swept = 0;
@@ -1598,7 +1669,9 @@ static void sweep_overwritten_copies(void) {   /* (copy_lock held) */
         }
     }
     static int logged;
-    if (swept && logged++ < 12) hos_log_at(HOS_LOG_DEBUG, "nvn: %zu copies of recordings whose control memory was reused let go (%zu live)", swept, ncopies);
+    if (!swept || logged == 12) return 0;
+    logged++;
+    return swept;
 }
 NV(nvnCommandBufferAddControlMemory) {
     nvn_cmd *o = CB(P(0));
@@ -1629,8 +1702,7 @@ NV(nvnCommandBufferBeginRecording) {
 /* the recording, BEGIN to END, is contiguous in the command buffer's segment: one copy of it */
 static uint8_t *flatten(const uint8_t *p, size_t n) {
     unsigned cls;
-    uint8_t *out = (uint8_t *)pool_get(sizeof(copy_prefix) + n, &cls);
-    if (!out) die("recording copy (%zu bytes)", n);
+    uint8_t *out = (uint8_t *)pool_get(sizeof(copy_prefix) + n, &cls, "native NVN: recording copy");
     memcpy(out + sizeof(copy_prefix), p, n);
     copy_prefix *pre = (copy_prefix *)out;
     pre->cls = cls;
@@ -1660,6 +1732,10 @@ static void watch_handle_called(Ctx *c, uint64_t h, const char *how) {
     }
 }
 NV(nvnCommandBufferEndRecording) {
+#ifdef TRACY_ENABLE
+    HT_ZONE(tz, "nvnCommandBufferEndRecording");   /* (the recorded commands' copy) */
+    HT_ZONE_TEXTF(tz, "lr %#llx", (unsigned long long)c->x[30]);
+#endif
     nvn_cmd *o = CB(P(0));
     uint8_t *p = cmd_alloc(o, 8);
     put_hdr(p, NOP_END, 8);
@@ -1691,12 +1767,24 @@ NV(nvnCommandBufferEndRecording) {
     ncopies++;
     live_handle_add((uint64_t)(uintptr_t)copy);
     static uint64_t made;
-    if (++made % SWEEP_EVERY == 0) sweep_overwritten_copies();
-    if (made % 50000 == 0)
-        hos_log("nvn: %llu recordings made, %zu live copies (%.1f MB), %zu texture copies; %lld command buffers' segments "
-                "(%.1f MB)", (unsigned long long)made, ncopies, copy_bytes / 1048576.0, npins, (long long)seg_count,
-                seg_bytes / 1048576.0);
+    const uint64_t recording = ++made;
+    const size_t swept = recording % SWEEP_EVERY == 0 ? sweep_overwritten_copies() : 0;
+    const int report = recording % 50000 == 0;
+    const size_t live_copies = (report || swept) ? ncopies : 0;
     ReleaseSRWLockExclusive(&copy_lock);
+    if (report || swept) {
+        /* stderr can block for hundreds of milliseconds. Other recorders and guests pinned to
+           this thread's virtual core must be able to run while the line is being written. */
+        const int away = hos_vcore_away();
+        if (swept)
+            hos_log_at(HOS_LOG_DEBUG, "nvn: %zu copies of recordings whose control memory was reused let go (%zu live)", swept, live_copies);
+        if (report)
+            hos_log("nvn: %llu recordings made, %zu live copies (%.1f MB), %zu texture copies; %lld command buffers' segments "
+                    "(%.1f MB)", (unsigned long long)recording, live_copies, __atomic_load_n(&copy_bytes, __ATOMIC_RELAXED) / 1048576.0,
+                    __atomic_load_n(&npins, __ATOMIC_RELAXED), (long long)__atomic_load_n(&seg_count, __ATOMIC_RELAXED),
+                    __atomic_load_n(&seg_bytes, __ATOMIC_RELAXED) / 1048576.0);
+        if (away) hos_vcore_back();
+    }
     if (watch_draw_cmd && watch_draw_cmd == (void *)o && nwatch_handles < 16) {
         watch_handles[nwatch_handles++] = (uint64_t)(uintptr_t)copy;
         watch_draw_cmd = NULL;
@@ -2191,8 +2279,7 @@ static int pin_same(const nvn_tex *a, const nvn_tex *b) {
 }
 static void pins_grow(void) {
     const size_t n = pin_slots ? pin_slots * 2 : (1u << 16);
-    nvn_tex **t = (nvn_tex **)calloc(n, sizeof *t);
-    if (!t) die("texture copies table (%zu slots)", n);
+    nvn_tex **t = (nvn_tex **)hos_xcalloc(n, sizeof *t, "native NVN: texture copies table");
     for (size_t i = 0; i < pin_slots; i++)
         if (pins[i]) {
             size_t s = (size_t)(pin_hash(pins[i]) >> 20) & (n - 1);
@@ -2208,13 +2295,13 @@ static void tex_copy(const nvn_tex **dst, uint64_t t) {
     if (!o->serial) die("recording refers to an uninitialized texture object %#llx", (unsigned long long)t);
     const uint64_t h = pin_hash(o);
     AcquireSRWLockExclusive(&pin_lock);
-    if (npins * 2 >= pin_slots) pins_grow();
+    if (__atomic_load_n(&npins, __ATOMIC_RELAXED) * 2 >= pin_slots) pins_grow();
     size_t s = (size_t)(h >> 20) & (pin_slots - 1);
     while (pins[s] && !pin_same(pins[s], o)) s = (s + 1) & (pin_slots - 1);
     if (!pins[s]) {
         pins[s] = (nvn_tex *)malloc(sizeof(nvn_tex));
         *pins[s] = *o;
-        npins++;
+        __atomic_fetch_add(&npins, 1, __ATOMIC_RELAXED);
     }
     *dst = pins[s];
     ReleaseSRWLockExclusive(&pin_lock);
@@ -2427,6 +2514,10 @@ NV(nvnQueueSubmitCommands) {
     { void hos_renderer_wait(void); static volatile LONG up; if (!up) { hos_renderer_wait(); up = 1; } }   /* (display.c) */
     nvn_queue *q = (nvn_queue *)P(0);
     const int n = I(1);
+#ifdef TRACY_ENABLE
+    HT_ZONE(tz, "nvnQueueSubmitCommands");
+    HT_ZONE_TEXTF(tz, "queue %p, %d handles, lr %#llx", (void *)q, n, (unsigned long long)c->x[30]);
+#endif
     uint64_t h[64];
     if (n < 0 || n > 64) die("submit of %d handles", n);
     memcpy(h, PN(2, 8 * (size_t)n), 8 * (size_t)n);
@@ -2493,6 +2584,7 @@ NV(nvnWindowBuilderSetNumActiveTextures) { if (I(1) < 2 || I(1) > 4) die("%d act
 NV(nvnWindowBuilderSetPresentInterval) { WB(P(0))->interval = I(1); }
 NV(nvnWindowBuilderGetNativeWindow) { RET(WB(P(0))->native); }
 NV(nvnWindowBuilderGetPresentInterval) { RET((uint32_t)WB(P(0))->interval); }
+static void detached_probe_capture(Ctx *c, const nvn_win *win);
 NV(nvnWindowInitialize) {
     const nvn_win_builder *b = WB(P(1));
     nvn_win *o = (nvn_win *)P(0);
@@ -2506,6 +2598,7 @@ NV(nvnWindowInitialize) {
     const nvn_tex *t0 = win_tex(o, 0);
     hos_log("nvn: window of %d textures (%d active), %dx%d format %#x", o->ntex, o->active, (int)t0->d.width,
             (int)t0->d.height, t0->d.format);
+    detached_probe_capture(c, o);
     RET(1);
 }
 NV(nvnWindowFinalize) {}
@@ -2548,6 +2641,9 @@ NV(nvnWindowAcquireTexture) {
     nvn_sync *s = (nvn_sync *)P(1);
     *(int *)P(2) = o->active ? o->next++ % o->active : 0;
     {
+#ifdef TRACY_ENABLE
+        HT_WAIT(tz, "nvnWindowAcquireTexture");   /* (the frame's pacing: host/nn_vi.c) */
+#endif
         const int away = hos_vcore_away();
         hos_vi_native_acquire(o->active ? o->active : o->ntex);
         if (away) hos_vcore_back();
@@ -2556,11 +2652,396 @@ NV(nvnWindowAcquireTexture) {
     if (s) s->fenced = 3, s->fence = 0;
     RET(NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS);
 }
+/* An alternate native window and three output textures in the host-reserved guest range. */
+typedef struct {
+    nvn_pool pool;
+    nvn_win window;
+    nvn_tex textures[3];
+    nvn_pool_builder pool_builder;
+    nvn_tex_builder tex_builder;
+    nvn_win_builder win_builder;
+} detached_window;
+
+_Static_assert(sizeof(detached_window) <= 4096, "NVN objects precede the page-aligned pool storage");
+
+extern int hos_mem_mapped(uint64_t, uint64_t);
+static uint64_t detached_owner, detached_original;
+static DWORD detached_boot_thread;
+static uint64_t detached_boot_addr, detached_boot_bytes;
+extern uint64_t hos_output_boot_reserve(int force_refusal, uint64_t *bytes);
+extern int rx_output_preview_stage(const nvn_tex *textures);
+extern int rx_output_preview_retired(uint64_t last_serial);
+extern int rx_output_trial_phase(uint64_t serial, int cancel);
+extern int rx_output_trial_publish(uint64_t serial, void (*apply)(void *, uint64_t), void *state);
+extern void rx_nvn_present_trial(const nvn_tex *t, const int crop[4], uint64_t generation);
+static uint64_t detached_published_generation;
+enum { OUTPUT_UNAVAILABLE, OUTPUT_IDLE, OUTPUT_REQUESTED };
+static int detached_ui_state;
+static int detached_rebuild_pending;
+static detached_window *detached_candidate, *detached_retired;
+static uint64_t detached_retired_serial;
+static uint64_t detached_old_window, detached_graphics;
+static uint64_t detached_old_textures[3];
+static int detached_published;
+static int64_t detached_activate_until;
+static int64_t detached_rollback_since;   /* (when a published preview first needed its way back; 0: none pending) */
+static volatile LONG detached_capture_claim;
+
+/* The presentation queue owns its length. The marker exists only until its receiver wakes and may dequeue. */
+static SRWLOCK detached_idle_lock = SRWLOCK_INIT;
+static const int *detached_idle_queue_length;
+static SRWLOCK *detached_idle_queue_lock;
+static const unsigned *detached_idle_queue_life;
+static unsigned detached_idle_queue_instance;
+static uint64_t detached_idle_window, detached_idle_generation;
+static SRWLOCK *detached_trial_queue_lock;
+static unsigned detached_trial_queue_instance;
+static _Thread_local SRWLOCK *detached_received_queue, *detached_last_present_queue;
+static _Thread_local unsigned detached_received_instance, detached_last_present_instance;
+static _Thread_local uint64_t detached_last_present_window, detached_last_present_generation;
+static int detached_idle_enabled;
+
+int nvn_detached_observe_present_wait(Ctx *c) {
+    if (!__atomic_load_n(&detached_idle_enabled, __ATOMIC_ACQUIRE) || c->x[30] != 0x834a3084) return 0;
+    HosThread *thread = hos_self();
+    return thread && !strcmp(hos_thread_name(thread), "Presentation Thread");
+}
+
+void nvn_detached_present_received(SRWLOCK *queue_lock, unsigned instance) {
+    detached_received_queue = queue_lock;
+    detached_received_instance = instance;
+}
+
+void nvn_detached_present_wait(const int *length, SRWLOCK *queue_lock, const unsigned *life) {
+    AcquireSRWLockExclusive(&detached_idle_lock);
+    detached_idle_queue_length = length;
+    detached_idle_queue_lock = queue_lock;
+    detached_idle_queue_life = life;
+    detached_idle_queue_instance = life ? __atomic_load_n(life, __ATOMIC_RELAXED) : 0;
+    const int same_source_queue = queue_lock && queue_lock == detached_last_present_queue &&
+                                  detached_idle_queue_instance == detached_last_present_instance;
+    detached_idle_window = same_source_queue ? detached_last_present_window : 0;
+    detached_idle_generation = same_source_queue ? detached_last_present_generation : 0;
+    ReleaseSRWLockExclusive(&detached_idle_lock);
+}
+
+/* Called while the native presentation thread is still inside its empty-queue wait. Both sets of
+   descriptors remain allocated so already captured work can finish through the normal replay timeline. */
+typedef struct {
+    Ctx *context;
+    const nvn_win *original;
+    uint64_t graphics;
+} DetachedPublication;
+
+static void detached_publish(void *state, uint64_t generation) {
+    const DetachedPublication *publication = state;
+    Ctx *c = publication->context;
+    const nvn_win *original = publication->original;
+    detached_candidate->window.interval = original->interval;
+    detached_candidate->window.next = original->next;
+    recomp_store64(c, detached_owner + 0x70, h2g(&detached_candidate->window));
+    for (int i = 0; i < 3; ++i) recomp_store64(c, detached_owner + 0x88 + i * 8, detached_candidate->window.tex[i]);
+    recomp_store8(c, publication->graphics + 0x549, 1);
+    detached_graphics = publication->graphics;
+    detached_trial_queue_lock = detached_idle_queue_lock;
+    detached_trial_queue_instance = detached_idle_queue_instance;
+    detached_published = 1;
+    detached_rollback_since = 0;
+    __atomic_store_n(&detached_published_generation, generation, __ATOMIC_RELEASE);
+}
+
+int hos_defer_native_output_rebuild(Ctx *c) {
+    if (!__atomic_load_n(&detached_published_generation, __ATOMIC_ACQUIRE) ||
+        c->x[0] != detached_owner || !hos_mem_mapped(detached_owner, 0xc9) ||
+        !recomp_load8(c, detached_owner + 0xc8)) return 0;
+    __atomic_store_n(&detached_rebuild_pending, 1, __ATOMIC_RELEASE);
+    return 1;
+}
+
+static void detached_publish_at_acquire(Ctx *c, int may_restore) {
+    const uint64_t candidate_window = h2g(&detached_candidate->window);
+    const uint64_t serial = detached_candidate->textures[0].serial;
+    const uint64_t current = recomp_load64(c, detached_owner + 0x70);
+    const int native_rebuild = __atomic_load_n(&detached_rebuild_pending, __ATOMIC_ACQUIRE) ||
+                               recomp_load8(c, detached_owner + 0xc8) || current != candidate_window;
+    const int phase = rx_output_trial_phase(serial, detached_published && native_rebuild);
+    if (detached_published) {
+        if (phase != OUTPUT_TRIAL_EXPIRED) return;
+        const int owns_window = current == candidate_window || current == detached_old_window;
+        if (owns_window && !may_restore) return;
+        for (int i = 0; i < 3; ++i) {
+            const uint64_t alias = recomp_load64(c, detached_owner + 0x88 + i * 8);
+            if (owns_window) {
+                if (alias != detached_candidate->window.tex[i] && alias != detached_old_textures[i]) return;
+            } else {
+                for (int j = 0; j < 3; ++j)
+                    if (alias == detached_candidate->window.tex[j]) return;
+            }
+        }
+        if (owns_window) {
+            recomp_store64(c, detached_owner + 0x70, detached_old_window);
+            for (int i = 0; i < 3; ++i) recomp_store64(c, detached_owner + 0x88 + i * 8, detached_old_textures[i]);
+            const uint64_t framework = recomp_load64(c, 0x84ea2de0);
+            if (hos_mem_mapped(framework, 0xe0) && recomp_load64(c, framework + 0xd8) == detached_graphics &&
+                hos_mem_mapped(detached_graphics, 0x54a) && recomp_load8(c, detached_graphics + 0x549) == 1)
+                recomp_store8(c, detached_graphics + 0x549, 0);
+        }
+        __atomic_store_n(&detached_published_generation, 0, __ATOMIC_RELEASE);
+        detached_published = 0;
+        __atomic_store_n(&detached_rebuild_pending, 0, __ATOMIC_RELEASE);
+        detached_retired = detached_candidate;
+        detached_candidate = NULL;
+        hos_log(owns_window ? "detached activation: restored 1280x720 at native acquisition" :
+                              "detached activation: retired after the stock window was replaced");
+        return;
+    }
+    if (phase == OUTPUT_TRIAL_EXPIRED || hos_now_ns() >= detached_activate_until) {
+        detached_retired = detached_candidate;
+        detached_candidate = NULL;
+        hos_log("detached activation: refused before publication");
+        return;
+    }
+    if (phase != OUTPUT_TRIAL_READY || current != detached_old_window ||
+        recomp_load8(c, detached_owner + 0xc8) || recomp_load8(c, detached_owner + 0xaa) != 3) return;
+    const nvn_win *original = hos_guest_range(current, sizeof *original);
+    if (!original || !hos_mem_mapped(current, sizeof *original) || original->ntex != 3 || original->active != 3) return;
+    for (int i = 0; i < 3; ++i) {
+        detached_old_textures[i] = recomp_load64(c, detached_owner + 0x88 + i * 8);
+        if (!detached_old_textures[i] || detached_old_textures[i] != original->tex[i]) return;
+    }
+    const uint64_t framework = recomp_load64(c, 0x84ea2de0);
+    if (!framework || !hos_mem_mapped(framework, 0xe0)) return;
+    const uint64_t graphics = recomp_load64(c, framework + 0xd8);
+    if (!graphics || !hos_mem_mapped(graphics, 0x54a) || recomp_load8(c, graphics + 0x549) != 0) return;
+    DetachedPublication publication = {c, original, graphics};
+    if (rx_output_trial_publish(serial, detached_publish, &publication))
+        hos_log("detached activation: published 1024x576 at native acquisition");
+}
+
+/* A way back the native swap could not make within a second still ends the trial: its presents stop carrying the
+   generation (the renderer drops a tagged present once its trial is gone) and the game's own rebuild is no longer held.
+   The candidate stays allocated, and the rollback above keeps being tried without waiting, until the owner names none
+   of its textures. */
+static void detached_rollback_overdue(void) {
+    if (!detached_published) {
+        detached_rollback_since = 0;
+        return;
+    }
+    const int64_t now = hos_now_ns();
+    if (!detached_rollback_since) detached_rollback_since = now;
+    if (now - detached_rollback_since < 1000000000LL || !__atomic_load_n(&detached_published_generation, __ATOMIC_ACQUIRE))
+        return;
+    rx_output_trial_phase(detached_candidate->textures[0].serial, 1);
+    __atomic_store_n(&detached_published_generation, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&detached_rebuild_pending, 0, __ATOMIC_RELEASE);
+    hos_log("detached activation: native rollback did not land; presenting the preview window untagged");
+}
+
+void nvn_detached_pre_acquire(Ctx *c) {
+    if (!__atomic_load_n(&detached_idle_enabled, __ATOMIC_ACQUIRE) || GetCurrentThreadId() != detached_boot_thread ||
+        !detached_candidate || c->x[30] != 0x81207a6c) return;
+    const uint64_t receiver = c->x[19];
+    const int same_owner = receiver && hos_mem_mapped(receiver, 0x188) &&
+                           recomp_load64(c, receiver + 0x180) == detached_owner;
+    if (!same_owner && !detached_published) return;
+    const int rollback = detached_published &&
+        (__atomic_load_n(&detached_rebuild_pending, __ATOMIC_ACQUIRE) ||
+         (hos_mem_mapped(detached_owner, 0xc9) &&
+          recomp_load64(c, detached_owner + 0x70) != h2g(&detached_candidate->window)) ||
+         rx_output_trial_phase(detached_candidate->textures[0].serial, 0) == OUTPUT_TRIAL_EXPIRED);
+    if (detached_published && !rollback) return;
+    const int64_t wait_until =
+        rollback && __atomic_load_n(&detached_published_generation, __ATOMIC_ACQUIRE) ? hos_now_ns() + 50000000 : 0;
+    for (;;) {
+        AcquireSRWLockExclusive(&detached_idle_lock);
+        if (detached_idle_queue_lock && TryAcquireSRWLockExclusive(detached_idle_queue_lock)) {
+            const int same_life = __atomic_load_n(detached_idle_queue_life, __ATOMIC_ACQUIRE) == detached_idle_queue_instance;
+            if (same_life && !*detached_idle_queue_length && hos_mem_mapped(detached_owner, 0xc9)) {
+                const int same_queue = detached_idle_queue_lock == detached_trial_queue_lock &&
+                                       detached_idle_queue_instance == detached_trial_queue_instance;
+                const uint64_t generation = __atomic_load_n(&detached_published_generation, __ATOMIC_RELAXED);
+                const int saw_candidate = generation && detached_idle_generation == generation &&
+                                          detached_idle_window == h2g(&detached_candidate->window);
+                if (detached_published) {
+                    // The original queue incarnation can retire an already replaced window. A different
+                    // receiver can restore the old owner only when this parked presenter just used its candidate.
+                    if (same_queue || saw_candidate) detached_publish_at_acquire(c, same_owner || saw_candidate);
+                } else if (same_owner && detached_idle_window == detached_original && !detached_idle_generation) {
+                    detached_publish_at_acquire(c, 1);
+                }
+            }
+            ReleaseSRWLockExclusive(detached_idle_queue_lock);
+        }
+        ReleaseSRWLockExclusive(&detached_idle_lock);
+        if (!rollback || !detached_published || hos_now_ns() >= wait_until) break;
+        // The main thread stops producing new work while the previous presentation finishes.
+        const int away = hos_vcore_away();
+        hos_sleep_ns(1000000);
+        if (away) hos_vcore_back();
+    }
+    if (rollback) detached_rollback_overdue();
+}
+
+static void detached_probe_capture(Ctx *c, const nvn_win *win) {
+    if (c->x[30] != 0x8114e974 ||
+        strcmp(hos_main_build_id, "e0f3ccfaf50065ae4ea01eb5aeb13b1a45da3348") || win->ntex != 3) return;
+    const uint64_t owner = c->x[19];
+    const nvn_tex *t = win_tex(win, 0);
+    if (!owner || !hos_mem_mapped(owner, 0xc9) || !t->pool || t->d.width != 1280 || t->d.height != 720 ||
+        recomp_load64(c, owner + 0x70) != h2g(win) || recomp_load64(c, owner + 0xc0) != h2g(t->pool)) return;
+    if (InterlockedCompareExchange(&detached_capture_claim, 1, 0)) return;
+    detached_owner = owner;
+    const char *test = getenv("RX_VK_OUTPUT_PREVIEW_TEST");
+    detached_boot_addr = hos_output_boot_reserve(test && !strcmp(test, "reservation"), &detached_boot_bytes);
+    if (!detached_boot_addr) {
+        hos_log("detached window: boot reservation unavailable, continuing with stock output");
+        return;
+    }
+    hos_log("detached window: boot reserved %llu guest bytes", (unsigned long long)detached_boot_bytes);
+    detached_boot_thread = GetCurrentThreadId();
+    detached_original = h2g(win);
+    __atomic_store_n(&detached_idle_enabled, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&detached_ui_state, OUTPUT_IDLE, __ATOMIC_RELEASE);
+}
+
+static int detached_probe_stage(Ctx *c, const nvn_win *source) {
+    if (source->ntex != 3 || source->active != 3) return 0;
+    const nvn_pool *old_pool = win_tex(source, 0)->pool;
+    if (!old_pool || old_pool->magic != NVN_MAGIC('P', 'O', 'O', 'L') || old_pool->mem != old_pool->gpu ||
+        old_pool->flags != 0x21 || old_pool->size != 11796480) return 0;
+    nvn_texdesc desc[3];
+    uint64_t offsets[3], bytes = 0;
+    for (int i = 0; i < 3; ++i) {
+        const nvn_tex *t = win_tex(source, i);
+        if (t->pool != old_pool || t->d.width != 1280 || t->d.height != 720 || t->d.format != NVN_FORMAT_RGBA8 ||
+            t->d.target != NVN_TEXTURE_TARGET_2D || t->d.depth != 1 || t->d.levels != 1 || t->d.flags != 1 ||
+            t->d.samples > 1 || t->d.pkg_block_h || !t->serial) return 0;
+        desc[i] = t->d;
+        desc[i].width = 1024;
+        desc[i].height = 576;
+        nvn_texlayout layout;
+        nvn_tex_layout(&desc[i], &layout);
+        bytes = (bytes + layout.align - 1) & ~((uint64_t)layout.align - 1);
+        offsets[i] = bytes;
+        bytes += layout.size;
+    }
+    bytes = (bytes + 4095) & ~4095ULL;
+    const uint64_t addr = detached_boot_addr, total = bytes + 4096;
+    if (total > detached_boot_bytes || !hos_mem_mapped(addr, total) ||
+        (addr < old_pool->mem + old_pool->size && old_pool->mem < addr + total)) return 0;
+    detached_window *trial = hos_guest_range(addr, total);
+    if (!trial) return 0;
+
+    const Ctx saved = *c;
+    hos_guest_fill(addr, 0, sizeof *trial);
+    trial->pool_builder.mem = addr + 4096;
+    trial->pool_builder.size = bytes;
+    trial->pool_builder.flags = old_pool->flags;
+    c->x[0] = h2g(&trial->pool);
+    c->x[1] = h2g(&trial->pool_builder);
+    n_nvnMemoryPoolInitialize(c, &detached_descriptor_only);
+    if (!c->x[0]) goto refused;
+    for (int i = 0; i < 3; ++i) {
+        trial->tex_builder.d = desc[i];
+        trial->tex_builder.pool = &trial->pool;
+        trial->tex_builder.off = offsets[i];
+        trial->win_builder.tex[i] = h2g(&trial->textures[i]);
+        c->x[0] = trial->win_builder.tex[i];
+        c->x[1] = h2g(&trial->tex_builder);
+        n_nvnTextureInitialize(c, &detached_descriptor_only);
+        if (!c->x[0]) goto refused;
+        trial->textures[i].output_preview = (uint8_t)(i + 1);
+    }
+    trial->win_builder.ntex = 3;
+    trial->win_builder.interval = source->interval;
+    c->x[0] = h2g(&trial->window);
+    c->x[1] = h2g(&trial->win_builder);
+    n_nvnWindowInitialize(c, NULL);
+    if (!c->x[0]) goto refused;
+    c->x[0] = h2g(&trial->window);
+    c->x[1] = c->x[2] = 0;
+    c->x[3] = 1024;
+    c->x[4] = 576;
+    n_nvnWindowSetCrop(c, NULL);
+    if (!rx_output_preview_stage(trial->textures)) goto refused;
+
+    hos_gpu_track(trial->pool.gpu, trial->pool.size, 1);
+    for (int i = 0; i < 3; ++i) {
+        live_put(&trial->textures[i]);
+        rx_nvn_texture_created(&trial->textures[i]);
+    }
+    detached_old_window = h2g(source);
+    detached_candidate = trial;
+    detached_activate_until = hos_now_ns() + 2000000000LL;
+    *c = saved;
+    hos_log("detached activation: queued serial %llu", (unsigned long long)trial->textures[0].serial);
+    return 1;
+
+refused:
+    *c = saved;
+    return 0;  /* The reserved descriptors were never registered. */
+}
+
+int nvn_output_preview_request(uint32_t width, uint32_t height) {
+    if (width != 1024 || height != 576) return 0;
+    int idle = OUTPUT_IDLE;
+    return __atomic_compare_exchange_n(&detached_ui_state, &idle, OUTPUT_REQUESTED, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+}
+
+/* The guest's applet poll runs on the allocating thread even with a separate Presentation Thread. */
+void nvn_output_preview_poll(Ctx *c) {
+    if (!__atomic_load_n(&detached_idle_enabled, __ATOMIC_ACQUIRE) || GetCurrentThreadId() != detached_boot_thread) return;
+    if (detached_candidate && !detached_published &&
+        (hos_now_ns() >= detached_activate_until ||
+         rx_output_trial_phase(detached_candidate->textures[0].serial, 0) == OUTPUT_TRIAL_EXPIRED)) {
+        detached_retired = detached_candidate;
+        detached_candidate = NULL;
+        hos_log("detached activation: refused before publication");
+    }
+    if (detached_retired) {
+        const Ctx saved = *c;
+        if (!detached_retired_serial) {
+            detached_retired_serial = detached_retired->textures[2].serial;
+            for (int i = 0; i < 3; ++i) {
+                c->x[0] = h2g(&detached_retired->textures[i]);
+                n_nvnTextureFinalize(c, NULL);
+            }
+            *c = saved;
+            return;
+        }
+        if (!rx_output_preview_retired(detached_retired_serial)) return;
+        c->x[0] = h2g(&detached_retired->pool);
+        n_nvnMemoryPoolFinalize(c, NULL);
+        *c = saved;
+        detached_retired = NULL;
+        detached_retired_serial = 0;
+        if (hos_mem_mapped(detached_owner, 0xc9) && recomp_load64(c, detached_owner + 0x70) == detached_original &&
+            !recomp_load8(c, detached_owner + 0xc8))
+            __atomic_store_n(&detached_ui_state, OUTPUT_IDLE, __ATOMIC_RELEASE);
+        hos_log("detached activation: released trial storage");
+    }
+    int requested = OUTPUT_REQUESTED;
+    if (!__atomic_compare_exchange_n(&detached_ui_state, &requested, OUTPUT_UNAVAILABLE, 0,
+                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+    const nvn_win *win = hos_guest_range(detached_original, sizeof *win);
+    if (!win || !hos_mem_mapped(detached_original, sizeof *win) || win->magic != NVN_MAGIC('W', 'I', 'N', 'D') ||
+        !hos_mem_mapped(detached_owner, 0xc9) || recomp_load64(c, detached_owner + 0x70) != detached_original ||
+        recomp_load8(c, detached_owner + 0xc8)) return;  /* The stock window was rebuilt. */
+    if (!detached_probe_stage(c, win)) {
+        __atomic_store_n(&detached_ui_state, OUTPUT_IDLE, __ATOMIC_RELEASE);
+        hos_log("detached window: requested stage did not qualify");
+    }
+}
+
 NV(nvnQueuePresentTexture) {
     nvn_win *o = (nvn_win *)P(1);
     const int i = I(2);
     if (i < 0 || i >= o->ntex) die("present of window texture %d", i);
     HOS_CHAIN(HOS_CHAIN_PRESENT, (uint64_t)i);
+#ifdef TRACY_ENABLE
+    HT_FRAME();   /* (LONGSHOT_TRACY: a frame ends where the game presents) */
+    HT_ZONE(tz, "nvnQueuePresentTexture");
+#endif
     const int trace = hos_vi_present_trace_enabled();
     int64_t phases[4] = {0};
     if (trace) phases[0] = hos_now_ns();
@@ -2568,7 +3049,19 @@ NV(nvnQueuePresentTexture) {
     {
         const int away = hos_vcore_away();
         if (trace) phases[1] = hos_now_ns();
-        rx_nvn_present(win_tex(o, i), o->crop);
+        uint64_t preview = 0;
+        if (__atomic_load_n(&detached_idle_enabled, __ATOMIC_ACQUIRE)) {
+            preview = __atomic_load_n(&detached_published_generation, __ATOMIC_ACQUIRE);
+            if (o != &((const detached_window *)GP(detached_boot_addr))->window) preview = 0;
+            detached_last_present_window = h2g(o);
+            detached_last_present_generation = preview;
+            detached_last_present_queue = detached_received_queue;
+            detached_last_present_instance = detached_received_instance;
+        }
+        if (preview)
+            rx_nvn_present_trial(win_tex(o, i), o->crop, preview);
+        else
+            rx_nvn_present(win_tex(o, i), o->crop);
         if (trace) phases[2] = hos_now_ns();
         if (away) hos_vcore_back();
         if (trace) phases[3] = hos_now_ns();
@@ -2784,6 +3277,8 @@ static const nvn_impl impls[] = {
     {"nvnDeviceInstallDebugCallback", n_nvnDeviceInstallDebugCallback},
     {"nvnDeviceSetWindowOriginMode", n_nvnDeviceSetWindowOriginMode},
     {"nvnDeviceSetDepthMode", n_nvnDeviceSetDepthMode},
+    {"nvnDeviceGetWindowOriginMode", n_nvnDeviceGetWindowOriginMode},
+    {"nvnDeviceGetDepthMode", n_nvnDeviceGetDepthMode},
     {"nvnDeviceFinalizeCommandHandle", n_nvnDeviceFinalizeCommandHandle},
     {"nvnDeviceGetCurrentTimestampInNanoseconds", n_nvnDeviceGetCurrentTimestampInNanoseconds},
     {"nvnDeviceGetTimestampInNanoseconds", n_nvnDeviceGetTimestampInNanoseconds},
@@ -3284,6 +3779,6 @@ void nvn2_dispatch(Ctx *c, const char *name, void **cache) {
 
 /* nvnBootstrapLoader(char const* name) -> the proc */
 HLE(nvnBootstrapLoader) {
-    const char *name = ARG(0) ? (const char *)GP(ARG(0)) : "";
-    RET(nvn_native_proc(name));
+    char name[256];
+    RET(nvn_native_proc(guest_name(ARG(0), name, sizeof name)));
 }

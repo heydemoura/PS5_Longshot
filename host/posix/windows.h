@@ -172,8 +172,8 @@ void hos_srw_release(SRWLOCK *l);   /* (either kind: SleepConditionVariableSRW's
 typedef pthread_rwlock_t SRWLOCK, *PSRWLOCK;
 #define SRWLOCK_INIT PTHREAD_RWLOCK_INITIALIZER
 #endif
-typedef struct { volatile uint32_t seq; } CONDITION_VARIABLE, *PCONDITION_VARIABLE;
-#define CONDITION_VARIABLE_INIT {0}
+typedef struct { volatile uint32_t seq, waiters; } CONDITION_VARIABLE, *PCONDITION_VARIABLE;
+#define CONDITION_VARIABLE_INIT {0, 0}
 #define CONDITION_VARIABLE_LOCKMODE_SHARED 0x1
 typedef pthread_mutex_t CRITICAL_SECTION, *LPCRITICAL_SECTION;
 #ifdef __PROSPERO__
@@ -199,7 +199,10 @@ static inline void EnterCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_lo
 static inline void LeaveCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_unlock(cs); }
 static inline BOOL TryEnterCriticalSection(CRITICAL_SECTION *cs) { return pthread_mutex_trylock(cs) == 0; }
 static inline void DeleteCriticalSection(CRITICAL_SECTION *cs) { pthread_mutex_destroy(cs); }
-static inline void InitializeConditionVariable(CONDITION_VARIABLE *cv) { cv->seq = 0; }
+static inline void InitializeConditionVariable(CONDITION_VARIABLE *cv) {
+    cv->waiters = 0;
+    cv->seq = 0;
+}
 void WakeConditionVariable(CONDITION_VARIABLE *cv);
 void WakeAllConditionVariable(CONDITION_VARIABLE *cv);
 BOOL SleepConditionVariableSRW(CONDITION_VARIABLE *cv, SRWLOCK *l, DWORD ms, ULONG flags);

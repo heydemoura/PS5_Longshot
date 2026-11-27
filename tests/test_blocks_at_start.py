@@ -43,7 +43,7 @@ def check_source(source):
                          "made in the images' pool, they stay empty while the textures are compacted in a pool of their own)")
     need("vk_vma.cpp: blocks_at_start()", block(vma, "static size_t blocks_at_start(bool holds_textures)"),
          ["if (!holds_textures) return 0;", 'getenv("RX_VK_IMAGE_PREALLOC")',
-          "vram_compact::blocks_at_start(heap, kImageBlock, holds_textures,\n"
+          "vram_compact::blocks_at_start(device_local_heap_bytes(), kImageBlock, holds_textures,\n"
           "                                                 dev.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU)"])
     # (the images' pool only when the textures are made there, RX_VK_COMPACT=0; else the textures' own)
     need("vk_vma.cpp: images_pool()", block(vma, "VmaPool images_pool() {"),
@@ -63,7 +63,7 @@ def check_source(source):
     need("vk_texture.cpp: texture_frame()", block(tex, "void texture_frame(uint64_t completed)"),
          ["if (textures_pool_usage(&pool_blocks, &pool_free, &pool_kept)) reclaim = vram_compact::reclaimable(block_free, pool_free);",
           "kept_only = vram_compact::kept_only(pool_blocks, pool_kept);",
-          "!(kept_only && !squeeze_always) && used > count_line && !room_in_blocks)"])
+          "if (known && !kept_only && used > count_line && !room_in_blocks)"])
 
 
 # Compile the real pool constructors, not a second implementation of their policy.
@@ -75,6 +75,7 @@ POOL_FIXTURE = r'''
 #include <cstdlib>
 #include <cstring>
 #include "vram_compact.h"
+#include "memory_priority.h"
 constexpr int VK_SUCCESS = 0, VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO = 1;
 constexpr int VK_IMAGE_TYPE_2D = 1, VK_FORMAT_R8G8B8A8_UNORM = 1, VK_SAMPLE_COUNT_1_BIT = 1;
 constexpr int VK_IMAGE_USAGE_SAMPLED_BIT = 1, VK_IMAGE_USAGE_TRANSFER_DST_BIT = 2, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT = 4;
@@ -88,7 +89,7 @@ struct VkImageCreateInfo {
     uint32_t mipLevels{}, arrayLayers{}, samples{}, usage{};
 };
 struct VmaAllocationCreateInfo { int usage{}, requiredFlags{}; };
-struct VmaPoolCreateInfo { uint32_t memoryTypeIndex{}; uint64_t blockSize{}; size_t minBlockCount{}; };
+struct VmaPoolCreateInfo { uint32_t memoryTypeIndex{}; uint64_t blockSize{}; size_t minBlockCount{}; float priority{}; };
 struct Pool { VmaPoolCreateInfo info; };
 using VmaPool = Pool*;
 struct { struct {
@@ -105,13 +106,16 @@ uint64_t texture_pool_kept{};
 const uint64_t kImageBlock = 128ull << 20;
 const char* compact_env;
 const char* prealloc_env;
+const char* priority_env;
 const char* test_getenv(const char* name) {
     if (!std::strcmp(name, "RX_VK_COMPACT")) return compact_env;
     if (!std::strcmp(name, "RX_VK_IMAGE_PREALLOC")) return prealloc_env;
+    if (!std::strcmp(name, "RX_VK_MEMORY_PRIORITY")) return priority_env;
     return nullptr;
 }
 #define getenv test_getenv
 void logf(const char*, ...) {}
+uint64_t test_vram_bytes(uint64_t heap) { return heap; }   // (RX_VK_TEST_VRAM_MB unset)
 int vmaFindMemoryTypeIndexForImageInfo(int, const VkImageCreateInfo*, const VmaAllocationCreateInfo*, uint32_t* type) {
     *type = 7; return VK_SUCCESS;
 }
@@ -126,8 +130,10 @@ int vmaCreatePool(int, const VmaPoolCreateInfo* info, VmaPool* pool) {
 #define CHECK(x) do { if (!(x)) { std::printf("FAIL %s: %s\n", argv[1], #x); return 1; } } while (0)
 int main(int argc, char** argv) {
     if (argc != 2) return 2;
-    const bool compact = std::strcmp(argv[1], "compaction-off") != 0;
+    const bool compact = std::strcmp(argv[1], "compaction-off") != 0 && std::strcmp(argv[1], "priority-compaction-off") != 0;
+    const bool priority = !std::strncmp(argv[1], "priority", 8);
     compact_env = compact ? nullptr : "0";
+    if (priority) priority_env = "1";
     if (!std::strcmp(argv[1], "override")) prealloc_env = "3";
     if (!std::strcmp(argv[1], "prealloc-off")) prealloc_env = "0";
     const bool integrated = !std::strcmp(argv[1], "integrated");
@@ -145,6 +151,10 @@ int main(int argc, char** argv) {
         CHECK(utility->info.minBlockCount == (compact || fail_prealloc ? 0 : wanted));
         CHECK(sampled->info.minBlockCount == (fail_prealloc ? 0 : wanted));
         CHECK(sampled->info.memoryTypeIndex == 7 && sampled->info.blockSize == kImageBlock);
+        // (RX_VK_MEMORY_PRIORITY: no pool is left at VMA's zero, the lowest. The textures' own pool is under the rest with
+        // the switch on; the images' pool, the textures' too with RX_VK_COMPACT=0, stays where the driver puts memory)
+        CHECK(utility->info.priority == 0.5f);
+        CHECK(sampled->info.priority == (priority && compact ? 0.25f : 0.5f));
         if (compact) CHECK(texture_pool_kept == sampled->info.minBlockCount * kImageBlock);
         if (fail_prealloc) CHECK(calls == 3 && requested[1] == 9 && requested[2] == 0);
     }
@@ -160,8 +170,8 @@ int main(int argc, char** argv) {
 def compile_pools(source, cxx, tmp):
     vma = (source / "gpu/vk/vk_vma.cpp").read_text(encoding="utf-8")
     functions = []
-    for marker in ("static size_t blocks_at_start(", "static size_t make_pool(",
-                   "VmaPool images_pool() {", "VmaPool textures_pool() {"):
+    for marker in ("static uint64_t device_local_heap_bytes()", "static const memory_priority::Tiers& memory_tiers() {",
+                   "static size_t blocks_at_start(", "static size_t make_pool(", "VmaPool images_pool() {", "VmaPool textures_pool() {"):
         if marker in vma:
             functions.append(block(vma, marker))
     fixture = tmp / "pools.cpp"
@@ -183,7 +193,8 @@ def main():
         subprocess.run([args.cxx, "-std=c++20", "-Wall", "-Wextra", "-Werror", str(ROOT / "tests/test_blocks_at_start.cpp"), "-o",
                         str(exe)], check=True)
         failures = 0
-        for case in ("default", "compaction-off", "override", "prealloc-off", "fallback", "failed-pool", "integrated"):
+        for case in ("default", "compaction-off", "override", "prealloc-off", "fallback", "failed-pool", "integrated",
+                     "priority", "priority-compaction-off"):
             failures += subprocess.run([str(pools), case]).returncode != 0
         if failures:
             raise SystemExit(f"{failures} pool constructor cases failed")

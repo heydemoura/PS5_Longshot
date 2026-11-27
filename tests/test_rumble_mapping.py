@@ -1,9 +1,9 @@
-"""The game's HD rumble goes to a controller's heavy and light motors by frequency, scaled by the menu's Rumble strength.
+"""The game's HD rumble goes to a controller's heavy and light motors by frequency, scaled by the menu's Vibration strength.
 
 host/nn_hid.c rumble_map: each band's strength (rumble_motor) is split between the heavy and light motors by its
 frequency (rumble_heavy_share: all heavy up to 160 Hz, all light from 200 Hz, a constant-power crossfade between, on a
 log scale). At the Switch's default frequencies and the ones OoT sends, every band lands on the motor it did before, at
-the same strength. host/pad_sdl.c rumble_strength: the Insert menu's Rumble strength, in percent, on the motors'
+the same strength. host/pad_sdl.c rumble_strength: the Insert menu's Vibration strength, in percent, on the motors'
 0..65535; above 100% both motors are scaled by the same factor when the stronger would pass the top.
 
 Run with: python -I -B tests/test_rumble_mapping.py
@@ -183,7 +183,7 @@ class RumbleMappingTests(unittest.TestCase):
         self.assertIsNotNone(call, "the poll does not scale the rumble by the menu's strength")
         self.assertRegex(call.group(1), r"rumble_low\b.*rumble_high\b")   # (heavy first, light second)
         self.assertLess(call.start(), poll.index("rumble_due("))   # (Off is a change: a stop is sent)
-        self.assertRegex(re.sub(r"\s+", " ", function(HID, "static void vibration_send")), r"\brumble_map\( ?v ?, ?amp\[dev\] ?\)")
+        self.assertRegex(re.sub(r"\s+", " ", function(HID, "static void vibration_send")), r"\brumble_map\( ?v ?, ?vibration_amp\[dev\] ?\)")
 
     def test_mapping_and_strength(self):
         fixture = FIXTURE % {

@@ -1,8 +1,7 @@
 #!/bin/bash
 # Game-free: a player's build started from what the AppImage carries, not from the repository. CI's AppImage job packages
-# the builder but never builds a game with it, so a file the AppImage leaves out was found by every player instead: #1459
-# made nx2/build.py write the menu's fonts from third_party/fonts at every build start, the AppImage does not carry that
-# folder, and every Linux build stopped at LibertinusSans-Regular.ttf while CI stayed green (2026-11-10, #1567).
+# the builder but never builds a game with it, so a file the AppImage leaves out would be found by every player instead
+# (a build start that reads a folder the AppImage does not carry stops every Linux build while CI stays green).
 #
 #   scripts/linux/check_player_build.sh [<Longshot-...-x86_64.AppImage>]   (default: the newest in build-linux/)
 #
@@ -48,6 +47,10 @@ sleep 1   # (so a file written below is newer than the stamp)
 echo "== the pipeline state list (assets/pipeline_states/: nx2/make_game.py merges it beside the game)"
 (cd "$T" && in_image "$R/usr/python/bin/python3" -I -B nx2/pipeline_states.py check --dir assets/pipeline_states) ||
     { echo "the AppImage carries no readable assets/pipeline_states/: a new install's first field load would be drawn white"; exit 1; }
+
+echo "== the hot list (assets/profiles/hot_funcs.txt: the lifted functions every build compiles at -O2, nx2/make_game.py)"
+grep -qE '^f_[0-9a-f]{8}$' "$T/assets/profiles/hot_funcs.txt" 2>/dev/null && ! grep -qvE '^f_[0-9a-f]{8}$' "$T/assets/profiles/hot_funcs.txt" ||
+    { echo "the AppImage carries no hot list, or one with a line that is not f_<8 hex>: every lifted function would be built at -O1"; exit 1; }
 
 echo "== AppRun --cli --help"
 in_image "$R/AppRun" --cli --help > "$TMP/help.txt"

@@ -1,5 +1,6 @@
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
+/* DRAW_KEY */
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -21,6 +22,7 @@
 #include <vector>
 
 namespace fixture {
+using namespace mkwvk;   // (compare_op and the pushed words' functions: draw_key.h)
 enum Cache { None = -1, Owner, Seen, Mine, Failure, Alias, Retire };
 std::atomic<int> fail_cache{None};
 std::atomic<unsigned> allocation_faults{0};
@@ -45,7 +47,6 @@ struct {
     bool custom_border_color = false;
 } dev;
 std::mutex replay_mu;
-struct ParLock { std::lock_guard<std::mutex> lock; ParLock() : lock(replay_mu) {} };
 std::atomic<uint64_t> generation{1};   // (sampler_registrations_generation: a registration, the rows, or a retirement moved it)
 uint64_t frame_no = 1;
 unsigned creates = 0, destroyed = 0;
@@ -99,10 +100,8 @@ bool sampler_of(int id, nvn_samp_par* p) {
     return true;
 }
 const char* getenv(const char* name) {
-    if (!std::strcmp(name, "RX_VK_PUSH_STATE_OLD") && descriptor_policy == "descriptor-old") return "1";
     if (!std::strcmp(name, "RX_VK_PUSH_ALL") && descriptor_policy == "descriptor-whole") return "1";
     if (!std::strcmp(name, "RX_VK_SAMPLER_CACHE") && cache_off) return "0";
-    if (!std::strcmp(name, "RX_VK_SHADOW_PCF") && policy == "compare-pcf-off") return "0";
     if (!std::strcmp(name, "RX_VK_ANISO") && policy == "anisotropy") return "16";
     if (!std::strcmp(name, "RX_VK_ANISO") && policy == "anisotropy-env-off") return "0";
     if (!std::strcmp(name, "RX_VK_FORCE_LINEAR") && policy == "force-linear") return "1";
@@ -157,7 +156,11 @@ struct DescWriter { std::vector<VkWriteDescriptorSet> writes; } descriptor_write
 DescWriter& dw() { return descriptor_writes; }
 struct Pushed;
 std::array<Pushed, 2>& pushed();
-struct Recording { VkDescriptorPool pool{}; std::vector<VkDescriptorPool> extra; } recording;
+struct Recording {   // (vk_draw.cpp's RecordingRes: its pools, and what the recording took of them)
+    VkDescriptorPool pool{};
+    std::vector<VkDescriptorPool> extra;
+    uint32_t pool_sets = 0, pool_descs[6] = {};
+} recording;
 Recording* cur = &recording;
 std::atomic<uint64_t> pools_extra{0};
 bool g_fine = false;
@@ -186,12 +189,14 @@ void vkUpdateDescriptorSets(VkDevice, uint32_t n, const VkWriteDescriptorSet* wr
 void vkCmdBindDescriptorSets(VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout, uint32_t, uint32_t, const VkDescriptorSet*, uint32_t, const uint32_t*) {
     descriptor_binds++;
 }
+bool ub_snapshot_wanted() { return false; }   // (no uniform snapshot: bind_descriptors pushes only the writes that changed)
+int ub_snap_dedup_mode() { return 1; }
 /* DESCRIPTORS */
 std::array<Pushed, 2>& pushed() { static std::array<Pushed, 2> state; return state; }
 
 std::string route;
-VkSampler get(int id = 0, bool compare = false) {
-    return route == "make" ? sampler_make(id, compare) : sampler_for(id, compare);
+VkSampler get(int id = 0, bool compare = false, bool one_level = false) {
+    return route == "make" ? sampler_make(id, compare, one_level) : sampler_for(id, compare, one_level);
 }
 void valid(VkSampler sampler) { assert(sampler && live.count(sampler)); }
 void retry(const std::string& test) {
@@ -207,7 +212,7 @@ void retry(const std::string& test) {
     else next = get();
     valid(next); assert(creates == 2 && get() == next);
 }
-// (sampler reuse) A recording thread that lives through a whole case, as a parallel replay's segment workers do: its own tables
+// (sampler reuse) A recording thread that lives through a whole case, as the render thread does: its own tables
 // (sampler_for's by id, sampler_make's mine) stay from one recording to the next
 struct Worker {
     std::mutex m;
@@ -241,7 +246,8 @@ VkSampler use(int id) {
 // sampler goes before the GPU is past the last recording that took it
 bool limit_case(const std::string& test) {
     if (test == "limit") {   // (300 recordings on two threads, each drawing with 10 samplers every recording uses and 20 of a window
-        // that moves 5 a recording: 1525 in all. The GPU 2 recordings behind)
+        // that moves 5 a recording: 1525 in all. The GPU 2 recordings behind. The threads take turns, as one thread records at a
+        // time (the render thread, or the game's submitting thread with it off), each keeping its own tables)
         lod_per_id = true; dev.props.limits.maxSamplerAllocationCount = 80;
         Worker worker;
         for (uint64_t r = 0; r < 300; r++) {
@@ -250,7 +256,7 @@ bool limit_case(const std::string& test) {
                 for (int id = 0; id < 10; id++) use(id);
                 for (int id = 100 + 5 * (int)r; id < 120 + 5 * (int)r; id++) use(id);
             };
-            worker.start(draws); draws(); worker.join();
+            worker.start(draws); worker.join(); draws();
             frame_no++;   // (a present)
         }
         // (each made once: none retired while recordings still drew with it, the 10 of every recording kept throughout)
@@ -326,7 +332,7 @@ void run(const std::string& test) {
         assert(!bind_descriptors(cmd, bp, p));
         assert(descriptor_allocs == allocs && descriptor_updates == updates && descriptor_binds == binds && descriptor_pushes == pushes);
         const auto& after = pushed()[bp == VK_PIPELINE_BIND_POINT_COMPUTE];
-        assert(after.cmd == before.cmd && after.layout == before.layout && after.n == before.n && after.words == before.words && after.writes == before.writes && after.at == before.at);
+        assert(after.cmd == before.cmd && after.layout == before.layout && after.n == before.n && after.words == before.words && after.at == before.at);
         create_result = VK_SUCCESS; frame_no++; images[1].sampler = get(2); valid(images[1].sampler);
         assert(bind_descriptors(cmd, bp, p));
         assert(p.push ? descriptor_pushes == pushes + 1 : descriptor_updates == updates + 1 && descriptor_binds == binds + 1);
@@ -356,14 +362,14 @@ void run(const std::string& test) {
         // A distinct ID forces the parameter acceleration insertion.
         // Use sampler_make directly to test this cache even when the outer ID table is bypassed.
         if (!cache_off) {
-            fail_cache = Seen; auto next = sampler_make(1, false); valid(next); assert(allocation_faults == 1);
+            fail_cache = Seen; auto next = sampler_make(1, false, false); valid(next); assert(allocation_faults == 1);
             assert(live.at(next).ci.mipLodBias == 0.25f && live.at(next).ci.maxLod == 8);
         } else valid(get(1));
         assert(destroyed == 0); return;
     }
     if (test == "mine-commit") {
-        auto first = sampler_make(0, false); valid(first);
-        fail_cache = Mine; assert(sampler_make(0, false) == first);
+        auto first = sampler_make(0, false, false); valid(first);
+        fail_cache = Mine; assert(sampler_make(0, false, false) == first);
         assert(allocation_faults == 1 && creates == 1 && destroyed == 0 && live.size() == 1); return;
     }
     if (test == "valid-after-failure" || test == "failure-commit") {
@@ -381,6 +387,14 @@ void run(const std::string& test) {
         assert(second != first && creates == 2 && live.at(second).ci.anisotropyEnable && live.at(second).ci.maxAnisotropy == 4);
         assert(get() == second && creates == 2);
         row_times = 0; generation++; assert(get() == first && creates == 2); return;   // (the first kept: its key again)
+    }
+    if (test == "anisotropy-one-level") {   // (an image of one level: the game's own anisotropy, not the row's 16x)
+        row_times = 16;
+        auto one = get(0, false, true); valid(one);
+        assert(!live.at(one).ci.anisotropyEnable && live.at(one).ci.maxAnisotropy == 1);
+        auto mipped = get(0, false, false); valid(mipped);   // (the same id with a mipmapped image: the row's, a sampler of its own)
+        assert(mipped != one && live.at(mipped).ci.anisotropyEnable && live.at(mipped).ci.maxAnisotropy == 8);
+        assert(get(0, false, true) == one && get(0, false, false) == mipped && creates == 2); return;
     }
     if (test == "upscale-bias-change") {   // (another Render resolution: samplers_changed; the biased sampler made anew)
         policy = test;
@@ -415,7 +429,7 @@ void run(const std::string& test) {
     if (test == "upscale-bias-plain") assert(ci.mipLodBias == 0);   // (a sampler the game does not bias: as it asks)
     if (compare) {
         assert(ci.compareEnable && ci.compareOp == (test == "compare-explicit" ? VK_COMPARE_OP_NEVER : VK_COMPARE_OP_LESS_OR_EQUAL));
-        assert(ci.minFilter == (test == "compare-pcf-off" ? VK_FILTER_NEAREST : VK_FILTER_LINEAR));
+        assert(ci.minFilter == VK_FILTER_LINEAR);
     }
     if (test == "custom-border" || test == "custom-reduction") assert(saved.custom && ci.borderColor == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT && saved.border[0] == 0.25f && saved.border[3] == 1);
     if (test == "standard-border") assert(!saved.custom && ci.borderColor == VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE);

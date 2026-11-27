@@ -7,11 +7,14 @@ import argparse
 import os
 import re
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 RUN_ALL_ARGS = ["--cxx", "{cxx}"]
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tests"))
+from menu_model_fixture import menu_text, output_engine  # noqa: E402
 
 
 def definition(text, name):
@@ -29,7 +32,8 @@ def definition(text, name):
 
 
 def fixture(source):
-    menu = (source / "gpu/vk/vk_menu.cpp").read_text(encoding="utf-8")
+    # (vk_menu.cpp and its modules' rows as table lines, #1633: tx_gpu is gpu/vk/menu/gpu.cpp's)
+    menu = menu_text(source) if (source / "gpu/vk/menu").is_dir() else (source / "gpu/vk/vk_menu.cpp").read_text(encoding="utf-8")
     header = (source / "gpu/vk/vk_menu.h").read_text(encoding="utf-8")
     options = re.search(r"struct Options \{.*?\n\};", header, re.S).group()
     row = re.search(r"struct Row \{.*?\n\};", menu, re.S).group()
@@ -37,14 +41,22 @@ def fixture(source):
     names = dict((member, name) for name, member in re.findall(r'\{TAB_\w+, "([^"]+)", &opts\.(\w+),', menu))
     controls = "\n".join(definition(menu, signature) for signature in (
         "void apply_preset", "void apply_auto"))
-    auto_members = sorted(set(re.findall(r"opts\.(\w+)\s*=", controls)) & names.keys())
+    defaults = dict((member, int(value)) for member, value in re.findall(r"\bint (\w+)\s*=\s*(-?\d+);", options))
+    # (a row the controls only put back to its built-in default, as a preset does Shadow resolution's Auto, is no row Auto
+    # chooses for: at its default, a report lists it nowhere)
+    sets = {}
+    for member, value in re.findall(r"opts\.(\w+)\s*=\s*([^;,=][^;,]*)", controls):
+        sets.setdefault(member, set()).add(value.strip())
     text_functions = {
         "ultrawide": "tx_ultrawide", "output_res": "tx_output_res", "resolution": "tx_resolution",
         "dlss": "tx_upscaler", "dlss_model": "tx_dlss_model", "preset": "tx_preset", "gpu_device": "tx_gpu", "mic": "tx_mic",
     }
     # (the rows a preset sets whose texts are fixed: the built-in defaults for a Custom player Auto never chose for)
     preset_rows = ["sharpness", "pace", "realtime", "handheld"]
-    members = list(dict.fromkeys(["ultrawide", "output_res", "resolution", "dlss", *auto_members, *preset_rows,
+    reset_members = sorted(member for member, values in sets.items() if member in names and member in defaults
+                           and member not in preset_rows and values == {str(defaults[member])})
+    auto_members = sorted(set(sets) & names.keys() - set(reset_members))
+    members = list(dict.fromkeys(["ultrawide", "output_res", "resolution", "dlss", *auto_members, *reset_members, *preset_rows,
                                  "framegen_by", "game_lang", "dlss_model", "gpu_device", "mic", "fov"]))
     rows = "\n".join('    {TAB_GRAPHICS, "%s", &opts.%s, 0, 100, 1, %s, nullptr},' %
                      (names[member], member, text_functions.get(member, "tx_number")) for member in members)
@@ -54,7 +66,6 @@ def fixture(source):
     known = definition(menu, "int report_default") if "int report_default(" in menu else ""
     auto_for = re.search(r"^uint64_t auto_for = 0;", menu, re.M)
     auto_for = auto_for.group() if auto_for else "uint64_t auto_for = 0;"
-    defaults = dict((member, int(value)) for member, value in re.findall(r"\bint (\w+)\s*=\s*(-?\d+);", options))
     # (each preset row moved off its built-in default, and the line a report gives it then)
     moved = dict((member, 1 if defaults[member] == 0 else 0) for member in preset_rows)
     custom_set = " ".join("opts.%s = %d;" % (member, moved[member]) for member in preset_rows)
@@ -62,12 +73,16 @@ def fixture(source):
     custom_names = ", ".join('"%s: "' % names[member] for member in preset_rows)
     call = "changed_rows_text(pc)" if modern else "changed_rows_text()"
     source_parts = [definition(menu, signature) for signature in (
+        "void game_size", "const char* tx_resolution",   # (#1633: game_size out of vk_menu.cpp's anonymous namespace, tx_resolution the upscaler module's)
         "const char* tx_upscaler", "const char* dlss_preset_env", "const char* tx_dlss_model",
         "const char* tx_output_res", "const char* tx_ultrawide", "const char* tx_preset",
         "const char* tx_gpu", "const char* tx_mic")]
     unchanged = " && ".join("opts.%s == before.%s" % (member, member) for member in re.findall(r"\bint (\w+)\s*=", options))
     auto_checks = "\n".join('        CHECK(pc.find("%s: ") != std::string::npos, "Auto-controlled %s missing");' %
                             (names[member], member) for member in auto_members)
+    auto_checks += "".join('\n        CHECK(changed.find("%s: ") == std::string::npos && pc.find("%s: ") == std::string::npos, '
+                           '"%s, put back to its default, listed");' % (names[member], names[member], member)
+                           for member in reset_members)
     return r'''#ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS
 #endif
@@ -82,6 +97,7 @@ def fixture(source):
 #include "host/hos_wide_size.h"
 #include "gpu/vk/display_modes.h"
 #include "gpu/vk/upscaler_rows.h"
+namespace mkwvk::menu { struct Setting; }   // (Row.setting: a module's row, #1633)
 using namespace mkwvk;
 namespace ur = upscaler_rows;
 ''' + options + r'''
@@ -99,6 +115,8 @@ bool screen_size(uint32_t* w, uint32_t* h) {
 bool host_screen_size(uint32_t* w, uint32_t* h) { return screen_size(w, h); }
 std::vector<display_modes::Size> screen_modes() { return {}; }
 int upscaler() { return opts.dlss; } // authored available engine; no backend/GPU call
+uint64_t vram; // the card's video memory, as device_vram_bytes gives it (0: not known)
+uint64_t device_vram_bytes() { return vram; }
 std::vector<std::string> gpu_device_names{"Authored GPU"};
 int mic_calls;
 struct Host { const char* (*mic_name)(int); };
@@ -108,7 +126,7 @@ bool mic_missing = false; int mic_listed = 1; std::string mic_want;
 bool can_mic() { return true; }
 void utf8_whole(char*) {} // the missing-device path is not used; names must be suppressed first
 void logf(const char*, ...) {}
-''' + menu[menu.index("struct Out {"):menu.index("/// The Render resolution: the value chosen")] + "\n" + "\n".join(source_parts) + "\n" + tabs + "\n" + row + r'''
+''' + output_engine(source, "void game_size(float scale") + "\n" + "\n".join(source_parts) + "\n" + tabs + "\n" + row + r'''
 const char* tx_number(int value) { static char text[24]; std::snprintf(text, sizeof text, "%d", value); return text; }
 Row rows[] = {
 ''' + rows + r'''
@@ -117,6 +135,8 @@ int ultrawide_read = 1;
 ''' + definition(menu, "void outputs_sync") + r'''
 static bool pending_restart;
 bool restart_changed(const Row& r) { return pending_restart && r.value == &opts.output_res; }
+bool dlss_fg_forced_here = false; // RX_VK_DLSS_FG=1 fixes Frame generation by at DLSS FG (vk_dlss.cpp dlss_fg_forced)
+bool framegen_by_fixed() { return dlss_fg_forced_here; }
 ''' + policy + "\n" + known + "\n" + formatter + r'''
 int failures;
 const char* case_name;
@@ -148,7 +168,10 @@ int main(int argc, char** argv) {
         if (which == "custom-never-auto") known = {''' + custom_lines + r'''};
     } else if (which == "framegen-by") {
         opts.framegen_by = 1;
-        known = {"''' + names["framegen_by"] + r''': 1 (default: Auto)"}; // not the row's live text at Auto
+        known = {"''' + names["framegen_by"] + r''': 1 (default: 0)"}; // Built-in FG, the default DLSS FG
+    } else if (which == "framegen-by-forced") {
+        dlss_fg_forced_here = true; opts.framegen_by = 1; // RX_VK_DLSS_FG=1: nothing the player chose, whatever is saved
+        at_default = {"''' + names["framegen_by"] + r''': "};
     } else if (which == "lang-saved") {
         i18n::lang_saved = 3; opts.game_lang = 3;
         at_default = {"''' + names["game_lang"] + r''': ", "''' + names["framegen_by"] + r''': "};
@@ -180,6 +203,8 @@ int main(int argc, char** argv) {
         opts.gpu_device = 1; opts.mic = 2; opts.fov = 110;
     } else if (which == "model-env" || which == "model-fixed") {
         opts.dlss_model = 1;
+    } else if (which == "model-small-card") {
+        vram = 6ull << 30; // (the K row draws CNN preset E under 7 GB: upscaler_rows.h cnn_for_vram)
     } else return 2;
     const Options before = opts;
     std::string pc;
@@ -221,6 +246,11 @@ int main(int argc, char** argv) {
         CHECK(changed.find("DLSS model: ") == std::string::npos && pc.find("DLSS model: Preset M") != std::string::npos,
               "environment-dependent model default invented");
     }
+    if (which == "model-small-card") {
+        CHECK(changed.find("DLSS model: ") == std::string::npos &&
+              pc.find("DLSS model: CNN (E) (default depends on this PC") != std::string::npos,
+              "a card under 7 GB: the report does not name the CNN preset E that draws");
+    }
     if (which == "model-fixed") {
         CHECK(changed.find("DLSS model: Transformer 2 (M) (default: Transformer (K))") != std::string::npos,
               "fixed model default not retained without override");
@@ -239,8 +269,8 @@ def main():
     parser.add_argument("--cxx", default="g++")
     args = parser.parse_args()
     cases = ("aspect-default", "reordered-shapes", "aspect-changed", "aspect-changed-wide", "output-context", "render-context",
-             "upscaler-context", "auto-profile", "custom-never-auto", "custom-after-auto", "framegen-by", "lang-saved",
-             "lang-changed", "stable-sentinels", "model-env", "model-fixed")
+             "upscaler-context", "auto-profile", "custom-never-auto", "custom-after-auto", "framegen-by", "framegen-by-forced",
+             "lang-saved", "lang-changed", "stable-sentinels", "model-env", "model-fixed", "model-small-card")
     failed = []
     with tempfile.TemporaryDirectory(prefix="report-defaults-") as tmp:
         cpp = Path(tmp) / "defaults.cpp"
