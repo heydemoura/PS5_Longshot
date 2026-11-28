@@ -1,34 +1,47 @@
 min_version = "2026.11.3"
 
+# The front door: `mise tasks` lists these. setup once per clone; build or build-dev to build; dev for the base/pack A/B loop
+# and the PC's job queue; test and lint before you push.
+
 [tasks.setup]
-description = "Install git hooks (pre-commit and commit-msg)"
+description = "Once per clone, safe to repeat: ../Tooling, git hooks, (Linux) the checks' tools and Python packages, Rust; says what is missing"
 shell = "bash -c"
-run = "pre-commit install"
+depends = ["test-deps"]
+run = "python3 -I scripts/setup.py"
 
 [tools]
 python = "3.12.15"
-node = "22.12.0"
-"aqua:pre-commit/pre-commit" = "4.0.1"
+node = "22.23.5"
+# The Aqua provider has no Windows build; PyPI gives every platform the same pinned pre-commit.
+"pypi:pre-commit" = "4.0.1"
+"pypi:ruff" = "0.12.0"   # (ruff.toml; pre-commit runs it on changed Python)
 "github:rhysd/actionlint" = "1.7.12"
-"github:open-policy-agent/conftest" = "0.71.1"
-"github:CircleCI-Public/circleci-cli" = "1.14.0"
 "github:koalaman/shellcheck" = "0.10.0"
-# glslang 16.6.0 linux x86_64 tarball (checksum in test-deps-linux and [tasks.deps]); no arm64 release.
+# (.pre-commit-config.yaml's gitleaks-system hook runs it: the prebuilt release, not a Go toolchain building it)
+"github:gitleaks/gitleaks" = "8.22.1"
+# (longshot-builder's and the lifter's: docs/dev/reference/builder.md, "Building and checking the builder";
+# scripts/renhdrum.py's RUST_VERSION; the Windows target checks the builder for Windows: `cargo clippy --target
+# x86_64-pc-windows-gnullvm`, and is the game's Rust on Windows, build-compile's rust.rs, which a developer's
+# llvm-mingw build compiles. The release's Linux program is this system's own target, x86_64-unknown-linux-gnu, linked
+# against glibc 2.35: scripts/longshot_builder.py)
+rust = { version = "1.99.1", components = "rustfmt,clippy", targets = "x86_64-pc-windows-gnullvm" }
+# glslang 16.6.0 linux x86_64 tarball (checksum in test-deps-linux and [tasks.test-deps]); no arm64 release.
 
-[tasks.deps]
-description = "Pinned headers and glslang for local run_all (Linux x86_64)"
+[tasks.test-deps]
+description = "Pinned headers and glslang the game-free checks use (Linux x86_64; part of setup)"
+hide = true
 shell = "bash -c"
 run = """
 set -euo pipefail
 if [ "$(uname -s)" != Linux ]; then
-  echo 'deps: Linux only'
-  exit 2
+  echo 'test-deps: Linux only, skipped'
+  exit 0
 fi
 scripts/fetch_commit.sh https://github.com/KhronosGroup/SPIRV-Headers \
   04f10f650d514df88b76d25e83db360142c7b174 _deps/spirv-headers
 scripts/fetch_commit.sh https://github.com/KhronosGroup/Vulkan-Headers \
   74d8a6cb930c68ef617b202c3ff3c59d919e086b _deps/vulkan-headers
-tool_dir="${HOME}/glslang-16.6.0"
+tool_dir="$(python3 -I scripts/dev.py paths tools)/glslang-16.6.0"   # (the development folder's: `dev.py paths`)
 mkdir -p "$tool_dir"
 if [ ! -x "$tool_dir/bin/glslangValidator" ]; then
   curl -fL --retry 3 -o "$tool_dir/glslang.tar.gz" \
@@ -36,12 +49,81 @@ if [ ! -x "$tool_dir/bin/glslangValidator" ]; then
   echo '2c34071f56ecf39d16233294d3739cf43f981fd39080f2fd9dccb782101191ce  '"$tool_dir/glslang.tar.gz" | sha256sum -c --strict
   tar -xzf "$tool_dir/glslang.tar.gz" -C "$tool_dir"
 fi
+echo "test-deps: glslang in $tool_dir/bin (on PATH, the shader checks use it)"
 python3 -m pip install --disable-pip-version-check --no-deps \
-  zstandard==0.25.0 pillow==13.0.0 numpy==2.5.4
+  zstandard==0.25.0 pillow==13.0.0 numpy==2.5.4 unicorn==2.1.4
+"""
+
+[tasks.build]
+description = "Build a game folder from your own dump with this checkout's longshot-builder, through the PC's job queue (its arguments: build --game <.nup> --out <folder> ...; work folder: this checkout's in the development folder's work/ unless --work)"
+shell = "bash -c"
+# (`dev.py packs run` gives longshot-builder this checkout's work folder in the development folder's work/ when no --work
+# is given, and the development folder's builder-cache/ as its cache: not a player's work folder or cache,
+# ~/.cache/longshot-builder or %LOCALAPPDATA%\\Longshot\\Builder. It runs as a job of the PC's queue. mise puts the task's
+# arguments after the line)
+run = "python3 -I scripts/dev.py packs run --"
+
+[tasks.build-dev]
+description = "Compile the game again in this checkout's work folder (lifted before by `mise run build`), with this checkout's sources, through the PC's job queue (LONGSHOT_JOBS; RX_HOT_OPT=O1: a quicker build, never measured)"
+shell = "bash -c"
+run = "python3 -I scripts/dev.py packs run -- compile"
+
+[tasks.tools]
+description = "tools.lock's build tools for this system into the checkout's tools/ (longshot-builder dev tools install; its arguments after: --only <name> ...), where longshot-builder --root . takes them"
+shell = "bash -c"
+run = """
+set -euo pipefail
+case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) system=windows-x64 ;; *) system=linux-x64 ;; esac
+cargo run --release --locked -q -p longshot-builder -- dev tools install . --system "$system"
+"""
+
+[tasks.rust]
+description = "The Rust workspace's checks (the builder, the game's crates), as CI runs them: rustfmt, clippy with warnings as errors, cargo test"
+shell = "bash -c"
+run = """
+set -euo pipefail
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+"""
+
+[tasks.dev]
+description = "scripts/dev.py: shared bases, packs and runtimes through the PC's job queue (base, pack, rt, game, queue, paths; --help lists all)"
+shell = "bash -c"
+run = 'python3 -I scripts/dev.py "$@"'
+
+[tasks.tracy-tools]
+description = "Build tracy-capture and tracy-csvexport 0.15.0, the game's Tracy version, into the development folder's tools/tracy-0.15.0/bin (Linux)"
+shell = "bash -c"
+run = """
+set -euo pipefail
+# (Tracy's releases have no Linux or macOS programs: built from the pinned source. docs/dev/reference/profiling.md, Tracy)
+tool_dir="$(python3 -I scripts/dev.py paths tools)/tracy-0.15.0"   # (the development folder's, shared by every checkout)
+if [ -x "$tool_dir/bin/tracy-capture" ] && [ -x "$tool_dir/bin/tracy-csvexport" ]; then
+  echo "tracy-tools: $tool_dir/bin (already built)"
+  exit 0
+fi
+for t in cmake ninja c++; do
+  command -v "$t" > /dev/null || { echo "tracy-tools: $t is missing"; exit 2; }
+done
+mkdir -p "$tool_dir/bin"
+if [ ! -d "$tool_dir/src" ]; then
+  curl -fL --retry 3 -o "$tool_dir/tracy.tar.gz" https://github.com/wolfpld/tracy/archive/refs/tags/v0.15.0.tar.gz
+  echo '3d57da54aa67d7875da1e8fecd0bd5957675cef73c27dd52bffb6ab8d290a5e6  '"$tool_dir/tracy.tar.gz" | sha256sum -c --strict
+  mkdir -p "$tool_dir/src.part"
+  tar -xzf "$tool_dir/tracy.tar.gz" -C "$tool_dir/src.part" --strip-components=1
+  mv "$tool_dir/src.part" "$tool_dir/src"
+fi
+for t in capture csvexport; do
+  cmake -S "$tool_dir/src/$t" -B "$tool_dir/build-$t" -G Ninja -DCMAKE_BUILD_TYPE=Release
+  cmake --build "$tool_dir/build-$t"
+  cp "$tool_dir/build-$t/tracy-$t" "$tool_dir/bin/"
+done
+echo "tracy-tools: $tool_dir/bin (tracy-capture, tracy-csvexport)"
 """
 
 [tasks.lint]
-description = "pre-commit on what this branch changed (as CI does) + actionlint"
+description = "pre-commit (with ruff) on what this branch changed (as CI does), and actionlint on the workflows"
 shell = "bash -c"
 run = """
 set -euo pipefail
@@ -54,25 +136,24 @@ fi
 actionlint -color -config-file .forgejo/actionlint.yaml .forgejo/workflows/*.yml
 """
 
-[tasks."ci:smoke"]
-description = "Junit helper for run_all --junit"
+[tasks.test-changed]
+description = "Only the checks that read a file this branch changed against main (run_all.py --changed [BASE]): a quick look before you push"
 shell = "bash -c"
-run = "python3 -I -B tests/test_run_all_junit.py"
+run = 'python3 -I -B tests/run_all.py --strict --changed "$@"'
 
 [tasks.test]
-description = "Game-free checks (mise run deps on Linux for toolchain)"
+description = "Every game-free check, --strict (arguments: run_all.py's, such as a path filter)"
 shell = "bash -c"
 run = 'python3 -I -B tests/run_all.py --strict "$@"'
 
-[tasks.validate]
-description = "CircleCI config (merged events + conftest) via lean orb"
+[tasks.ci]
+description = "What CI checks on every change, game-free: the pinned test tools, every check (run_all.py --strict) and the website's build and checks"
 shell = "bash -c"
+depends = ["test-deps"]
 run = """
 set -euo pipefail
-orb="${MB_ORB_DIR:-}"
-if [ -z "$orb" ] || [ ! -f "$orb/tools/validate.sh" ]; then
-  echo 'Set MB_ORB_DIR to a local checkout of MagicBeanDev/orb (maintainers).' >&2
-  exit 2
-fi
-bash "$orb/tools/validate.sh" "$PWD"
+status=0
+python3 -I -B tests/run_all.py --strict || status=1   # (the same line CI runs, in parts there)
+scripts/website_check.sh || status=1
+exit $status
 """

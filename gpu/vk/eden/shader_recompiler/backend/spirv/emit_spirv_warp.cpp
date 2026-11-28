@@ -4,9 +4,17 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+#include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/backend/spirv/mma_layout.h"
+#include "shader_recompiler/backend/spirv/mma_software.h"
 
 namespace Shader::Backend::SPIRV {
 namespace {
@@ -135,79 +143,283 @@ Id BroadcastLane(EmitContext& ctx, Id value, u32 lane) {
     }
     return result;
 }
+
+// (longshot, mma_layout.h mesh_fallback_shared_warp) The shared warp: a fallback stage's 32 lanes are its workgroup's invocations,
+// on however many hardware threads the driver runs them, and what a warp operation needs of the other lanes goes through words of
+// workgroup memory. The lanes that run a block are its region's: the whole warp at the top, and inside an if the lanes that took
+// it, which every lane of the region around it says (WarpOpenRegion) before any goes in. A site (a ballot, a vote, a shuffle) is
+// reached by all of its region's lanes, since the planner (EmitContext::DefineSharedWarp) takes no stage that leaves an if early
+// or has a site in a loop: each lane writes its part and its arrival, then waits for the arrivals it needs. A lane only waits
+// for lanes behind it in the program, which wait for none ahead of them, so the waits end.
+Id WarpWord(EmitContext& ctx, Id index) {
+    return ctx.OpAccessChain(ctx.warp_word_pointer, ctx.warp_words, index);
+}
+
+Id WarpWord(EmitContext& ctx, u32 index) {
+    return WarpWord(ctx, ctx.Const(index));
+}
+
+u32 WarpTake(EmitContext& ctx, u32 words) {
+    if (ctx.warp_word_next + words > ctx.warp_word_count) {
+        throw LogicError("Shared warp: {} words past the {} planned", ctx.warp_word_next + words, ctx.warp_word_count);
+    }
+    const u32 first{ctx.warp_word_next};
+    ctx.warp_word_next += words;
+    return first;
+}
+
+Id WarpScope(EmitContext& ctx) {
+    return ctx.Const(static_cast<u32>(spv::Scope::Workgroup));
+}
+
+void WarpOr(EmitContext& ctx, u32 word, Id bits) {
+    // Each arrival publishes this lane's data and carries earlier arrivals' data through the RMW chain.
+    const auto semantics{spv::MemorySemanticsMask::AcquireRelease | spv::MemorySemanticsMask::WorkgroupMemory};
+    ctx.OpAtomicOr(ctx.U32[1], WarpWord(ctx, word), WarpScope(ctx), ctx.Const(static_cast<u32>(semantics)), bits);
+}
+
+Id WarpRead(EmitContext& ctx, Id pointer) {
+    return ctx.OpAtomicLoad(ctx.U32[1], pointer, WarpScope(ctx), ctx.u32_zero_value);
+}
+
+void WarpWait(EmitContext& ctx, u32 word, Id lanes) {
+    ctx.OpFunctionCall(ctx.void_id, ctx.warp_wait, ctx.Const(word), lanes);
+}
+
+/// (RX_VK_MESH_SHARED_WARP_CHECK) one more answer compared, and one more difference where there is one: the counters past
+/// the fallback's records (emit_spirv.h WARP_COUNTER_*)
+void WarpCheck(EmitContext& ctx, Id differs) {
+    const Id device{ctx.Const(static_cast<u32>(spv::Scope::Device))};
+    ctx.OpAtomicIAdd(ctx.U32[1], ctx.MeshFallbackWarpCounter(WARP_COUNTER_COMPARED), device, ctx.u32_zero_value, ctx.Const(1U));
+    ctx.OpAtomicIAdd(ctx.U32[1], ctx.MeshFallbackWarpCounter(WARP_COUNTER_DIFFERENT), device, ctx.u32_zero_value,
+                     ctx.OpSelect(ctx.U32[1], differs, ctx.Const(1U), ctx.u32_zero_value));
+}
+
+/// The lanes of the block's region for which `pred` holds
+Id SharedBallot(EmitContext& ctx, Id pred) {
+    const u32 word{WarpTake(ctx, WARP_BALLOT_WORDS)};
+    if (pred.value == ctx.true_value.value) {
+        return ctx.warp_region;
+    }
+    WarpOr(ctx, word, ctx.OpSelect(ctx.U32[1], pred, ctx.warp_bit, ctx.u32_zero_value));
+    WarpOr(ctx, word + 1, ctx.warp_bit);
+    WarpWait(ctx, word + 1, ctx.warp_region);
+    return WarpRead(ctx, WarpWord(ctx, word));
+}
+
+/// `value` of lane `source` (0 where that lane is not in the block's region: the subgroup's shuffle leaves it undefined)
+Id SharedShuffle(EmitContext& ctx, Id value, Id source) {
+    const u32 word{WarpTake(ctx, WARP_SHUFFLE_WORDS)};
+    const Id lane{ctx.OpBitwiseAnd(ctx.U32[1], source, ctx.Const(31U))};
+    ctx.OpAtomicExchange(ctx.U32[1], WarpWord(ctx, ctx.OpIAdd(ctx.U32[1], ctx.warp_lane, ctx.Const(word))), WarpScope(ctx),
+                         ctx.u32_zero_value, value);
+    WarpOr(ctx, word + 32, ctx.warp_bit);
+    WarpWait(ctx, word + 32,
+             ctx.OpBitwiseAnd(ctx.U32[1], ctx.OpShiftLeftLogical(ctx.U32[1], ctx.Const(1U), lane), ctx.warp_region));
+    return WarpRead(ctx, WarpWord(ctx, ctx.OpIAdd(ctx.U32[1], lane, ctx.Const(word))));
+}
+
+/// `value` of the constant lane `lane`: one word, which only that lane writes
+Id SharedBroadcast(EmitContext& ctx, Id value, u32 lane) {
+    const u32 word{WarpTake(ctx, WARP_BROADCAST_WORDS)};
+    WarpOr(ctx, word,
+           ctx.OpSelect(ctx.U32[1], ctx.OpIEqual(ctx.U1, ctx.warp_lane, ctx.Const(lane)), value, ctx.u32_zero_value));
+    WarpOr(ctx, word + 1, ctx.warp_bit);
+    WarpWait(ctx, word + 1, ctx.OpBitwiseAnd(ctx.U32[1], ctx.Const(1U << lane), ctx.warp_region));
+    return WarpRead(ctx, WarpWord(ctx, word));
+}
+
+/// A lane mask of the shared warp, from the lane's bit: lower lanes, lower or equal, higher, higher or equal
+Id SharedLtMask(EmitContext& ctx) {
+    return ctx.OpISub(ctx.U32[1], ctx.warp_bit, ctx.Const(1U));
+}
+
+Id SharedLeMask(EmitContext& ctx) {
+    return ctx.OpBitwiseOr(ctx.U32[1], SharedLtMask(ctx), ctx.warp_bit);
+}
+
+/// (the check: where a shuffle's two answers must agree: its source in range and a lane of the region; the subgroup's answer
+/// for any other lane is undefined)
+Id ShuffleCounts(EmitContext& ctx, Id in_range, Id source) {
+    if (!ctx.warp_shared_check) {
+        return Id{};
+    }
+    const Id bit{ctx.OpShiftLeftLogical(ctx.U32[1], ctx.Const(1U), ctx.OpBitwiseAnd(ctx.U32[1], source, ctx.Const(31U)))};
+    return ctx.OpLogicalAnd(ctx.U1, in_range,
+                            ctx.OpINotEqual(ctx.U1, ctx.OpBitwiseAnd(ctx.U32[1], bit, ctx.warp_region), ctx.u32_zero_value));
+}
+
+/// What the stage uses: the shared answer, or with the check the subgroup's, the two compared (`counts`: where they must agree)
+template <typename Native>
+Id SharedOr(EmitContext& ctx, Id shared, Native&& native, Id counts = Id{}, bool boolean = false) {
+    if (!ctx.warp_shared_check) {
+        return shared;
+    }
+    const Id subgroup{native()};
+    Id differs{boolean ? ctx.OpLogicalNotEqual(ctx.U1, shared, subgroup) : ctx.OpINotEqual(ctx.U1, shared, subgroup)};
+    if (Sirit::ValidId(counts)) {
+        differs = ctx.OpLogicalAnd(ctx.U1, differs, counts);
+    }
+    WarpCheck(ctx, differs);
+    return subgroup;
+}
 } // Anonymous namespace
 
-Id EmitLaneId(EmitContext& ctx) {
-    const Id id{GetThreadId(ctx)};
-    if (!ctx.profile.warp_size_potentially_larger_than_guest) {
-        return id;
+void WarpOpenRegion(EmitContext& ctx, const IR::Block* body, Id cond) {
+    if (!ctx.warp_shared) {
+        return;
     }
-    return ctx.OpBitwiseAnd(ctx.U32[1], id, ctx.Const(31U));
+    const bool region{ctx.warp_region_ifs.contains(body)};
+    ctx.warp_region_opened.push_back(region);
+    if (!region) {
+        return;
+    }
+    // (every lane of the region around says whether it goes in, then that it has said so; the lanes that go in are known
+    // once all of them have)
+    const u32 word{WarpTake(ctx, WARP_REGION_WORDS)};
+    WarpOr(ctx, word, ctx.OpSelect(ctx.U32[1], cond, ctx.warp_bit, ctx.u32_zero_value));
+    WarpOr(ctx, word + 1, ctx.warp_bit);
+    WarpWait(ctx, word + 1, ctx.warp_region);
+    ctx.warp_regions.push_back(ctx.warp_region);
+    ctx.warp_region = WarpRead(ctx, WarpWord(ctx, word));
+}
+
+void WarpCloseRegion(EmitContext& ctx) {
+    if (!ctx.warp_shared || ctx.warp_region_opened.empty()) {
+        return;
+    }
+    const bool region{ctx.warp_region_opened.back()};
+    ctx.warp_region_opened.pop_back();
+    if (region) {
+        ctx.warp_region = ctx.warp_regions.back();
+        ctx.warp_regions.pop_back();
+    }
+}
+
+/// The shared warp's start, in the stage's entry block: the invocation's lane and bit, the whole warp as the region, and
+/// the words at zero (the caller's barrier follows: every lane has zeroed its words before any writes one)
+void WarpPrologue(EmitContext& ctx) {
+    if (!ctx.warp_shared) {
+        return;
+    }
+    ctx.warp_lane = ctx.OpCompositeExtract(ctx.U32[1], ctx.OpLoad(ctx.U32[3], ctx.local_invocation_id), 0U);
+    ctx.warp_bit = ctx.OpShiftLeftLogical(ctx.U32[1], ctx.Const(1U), ctx.warp_lane);
+    ctx.warp_region = ctx.Const(0xffffffffU);
+    for (u32 first = 0; first < ctx.warp_word_count; first += 32) {
+        const Id at{ctx.OpUMin(ctx.U32[1], ctx.OpIAdd(ctx.U32[1], ctx.warp_lane, ctx.Const(first)),
+                               ctx.Const(ctx.warp_word_count - 1))};
+        ctx.OpStore(WarpWord(ctx, at), ctx.u32_zero_value);
+    }
+}
+
+Id EmitLaneId(EmitContext& ctx) {
+    const auto subgroup = [&] {
+        const Id id{GetThreadId(ctx)};
+        if (!ctx.profile.warp_size_potentially_larger_than_guest) {
+            return id;
+        }
+        return ctx.OpBitwiseAnd(ctx.U32[1], id, ctx.Const(31U));
+    };
+    if (ctx.warp_shared) {
+        return SharedOr(ctx, ctx.warp_lane, subgroup);
+    }
+    return subgroup();
 }
 
 Id EmitVoteAll(EmitContext& ctx, Id pred) {
     if (!StageSupportsSubgroups(ctx)) {
         return pred;
     }
-    if (!ctx.profile.warp_size_potentially_larger_than_guest) {
-        return ctx.OpGroupNonUniformAll(ctx.U1, SubgroupScope(ctx), pred);
+    const auto subgroup = [&] {
+        if (!ctx.profile.warp_size_potentially_larger_than_guest) {
+            return ctx.OpGroupNonUniformAll(ctx.U1, SubgroupScope(ctx), pred);
+        }
+        const Id mask_ballot{
+            ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), ctx.true_value)};
+        const Id active_mask{WarpExtract(ctx, mask_ballot)};
+        const Id ballot{
+            WarpExtract(ctx, ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), pred))};
+        const Id lhs{ctx.OpBitwiseAnd(ctx.U32[1], ballot, active_mask)};
+        return ctx.OpIEqual(ctx.U1, lhs, active_mask);
+    };
+    if (ctx.warp_shared) {
+        return SharedOr(ctx, ctx.OpIEqual(ctx.U1, SharedBallot(ctx, pred), ctx.warp_region), subgroup, Id{}, true);
     }
-    const Id mask_ballot{
-        ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), ctx.true_value)};
-    const Id active_mask{WarpExtract(ctx, mask_ballot)};
-    const Id ballot{
-        WarpExtract(ctx, ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), pred))};
-    const Id lhs{ctx.OpBitwiseAnd(ctx.U32[1], ballot, active_mask)};
-    return ctx.OpIEqual(ctx.U1, lhs, active_mask);
+    return subgroup();
 }
 
 Id EmitVoteAny(EmitContext& ctx, Id pred) {
     if (!StageSupportsSubgroups(ctx)) {
         return pred;
     }
-    if (!ctx.profile.warp_size_potentially_larger_than_guest) {
-        return ctx.OpGroupNonUniformAny(ctx.U1, SubgroupScope(ctx), pred);
+    const auto subgroup = [&] {
+        if (!ctx.profile.warp_size_potentially_larger_than_guest) {
+            return ctx.OpGroupNonUniformAny(ctx.U1, SubgroupScope(ctx), pred);
+        }
+        const Id mask_ballot{
+            ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), ctx.true_value)};
+        const Id active_mask{WarpExtract(ctx, mask_ballot)};
+        const Id ballot{
+            WarpExtract(ctx, ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), pred))};
+        const Id lhs{ctx.OpBitwiseAnd(ctx.U32[1], ballot, active_mask)};
+        return ctx.OpINotEqual(ctx.U1, lhs, ctx.u32_zero_value);
+    };
+    if (ctx.warp_shared) {
+        return SharedOr(ctx, ctx.OpINotEqual(ctx.U1, SharedBallot(ctx, pred), ctx.u32_zero_value), subgroup, Id{}, true);
     }
-    const Id mask_ballot{
-        ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), ctx.true_value)};
-    const Id active_mask{WarpExtract(ctx, mask_ballot)};
-    const Id ballot{
-        WarpExtract(ctx, ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), pred))};
-    const Id lhs{ctx.OpBitwiseAnd(ctx.U32[1], ballot, active_mask)};
-    return ctx.OpINotEqual(ctx.U1, lhs, ctx.u32_zero_value);
+    return subgroup();
 }
 
 Id EmitVoteEqual(EmitContext& ctx, Id pred) {
     if (!StageSupportsSubgroups(ctx)) {
         return ctx.true_value;
     }
-    if (!ctx.profile.warp_size_potentially_larger_than_guest) {
-        return ctx.OpGroupNonUniformAllEqual(ctx.U1, SubgroupScope(ctx), pred);
+    const auto subgroup = [&] {
+        if (!ctx.profile.warp_size_potentially_larger_than_guest) {
+            return ctx.OpGroupNonUniformAllEqual(ctx.U1, SubgroupScope(ctx), pred);
+        }
+        const Id mask_ballot{
+            ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), ctx.true_value)};
+        const Id active_mask{WarpExtract(ctx, mask_ballot)};
+        const Id ballot{
+            WarpExtract(ctx, ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), pred))};
+        const Id lhs{ctx.OpBitwiseXor(ctx.U32[1], ballot, active_mask)};
+        return ctx.OpLogicalOr(ctx.U1, ctx.OpIEqual(ctx.U1, lhs, ctx.u32_zero_value),
+                               ctx.OpIEqual(ctx.U1, lhs, active_mask));
+    };
+    if (ctx.warp_shared) {
+        const Id ballot{SharedBallot(ctx, pred)};
+        return SharedOr(ctx,
+                        ctx.OpLogicalOr(ctx.U1, ctx.OpIEqual(ctx.U1, ballot, ctx.u32_zero_value),
+                                        ctx.OpIEqual(ctx.U1, ballot, ctx.warp_region)),
+                        subgroup, Id{}, true);
     }
-    const Id mask_ballot{
-        ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), ctx.true_value)};
-    const Id active_mask{WarpExtract(ctx, mask_ballot)};
-    const Id ballot{
-        WarpExtract(ctx, ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), pred))};
-    const Id lhs{ctx.OpBitwiseXor(ctx.U32[1], ballot, active_mask)};
-    return ctx.OpLogicalOr(ctx.U1, ctx.OpIEqual(ctx.U1, lhs, ctx.u32_zero_value),
-                           ctx.OpIEqual(ctx.U1, lhs, active_mask));
+    return subgroup();
 }
 
 Id EmitSubgroupBallot(EmitContext& ctx, Id pred) {
     if (!StageSupportsSubgroups(ctx)) {
         return ctx.OpSelect(ctx.U32[1], pred, ctx.Const(1u), ctx.u32_zero_value);
     }
-    const Id ballot{ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), pred)};
-    if (!ctx.profile.warp_size_potentially_larger_than_guest) {
-        return ctx.OpCompositeExtract(ctx.U32[1], ballot, 0U);
+    const auto subgroup = [&] {
+        const Id ballot{ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), pred)};
+        if (!ctx.profile.warp_size_potentially_larger_than_guest) {
+            return ctx.OpCompositeExtract(ctx.U32[1], ballot, 0U);
+        }
+        return WarpExtract(ctx, ballot);
+    };
+    if (ctx.warp_shared) {
+        return SharedOr(ctx, SharedBallot(ctx, pred), subgroup);
     }
-    return WarpExtract(ctx, ballot);
+    return subgroup();
 }
 
 Id EmitSubgroupEqMask(EmitContext& ctx) {
     if (!StageSupportsSubgroups(ctx)) {
         return ctx.Const(1u);
+    }
+    if (ctx.warp_shared) {
+        return SharedOr(ctx, ctx.warp_bit, [&] { return LoadMask(ctx, ctx.subgroup_mask_eq); });
     }
     return LoadMask(ctx, ctx.subgroup_mask_eq);
 }
@@ -216,12 +428,18 @@ Id EmitSubgroupLtMask(EmitContext& ctx) {
     if (!StageSupportsSubgroups(ctx)) {
         return ctx.u32_zero_value;
     }
+    if (ctx.warp_shared) {
+        return SharedOr(ctx, SharedLtMask(ctx), [&] { return LoadMask(ctx, ctx.subgroup_mask_lt); });
+    }
     return LoadMask(ctx, ctx.subgroup_mask_lt);
 }
 
 Id EmitSubgroupLeMask(EmitContext& ctx) {
     if (!StageSupportsSubgroups(ctx)) {
         return ctx.Const(1u);
+    }
+    if (ctx.warp_shared) {
+        return SharedOr(ctx, SharedLeMask(ctx), [&] { return LoadMask(ctx, ctx.subgroup_mask_le); });
     }
     return LoadMask(ctx, ctx.subgroup_mask_le);
 }
@@ -230,12 +448,18 @@ Id EmitSubgroupGtMask(EmitContext& ctx) {
     if (!StageSupportsSubgroups(ctx)) {
         return ctx.u32_zero_value;
     }
+    if (ctx.warp_shared) {
+        return SharedOr(ctx, ctx.OpNot(ctx.U32[1], SharedLeMask(ctx)), [&] { return LoadMask(ctx, ctx.subgroup_mask_gt); });
+    }
     return LoadMask(ctx, ctx.subgroup_mask_gt);
 }
 
 Id EmitSubgroupGeMask(EmitContext& ctx) {
     if (!StageSupportsSubgroups(ctx)) {
         return ctx.Const(1u);
+    }
+    if (ctx.warp_shared) {
+        return SharedOr(ctx, ctx.OpNot(ctx.U32[1], SharedLtMask(ctx)), [&] { return LoadMask(ctx, ctx.subgroup_mask_ge); });
     }
     return LoadMask(ctx, ctx.subgroup_mask_ge);
 }
@@ -258,12 +482,26 @@ Id EmitShuffleIndex(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id cla
     const IR::Value lane{inst->Arg(1).Resolve()};
     const IR::Value segment{inst->Arg(3).Resolve()};
     if (lane.IsImmediate() && segment.IsImmediate() && segment.U32() == 0) {
-        return ctx.OpSelect(ctx.U32[1], in_range, BroadcastLane(ctx, value, lane.U32() & 31),
+        const auto subgroup = [&] { return BroadcastLane(ctx, value, lane.U32() & 31); };
+        if (ctx.warp_shared) {
+            const Id source{ctx.Const(lane.U32() & 31)};
+            const Id shared{SharedBroadcast(ctx, value, lane.U32() & 31)};
+            return ctx.OpSelect(ctx.U32[1], in_range,
+                                SharedOr(ctx, shared, subgroup, ShuffleCounts(ctx, in_range, source)),
+                                value);
+        }
+        return ctx.OpSelect(ctx.U32[1], in_range, subgroup(), value);
+    }
+    const auto subgroup = [&] {
+        return ShuffleAbsolute(ctx, value, HostThreadId(ctx, src_thread_id), UseShuffleFallback(ctx));
+    };
+    if (ctx.warp_shared) {
+        const Id shared{SharedShuffle(ctx, value, src_thread_id)};
+        return ctx.OpSelect(ctx.U32[1], in_range,
+                            SharedOr(ctx, shared, subgroup, ShuffleCounts(ctx, in_range, src_thread_id)),
                             value);
     }
-    const Id shuffled{
-        ShuffleAbsolute(ctx, value, HostThreadId(ctx, src_thread_id), UseShuffleFallback(ctx))};
-    return ctx.OpSelect(ctx.U32[1], in_range, shuffled, value);
+    return ctx.OpSelect(ctx.U32[1], in_range, subgroup(), value);
 }
 
 Id EmitShuffleUp(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id clamp,
@@ -279,9 +517,16 @@ Id EmitShuffleUp(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id clamp,
     const Id in_range{ctx.OpSGreaterThanEqual(ctx.U1, src_thread_id, max_thread_id)};
 
     SetInBoundsFlag(inst, in_range);
-    const Id shuffled{ShuffleRelative(ctx, value, delta, src_thread_id,
-                                      spv::Op::OpGroupNonUniformShuffleUp)};
-    return ctx.OpSelect(ctx.U32[1], in_range, shuffled, value);
+    const auto subgroup = [&] {
+        return ShuffleRelative(ctx, value, delta, src_thread_id, spv::Op::OpGroupNonUniformShuffleUp);
+    };
+    if (ctx.warp_shared) {
+        const Id shared{SharedShuffle(ctx, value, src_thread_id)};
+        return ctx.OpSelect(ctx.U32[1], in_range,
+                            SharedOr(ctx, shared, subgroup, ShuffleCounts(ctx, in_range, src_thread_id)),
+                            value);
+    }
+    return ctx.OpSelect(ctx.U32[1], in_range, subgroup(), value);
 }
 
 Id EmitShuffleDown(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id clamp,
@@ -297,9 +542,16 @@ Id EmitShuffleDown(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id clam
     const Id in_range{ctx.OpSLessThanEqual(ctx.U1, src_thread_id, max_thread_id)};
 
     SetInBoundsFlag(inst, in_range);
-    const Id shuffled{ShuffleRelative(ctx, value, delta, src_thread_id,
-                                      spv::Op::OpGroupNonUniformShuffleDown)};
-    return ctx.OpSelect(ctx.U32[1], in_range, shuffled, value);
+    const auto subgroup = [&] {
+        return ShuffleRelative(ctx, value, delta, src_thread_id, spv::Op::OpGroupNonUniformShuffleDown);
+    };
+    if (ctx.warp_shared) {
+        const Id shared{SharedShuffle(ctx, value, src_thread_id)};
+        return ctx.OpSelect(ctx.U32[1], in_range,
+                            SharedOr(ctx, shared, subgroup, ShuffleCounts(ctx, in_range, src_thread_id)),
+                            value);
+    }
+    return ctx.OpSelect(ctx.U32[1], in_range, subgroup(), value);
 }
 
 Id EmitShuffleButterfly(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id clamp,
@@ -317,10 +569,18 @@ Id EmitShuffleButterfly(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id
     SetInBoundsFlag(inst, in_range);
     // (longshot) through the broadcasts where shuffles are broken (UseShuffleFallback: AMD's fragment stages, Lichii #273),
     // as the absolute and relative shuffles are; #273 left SHFL.BFLY native, and some of Kokiri Forest's plants use it
-    const Id shuffled{UseShuffleFallback(ctx)
-                          ? ShuffleAbsolute(ctx, value, HostThreadId(ctx, src_thread_id), true)
-                          : ctx.OpGroupNonUniformShuffleXor(ctx.U32[1], SubgroupScope(ctx), value, mask)};
-    return ctx.OpSelect(ctx.U32[1], in_range, shuffled, value);
+    const auto subgroup = [&] {
+        return UseShuffleFallback(ctx)
+                   ? ShuffleAbsolute(ctx, value, HostThreadId(ctx, src_thread_id), true)
+                   : ctx.OpGroupNonUniformShuffleXor(ctx.U32[1], SubgroupScope(ctx), value, mask);
+    };
+    if (ctx.warp_shared) {
+        const Id shared{SharedShuffle(ctx, value, src_thread_id)};
+        return ctx.OpSelect(ctx.U32[1], in_range,
+                            SharedOr(ctx, shared, subgroup, ShuffleCounts(ctx, in_range, src_thread_id)),
+                            value);
+    }
+    return ctx.OpSelect(ctx.U32[1], in_range, subgroup(), value);
 }
 
 Id EmitQuadBroadcast(EmitContext& ctx, Id value, Id lane) {
@@ -379,126 +639,777 @@ Id EmitDPdyCoarse(EmitContext& ctx, Id op_a) {
     return ctx.OpDPdyCoarse(ctx.F32[1], op_a);
 }
 
-// (longshot) HMMA in software, from Lichii (zortos293/Lichii, emit_spirv_tensor.cpp, GPL-3.0): the 32 lanes' fragments
-// through subgroup shuffles in one helper function, accumulated with FMA in f32 and rounded to f16 after every 8
-// columns of K, as HMMA.F16 does. It needs no cooperative matrices (RX_VK_MMA_SOFTWARE=1, vk_coopmat.cpp).
-void DefineSoftwareMatrixFunction(EmitContext& ctx) {
-    {
-        constexpr bool variant = true;
-        ctx.AddCapability(spv::Capability::GroupNonUniform);
-        ctx.AddCapability(spv::Capability::GroupNonUniformShuffle);
-        if (!ctx.profile.SupportsSubgroupStage(ctx.stage) ||
-            ctx.profile.has_broken_spirv_subgroup_shuffle)
-            throw NotImplementedException("Software HMMA requires subgroup shuffle support");
-        const Id u32ty = ctx.U32[1], f32ty = ctx.F32[1];
-        const auto imm = [&](u32 v) { return ctx.Const(v); };
-        const auto add = [&](Id a, Id b) { return ctx.OpIAdd(u32ty, a, b); };
-        const auto and_ = [&](Id a, u32 b) { return ctx.OpBitwiseAnd(u32ty, a, imm(b)); };
-        const auto unpack = [&](Id v) { return ctx.OpUnpackHalf2x16(ctx.F32[2], v); };
-        const auto round_half = [&](Id value) {
-            // Do not express the intermediate rounding as unpack(pack(value)): drivers may
-            // eliminate that round trip. Round normal significands explicitly, ties to even;
-            // half subnormals lie on the exactly representable 2^-24 grid.
-            const Id bits = ctx.OpBitcast(u32ty, value);
-            const Id magnitude = and_(bits, 0x7fffffffU);
-            const Id tie = and_(ctx.OpShiftRightLogical(u32ty, magnitude, imm(13)), 1);
-            const Id rounded = and_(add(add(magnitude, imm(0xfff)), tie), ~0x1fffU);
-            const Id normal = ctx.OpSelect(u32ty,
-                ctx.OpUGreaterThanEqual(ctx.U1, rounded, imm(0x47800000)), imm(0x7f800000), rounded);
-            const Id scaled = ctx.OpFMul(f32ty, ctx.OpBitcast(f32ty, magnitude), ctx.Const(16777216.0f));
-            const Id subnormal = ctx.OpBitcast(u32ty,
-                ctx.OpFMul(f32ty, ctx.OpRoundEven(f32ty, scaled), ctx.Const(0x1p-24f)));
-            const Id finite = ctx.OpSelect(u32ty,
-                ctx.OpUGreaterThanEqual(ctx.U1, magnitude, imm(0x38800000)), normal, subnormal);
-            const Id result = ctx.OpSelect(u32ty,
-                ctx.OpUGreaterThanEqual(ctx.U1, magnitude, imm(0x7f800000)), magnitude, finite);
-            return ctx.OpBitcast(f32ty, ctx.OpBitwiseOr(u32ty, result, and_(bits, 0x80000000)));
-        };
-        const Id type = ctx.TypeFunction(ctx.U32[2], ctx.U32[4], ctx.U32[2], ctx.U32[2]);
-        const Id fn = ctx.OpFunction(ctx.U32[2], spv::FunctionControlMask::DontInline, type);
-        ctx.software_matrix_function = fn;
-        const Id matrix_a = ctx.OpFunctionParameter(ctx.U32[4]);
-        const Id matrix_b = ctx.OpFunctionParameter(ctx.U32[2]);
-        const Id matrix_c = ctx.OpFunctionParameter(ctx.U32[2]);
-        ctx.AddLabel();
-        const Id counter = ctx.AddLocalVariable(ctx.TypePointer(spv::StorageClass::Function, u32ty),
-                                           spv::StorageClass::Function);
-        std::array<Id, 4> accumulators;
-        for (auto& acc : accumulators)
-            acc = ctx.AddLocalVariable(ctx.TypePointer(spv::StorageClass::Function, f32ty),
-                                 spv::StorageClass::Function);
-        std::array<Id, 8> inputs;
-        for (u32 i = 0; i < 4; ++i)
-            inputs[i] = ctx.OpCompositeExtract(u32ty, matrix_a, i);
-        for (u32 i = 0; i < 2; ++i) {
-            inputs[4 + i] = ctx.OpCompositeExtract(u32ty, matrix_b, i);
-            inputs[6 + i] = ctx.OpCompositeExtract(u32ty, matrix_c, i);
+// (longshot) HMMA in software (mma_software.h): the 32 lanes' fragments through subgroup operations in one helper function,
+// accumulated with FMA in f32 and rounded to f16 after every 8 columns of K, as HMMA.F16 does. It needs no cooperative matrices
+// (RX_VK_MMA_SOFTWARE=1, vk_coopmat.cpp); the form is the one vk_coopmat.cpp's self-test chose for this device (mma_software_form).
+void DefineSoftwareMatrixFunction(EmitContext& ctx, const IR::Program& program) {
+    ctx.AddCapability(spv::Capability::GroupNonUniform);
+    ctx.AddCapability(spv::Capability::GroupNonUniformShuffle);
+    if (!ctx.profile.SupportsSubgroupStage(ctx.stage) || ctx.profile.has_broken_spirv_subgroup_shuffle)
+        throw NotImplementedException("Software HMMA requires subgroup shuffle support");
+    const auto form = static_cast<SoftwareMmaForm>(mma_software_form);
+    const bool quad = form != SoftwareMmaForm::Loop && mma_software_quad;
+    if (quad) ctx.AddCapability(spv::Capability::GroupNonUniformQuad);
+    const SoftwareMmaTypes types{ctx.U32[1], ctx.U32[2], ctx.U32[4], ctx.F32[1], ctx.F32[2], ctx.F16[1], ctx.U1, ctx.F16[2]};
+    // (B through a workgroup memory tile a subgroup, mma_software.h: where the self-test passed it, in a compute program pinned to
+    // 32 lanes (profile_pinned) whose subgroups are full: the device has computeFullSubgroups (mma_software_full_subgroups) and the
+    // workgroup's X width is a multiple of 32, where vk_draw.cpp pin_subgroup asks REQUIRE_FULL_SUBGROUPS; its own workgroup
+    // memory and the tiles within the device's. Not in a program with an explicit workgroup layout and workgroup memory of its own
+    // (EmitContext::DefineSharedMemory: every workgroup variable a Block from byte 0), a layout the self-test does not run and the
+    // renderer does not enable (make_profile leaves support_explicit_workgroup_layout off): such a program keeps the shuffles)
+    SoftwareMmaStagedB staged{};
+    const auto& wg = program.workgroup_size;
+    const u32 invocations = wg[0] * wg[1] * wg[2];
+    const u32 own = (program.shared_memory_size + 15U) & ~15U, tiles = invocations / 32;
+    const bool explicit_layout = ctx.uses_explicit_workgroup_layout && program.shared_memory_size != 0;
+    const bool full_subgroups = mma_software_full_subgroups && ctx.stage == Stage::Compute &&
+                                !ctx.profile.warp_size_potentially_larger_than_guest && ctx.profile.max_subgroup_size == 32 &&
+                                invocations && wg[0] % 32 == 0;
+    const bool stage_b = form != SoftwareMmaForm::Loop && mma_software_staged_b && !explicit_layout &&
+                         full_subgroups && own + tiles * kSoftwareMmaTileBytes <= mma_software_staged_b;
+    if (stage_b) {
+        // (without an explicit layout the driver lays the variables out, and an array has no stride. Its length a signed
+        // constant, as DefineSharedWarp's: Sirit gives back the type already made for the same words, and u32x4 arrays made for
+        // blocks (constant buffers) carry an ArrayStride)
+        const Id array{ctx.TypeArray(ctx.U32[4], ctx.SConst(static_cast<s32>(tiles * kSoftwareMmaTileVectors)))};
+        staged.tile = ctx.AddGlobalVariable(ctx.TypePointer(spv::StorageClass::Workgroup, array), spv::StorageClass::Workgroup);
+        ctx.Name(staged.tile, "mma_b_tiles");
+        ctx.interfaces.push_back(staged.tile);
+        staged.subgroup_id = ctx.AddGlobalVariable(ctx.TypePointer(spv::StorageClass::Input, ctx.U32[1]), spv::StorageClass::Input);
+        ctx.Decorate(staged.subgroup_id, spv::Decoration::BuiltIn, spv::BuiltIn::SubgroupId);
+        ctx.interfaces.push_back(staged.subgroup_id);
+        staged.u32_pointer = ctx.TypePointer(spv::StorageClass::Workgroup, ctx.U32[1]);
+        staged.u32x4_pointer = ctx.TypePointer(spv::StorageClass::Workgroup, ctx.U32[4]);
+    }
+    ctx.software_matrix_function =
+        DefineSoftwareMma(ctx, types, ctx.subgroup_local_invocation_id, form, quad, stage_b ? &staged : nullptr);
+}
+
+
+bool Wmma16Fits(const Profile& profile, const IR::Program& program) {
+    // (only where every subgroup is full: the cooperative matrix operations and the subgroup barriers then run with all
+    // 32 lanes, as the startup test checked them. Otherwise the software multiply)
+    if (program.stage != Stage::Compute || !mma_wmma16_full_subgroups || program.workgroup_size[0] == 0 || program.workgroup_size[0] % 32 != 0) return false;
+    const uint64_t threads = uint64_t(program.workgroup_size[0]) * program.workgroup_size[1] * program.workgroup_size[2];
+    if (!threads || threads > 32ull * mma_wmma16_max_subgroups || profile.warp_size_potentially_larger_than_guest || profile.max_subgroup_size != 32) return false;
+    const uint64_t subgroups = (threads + 31) / 32;
+    // (EmitContext::DefineSharedMemory uses_explicit_workgroup_layout)
+    const bool explicit_layout = profile.support_explicit_workgroup_layout &&
+                                 (!program.info.uses_int8 || profile.support_workgroup_layout_8bit_access) &&
+                                 (!program.info.uses_int16 || profile.support_workgroup_layout_16bit_access) &&
+                                 program.shared_memory_size != 0;
+    const uint64_t own_bytes = explicit_layout ? (uint64_t(program.shared_memory_size) + 15) & ~15ull : (uint64_t(program.shared_memory_size) + 3) & ~3ull;
+    return mma_wmma16_shared_limit == 0 || own_bytes + subgroups * mma_wmma16_tile_words * 4 + 4 <= mma_wmma16_shared_limit;
+}
+
+// (longshot, AMD RDNA 3/4) HMMA_nx2 on 16x16x16 cooperative matrices (mma_layout.h mma_wmma16). Each subgroup has 512
+// words of workgroup memory past the program's own: A (row major), B's K halves 0-7 and 8-15 (column major, the
+// other half's rows zero) and C/D (row major), every 16x16 f16. The lanes write their fragments at the console's
+// positions (PTX m16n8k16) and zeros where B and C have no columns 8-15, the device loads the tiles in its own
+// layout, D = A*B_hi + (A*B_lo + C) is rounded to f16 between the two as HMMA.F16 does, and each lane reads its two
+// words of D back. False when the tiles do not fit the device's shared memory: the program then takes the software
+// multiply.
+bool DefineWmma16MatrixFunction(EmitContext& ctx, const IR::Program& program) {
+    if (!Wmma16Fits(ctx.profile, program)) return false;
+    const u32 threads = std::max(1U, program.workgroup_size[0] * program.workgroup_size[1] * program.workgroup_size[2]);
+    const u32 subgroups = (threads + 31) / 32;
+    const bool explicit_layout = ctx.uses_explicit_workgroup_layout && program.shared_memory_size != 0;
+    const u32 offset_bytes = explicit_layout ? (program.shared_memory_size + 15U) & ~15U : 0U;
+    const u32 words = subgroups * mma_wmma16_tile_words;
+
+    const Id u32ty{ctx.U32[1]};
+    const Id word_pointer{ctx.TypePointer(spv::StorageClass::Workgroup, u32ty)};
+    const Id array_type{ctx.TypeArray(u32ty, ctx.Const(words))};
+    Id scratch{};
+    if (explicit_layout) {
+        // (all the Workgroup variables are blocks over the same memory: these words follow the program's. The second
+        // member keeps the structure distinct from the program's own single-member ones, decorated at offset 0)
+        ctx.Decorate(array_type, spv::Decoration::ArrayStride, 4U);
+        const Id block{ctx.TypeStruct(array_type, u32ty)};
+        ctx.MemberDecorate(block, 0U, spv::Decoration::Offset, offset_bytes);
+        ctx.MemberDecorate(block, 1U, spv::Decoration::Offset, offset_bytes + words * 4);
+        ctx.Decorate(block, spv::Decoration::Block);
+        scratch = ctx.AddGlobalVariable(ctx.TypePointer(spv::StorageClass::Workgroup, block),
+                                        spv::StorageClass::Workgroup);
+        ctx.Decorate(scratch, spv::Decoration::Aliased);
+    } else {
+        scratch = ctx.AddGlobalVariable(ctx.TypePointer(spv::StorageClass::Workgroup, array_type),
+                                        spv::StorageClass::Workgroup);
+    }
+    ctx.interfaces.push_back(scratch);
+    ctx.AddCapability(spv::Capability::GroupNonUniform);
+    const Id subgroup_id{ctx.AddGlobalVariable(ctx.TypePointer(spv::StorageClass::Input, u32ty),
+                                               spv::StorageClass::Input)};
+    ctx.Decorate(subgroup_id, spv::Decoration::BuiltIn, spv::BuiltIn::SubgroupId);
+    ctx.interfaces.push_back(subgroup_id);
+
+    const auto imm = [&](u32 v) { return ctx.Const(v); };
+    const auto add = [&](Id a, Id b) { return ctx.OpIAdd(u32ty, a, b); };
+    const auto at = [&](Id index) {
+        return explicit_layout ? ctx.OpAccessChain(word_pointer, scratch, ctx.u32_zero_value, index)
+                               : ctx.OpAccessChain(word_pointer, scratch, index);
+    };
+    const auto store = [&](Id index, Id value) { ctx.OpStore(at(index), value, spv::MemoryAccessMask::NonPrivatePointer); };
+    const auto load = [&](Id index) { return ctx.OpLoad(u32ty, at(index), spv::MemoryAccessMask::NonPrivatePointer); };
+    const Id subgroup_scope{imm(static_cast<u32>(spv::Scope::Subgroup))};
+    const auto barrier = [&] {
+        ctx.OpControlBarrier(subgroup_scope, subgroup_scope,
+                             imm(static_cast<u32>(spv::MemorySemanticsMask::AcquireRelease |
+                                                  spv::MemorySemanticsMask::WorkgroupMemory |
+                                                  spv::MemorySemanticsMask::MakeAvailable |
+                                                  spv::MemorySemanticsMask::MakeVisible)));
+    };
+    const Id f16{ctx.F16[1]};
+    const auto type = [&](spv::CooperativeMatrixUse use) {
+        return ctx.TypeCooperativeMatrixKHR(f16, subgroup_scope, imm(16), imm(16), imm(static_cast<u32>(use)));
+    };
+    const Id a_type{type(spv::CooperativeMatrixUse::MatrixAKHR)};
+    const Id b_type{type(spv::CooperativeMatrixUse::MatrixBKHR)};
+    const Id c_type{type(spv::CooperativeMatrixUse::MatrixAccumulatorKHR)};
+
+    const Id fn_type{ctx.TypeFunction(ctx.U32[2], ctx.U32[4], ctx.U32[2], ctx.U32[2])};
+    const Id fn{ctx.OpFunction(ctx.U32[2], spv::FunctionControlMask::DontInline, fn_type)};
+    ctx.wmma16_function = fn;
+    const Id matrix_a{ctx.OpFunctionParameter(ctx.U32[4])};
+    const Id matrix_b{ctx.OpFunctionParameter(ctx.U32[2])};
+    const Id matrix_c{ctx.OpFunctionParameter(ctx.U32[2])};
+    ctx.AddLabel();
+    const Id lane{ctx.OpBitwiseAnd(u32ty, ctx.OpLoad(u32ty, ctx.subgroup_local_invocation_id), imm(31))};
+    const Id base{ctx.OpIMul(u32ty, ctx.OpLoad(u32ty, subgroup_id), imm(mma_wmma16_tile_words))};
+    const Id g{ctx.OpShiftRightLogical(u32ty, lane, imm(2))};
+    const Id i{ctx.OpBitwiseAnd(u32ty, lane, imm(3))};
+    // the word of row (or column) g (+8) at word i (+4) of a region
+    const auto word = [&](u32 region, u32 plus_rows, u32 plus_words) {
+        return add(add(base, imm(region * 128 + plus_rows * 8 + plus_words)),
+                   add(ctx.OpShiftLeftLogical(u32ty, g, imm(3)), i));
+    };
+    const Id zero{ctx.u32_zero_value};
+    const auto part = [&](Id words, u32 index) { return ctx.OpCompositeExtract(u32ty, words, index); };
+    constexpr u32 region_a = 0, region_b_lo = 1, region_b_hi = 2, region_c = 3;
+    // Wait for any trailing region_c reads from a prior WMMA16 helper before writing region_c.
+    barrier();
+    store(word(region_a, 0, 0), part(matrix_a, 0));
+    store(word(region_a, 8, 0), part(matrix_a, 1));
+    store(word(region_a, 0, 4), part(matrix_a, 2));
+    store(word(region_a, 8, 4), part(matrix_a, 3));
+    store(word(region_b_lo, 0, 0), part(matrix_b, 0));
+    store(word(region_b_lo, 0, 4), mma_wmma16_fast ? part(matrix_b, 1) : zero);
+    store(word(region_b_lo, 8, 0), zero);
+    store(word(region_b_lo, 8, 4), zero);
+    if (!mma_wmma16_fast) {
+        store(word(region_b_hi, 0, 0), zero);
+        store(word(region_b_hi, 0, 4), part(matrix_b, 1));
+        store(word(region_b_hi, 8, 0), zero);
+        store(word(region_b_hi, 8, 4), zero);
+    }
+    store(word(region_c, 0, 0), part(matrix_c, 0));
+    store(word(region_c, 8, 0), part(matrix_c, 1));
+    store(word(region_c, 0, 4), zero);
+    store(word(region_c, 8, 4), zero);
+    barrier();
+    const Id row_major{imm(0)}, column_major{imm(1)}, stride{imm(8)};
+    const auto tile = [&](Id matrix_type, u32 region, Id layout) {
+        return ctx.OpCooperativeMatrixLoadKHR(matrix_type, at(add(base, imm(region * 128))), layout, stride,
+                                              spv::MemoryAccessMask::NonPrivatePointer);
+    };
+    const Id a{tile(a_type, region_a, row_major)};
+    Id d{ctx.OpCooperativeMatrixMulAddKHR(c_type, a, tile(b_type, region_b_lo, column_major),
+                                           tile(c_type, region_c, row_major))};
+    if (!mma_wmma16_fast)
+        d = ctx.OpCooperativeMatrixMulAddKHR(c_type, a, tile(b_type, region_b_hi, column_major), d);
+    barrier();
+    ctx.OpCooperativeMatrixStoreKHR(at(add(base, imm(region_c * 128))), d, row_major, stride,
+                                    spv::MemoryAccessMask::NonPrivatePointer);
+    barrier();
+    const Id d0{load(word(region_c, 0, 0))};
+    const Id d1{load(word(region_c, 8, 0))};
+    ctx.OpReturnValue(ctx.OpCompositeConstruct(ctx.U32[2], d0, d1));
+    ctx.OpFunctionEnd();
+    return true;
+}
+
+// (longshot, AMD RDNA 3/3.5/4) Fused WMMA16 N-pair, zero-C, quad-A, and K-chain DontInline helpers + planner.
+// Zero-C pairs skip region_c LDS stores/loads via OpCompositeConstruct(c_type, f16_zero) and cut barriers from 4 to 2.
+// Quad-A fuses two zero-C pairs sharing canonical A, keeping A in a cooperative matrix register across both pairs.
+// K-chain fuses a zero-C producer pair into its consuming accumulator pair, keeping the accumulator in registers.
+void DefineWmma16PairFunction(EmitContext& ctx, const IR::Program& program) {
+    if (ctx.interfaces.size() < 2) return;
+    auto& fs = ctx.wmma16_fused;
+
+    struct CanonKey4 {
+        std::array<uintptr_t, 4> e{};
+        bool operator==(const CanonKey4&) const = default;
+    };
+    struct CanonKey4Hash {
+        size_t operator()(const CanonKey4& k) const noexcept {
+            size_t h = 0;
+            for (uintptr_t v : k.e) h ^= std::hash<uintptr_t>{}(v) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            return h;
         }
-        for (u32 row = 0; row < 2; ++row) {
-            const Id c = unpack(inputs[6 + row]);
-            for (u32 col = 0; col < 2; ++col)
-                ctx.OpStore(accumulators[row * 2 + col], ctx.OpCompositeExtract(f32ty, c, col));
+    };
+    const auto encode_val = [](IR::Value v) -> uintptr_t {
+        v = v.Resolve();
+        if (v.IsEmpty()) return 0u;
+        if (v.IsImmediate()) return (static_cast<uintptr_t>(v.U32()) << 2) | 1u;
+        return reinterpret_cast<uintptr_t>(v.Inst());
+    };
+    const auto canon_a = [&](IR::Value a) -> CanonKey4 {
+        a = a.Resolve();
+        if (!a.IsEmpty() && !a.IsImmediate() && a.Inst()->GetOpcode() == IR::Opcode::CompositeConstructU32x4) {
+            const IR::Inst* cc = a.Inst();
+            return CanonKey4{{encode_val(cc->Arg(0)), encode_val(cc->Arg(1)), encode_val(cc->Arg(2)), encode_val(cc->Arg(3))}};
         }
-        ctx.OpStore(counter, imm(0));
-        const Id lane = ctx.OpLoad(u32ty, ctx.subgroup_local_invocation_id);
-        const Id warp_base = and_(lane, ~31U);
-        const Id row_base = and_(lane, 28);
-        const Id col_base = ctx.OpShiftLeftLogical(u32ty, and_(lane, 3), imm(3));
-        const Id header = ctx.OpLabel(), body = ctx.OpLabel(), next = ctx.OpLabel(), end = ctx.OpLabel();
-        ctx.OpBranch(header);
-        ctx.AddLabel(header);
-        const Id pair = ctx.OpLoad(u32ty, counter);
-        const Id more = ctx.OpULessThan(ctx.U1, pair, imm(variant ? 8 : 4));
-        ctx.OpLoopMerge(end, next, spv::LoopControlMask::DontUnroll);
-        ctx.OpBranchConditional(more, body, end);
-        ctx.AddLabel(body);
-        const Id upper = ctx.OpUGreaterThanEqual(ctx.U1, pair, imm(4));
-        const Id component = and_(pair, 3);
-        const Id a_lane = add(warp_base, add(row_base, component));
-        const Id b_lane = add(warp_base, add(col_base, component));
-        const Id b = ctx.OpSelect(u32ty, upper, inputs[5], inputs[4]);
-        std::array<Id, 2> bs;
-        for (u32 col = 0; col < 2; ++col)
-            bs[col] = unpack(ctx.OpGroupNonUniformShuffle(u32ty, imm(3), b,
-                                                          add(b_lane, imm(col * 4))));
-        const Id round_now = ctx.OpIEqual(ctx.U1, component, imm(3));
-        for (u32 row = 0; row < 2; ++row) {
-            const Id a = ctx.OpSelect(u32ty, upper, inputs[row + 2], inputs[row]);
-            const Id as = unpack(ctx.OpGroupNonUniformShuffle(u32ty, imm(3), a, a_lane));
-            for (u32 col = 0; col < 2; ++col) {
-                Id value = ctx.OpLoad(f32ty, accumulators[row * 2 + col]);
-                for (u32 half = 0; half < 2; ++half) {
-                    value = ctx.OpFma(f32ty, ctx.OpCompositeExtract(f32ty, as, half),
-                                      ctx.OpCompositeExtract(f32ty, bs[col], half), value);
-                    ctx.Decorate(value, spv::Decoration::NoContraction);
+        return CanonKey4{{encode_val(a), 0, 0, 0}};
+    };
+    const auto is_zero_c = [](IR::Value c) -> bool {
+        c = c.Resolve();
+        if (c.IsEmpty()) return false;
+        if (c.IsImmediate()) return c.U32() == 0;
+        const IR::Inst* inst = c.Inst();
+        if (inst->GetOpcode() != IR::Opcode::CompositeConstructU32x2) return false;
+        const IR::Value c0 = inst->Arg(0).Resolve(), c1 = inst->Arg(1).Resolve();
+        return !c0.IsEmpty() && c0.IsImmediate() && c0.U32() == 0 &&
+               !c1.IsEmpty() && c1.IsImmediate() && c1.U32() == 0;
+    };
+    const auto c_src_mma = [](IR::Value c) -> IR::Inst* {
+        c = c.Resolve();
+        if (c.IsEmpty() || c.IsImmediate()) return nullptr;
+        IR::Inst* inst = c.Inst();
+        if (inst->GetOpcode() == IR::Opcode::MatrixMulAddF16) return inst;
+        if (inst->GetOpcode() != IR::Opcode::CompositeConstructU32x2) return nullptr;
+        IR::Inst* src = nullptr;
+        for (u32 idx = 0; idx < 2; ++idx) {
+            const IR::Value e = inst->Arg(idx).Resolve();
+            if (e.IsEmpty() || e.IsImmediate()) return nullptr;
+            IR::Inst* ei = e.Inst();
+            if (ei->GetOpcode() != IR::Opcode::CompositeExtractU32x2) return nullptr;
+            const IR::Value k = ei->Arg(1).Resolve();
+            if (k.IsEmpty() || !k.IsImmediate() || k.U32() != idx) return nullptr;
+            const IR::Value m = ei->Arg(0).Resolve();
+            if (m.IsEmpty() || m.IsImmediate() || m.Inst()->GetOpcode() != IR::Opcode::MatrixMulAddF16) return nullptr;
+            if (src && src != m.Inst()) return nullptr;
+            src = m.Inst();
+        }
+        return src;
+    };
+    const auto is_seg_barrier = [](IR::Opcode op) -> bool {
+        return op == IR::Opcode::Barrier || op == IR::Opcode::WorkgroupMemoryBarrier ||
+               op == IR::Opcode::DeviceMemoryBarrier;
+    };
+
+    std::unordered_map<const IR::Inst*, u32> global_uses;
+    for (IR::Block* const blk : program.blocks) {
+        for (IR::Inst& inst : blk->Instructions()) {
+            const size_t nargs = inst.NumArgs();
+            for (size_t k = 0; k < nargs; ++k) {
+                const IR::Value v = inst.Arg(k);
+                if (!v.IsEmpty() && !v.IsImmediate()) {
+                    ++global_uses[v.Inst()];
                 }
-                ctx.OpStore(accumulators[row * 2 + col], value);
             }
         }
-        // HMMA.F16 rounds after each K=8 group, including the midpoint of K=16.
-        // OpSelect evaluates both operands: keep the expensive half conversion in
-        // a branch so the other three pairs do no rounding work. The counter is
-        // identical in every participating lane and all shuffles precede this branch.
-        const Id round_block = ctx.OpLabel(), round_merge = ctx.OpLabel();
-        ctx.OpSelectionMerge(round_merge, spv::SelectionControlMask::DontFlatten);
-        ctx.OpBranchConditional(round_now, round_block, round_merge);
-        ctx.AddLabel(round_block);
-        for (const Id accumulator : accumulators) {
-            ctx.OpStore(accumulator, round_half(ctx.OpLoad(f32ty, accumulator)));
+    }
+
+    u32 next_a_id = 1;
+    for (IR::Block* const block : program.blocks) {
+        std::unordered_map<const IR::Inst*, u32> inst_pos;
+        std::unordered_map<const IR::Inst*, u32> inst_seg;
+        std::unordered_map<const IR::Inst*, std::vector<IR::Inst*>> uses;
+        std::vector<IR::Inst*> mmas;
+        u32 pos = 0, seg = 0;
+        for (IR::Inst& inst : block->Instructions()) {
+            inst_pos[&inst] = pos++;
+            inst_seg[&inst] = seg;
+            if (is_seg_barrier(inst.GetOpcode())) ++seg;
+            const size_t nargs = inst.NumArgs();
+            for (size_t k = 0; k < nargs; ++k) {
+                const IR::Value v = inst.Arg(k);
+                if (!v.IsEmpty() && !v.IsImmediate()) {
+                    uses[v.Inst()].push_back(&inst);
+                }
+            }
+            if (inst.GetOpcode() == IR::Opcode::MatrixMulAddF16) mmas.push_back(&inst);
         }
-        ctx.OpBranch(round_merge);
-        ctx.AddLabel(round_merge);
-        ctx.OpBranch(next);
-        ctx.AddLabel(next);
-        ctx.OpStore(counter, add(pair, imm(1)));
-        ctx.OpBranch(header);
-        ctx.AddLabel(end);
-        std::array<Id, 2> packed;
-        for (u32 row = 0; row < 2; ++row)
-            packed[row] = ctx.OpPackHalf2x16(u32ty, ctx.OpCompositeConstruct(ctx.F32[2],
-                ctx.OpLoad(f32ty, accumulators[row * 2]), ctx.OpLoad(f32ty, accumulators[row * 2 + 1])));
-        ctx.OpReturnValue(ctx.OpCompositeConstruct(ctx.U32[2], packed[0], packed[1]));
+        if (mmas.size() < 2) continue;
+
+        auto collect_defer = [&](IR::Inst* root, u32 limit_pos, std::vector<IR::Inst*>& out,
+                                 std::unordered_set<const IR::Inst*>& seen) -> bool {
+            bool ok = true;
+            auto dfs = [&](auto& self, IR::Inst* node) -> void {
+                auto it = uses.find(node);
+                if (it == uses.end()) return;
+                for (IR::Inst* u : it->second) {
+                    const bool pure = (u->GetOpcode() == IR::Opcode::CompositeExtractU32x2 && node == root) ||
+                                      (u->GetOpcode() == IR::Opcode::Identity && node != root);
+                    if (pure) {
+                        if (inst_pos[u] < limit_pos && seen.insert(u).second) out.push_back(u);
+                        self(self, u);
+                    } else if (inst_pos[u] <= limit_pos) {
+                        ok = false;
+                    }
+                }
+            };
+            dfs(dfs, root);
+            return ok;
+        };
+
+        auto has_no_external_uses = [&](const IR::Inst* node) -> bool {
+            const auto git = global_uses.find(node);
+            const u32 g = git == global_uses.end() ? 0u : git->second;
+            const auto lit = uses.find(node);
+            const u32 l = lit == uses.end() ? 0u : static_cast<u32>(lit->second.size());
+            return g == l;
+        };
+
+        auto is_pure_k_feed = [&](IR::Inst* prod, IR::Inst* cons, std::vector<IR::Inst*>& dead_chain) -> bool {
+            if (!has_no_external_uses(prod)) return false;
+            const IR::Value cv = cons->Arg(2).Resolve();
+            if (cv.IsEmpty() || cv.IsImmediate()) return false;
+            IR::Inst* const c_node = cv.Inst();
+            if (c_node == prod) {
+                auto it = uses.find(prod);
+                return it != uses.end() && it->second.size() == 1 && it->second[0] == cons;
+            }
+            if (c_node->GetOpcode() != IR::Opcode::CompositeConstructU32x2) return false;
+            if (!has_no_external_uses(c_node)) return false;
+            auto cit = uses.find(c_node);
+            if (cit == uses.end() || cit->second.size() != 1 || cit->second[0] != cons) return false;
+            bool ok = true;
+            std::unordered_set<const IR::Inst*> seen;
+            auto dfs = [&](auto& self, IR::Inst* node) -> void {
+                if (!has_no_external_uses(node)) {
+                    ok = false;
+                    return;
+                }
+                auto it = uses.find(node);
+                if (it == uses.end()) return;
+                for (IR::Inst* u : it->second) {
+                    if (u == c_node) continue;
+                    const bool pure = (u->GetOpcode() == IR::Opcode::CompositeExtractU32x2 && node == prod) ||
+                                      (u->GetOpcode() == IR::Opcode::Identity && node != prod);
+                    if (pure) {
+                        if (seen.insert(u).second) dead_chain.push_back(u);
+                        self(self, u);
+                    } else {
+                        ok = false;
+                    }
+                }
+            };
+            dfs(dfs, prod);
+            if (ok) dead_chain.push_back(c_node);
+            return ok;
+        };
+
+        std::unordered_map<CanonKey4, u32, CanonKey4Hash> a_ids;
+        std::unordered_map<u64, std::vector<IR::Inst*>> groups;
+        std::vector<u64> group_order;
+        for (IR::Inst* m : mmas) {
+            const CanonKey4 ck = canon_a(m->Arg(0));
+            auto [it, ins] = a_ids.emplace(ck, next_a_id);
+            if (ins) ++next_a_id;
+            const u64 gk = (static_cast<u64>(inst_seg[m]) << 32) | it->second;
+            auto& vec = groups[gk];
+            if (vec.empty()) group_order.push_back(gk);
+            vec.push_back(m);
+        }
+
+        struct PlannedPair {
+            u64 gk{};
+            u32 seg{};
+            IR::Inst* m0{};
+            IR::Inst* m1{};
+            bool zero_c{};
+            bool consumed{};
+            std::vector<IR::Inst*> deferred;
+        };
+        std::vector<PlannedPair> pairs;
+        std::unordered_map<const IR::Inst*, size_t> pair_of_m0;
+
+        for (u64 gk : group_order) {
+            const auto& grp = groups[gk];
+            size_t idx = 0;
+            while (idx + 1 < grp.size()) {
+                IR::Inst* m0 = grp[idx];
+                IR::Inst* m1 = grp[idx + 1];
+                std::vector<IR::Inst*> to_defer;
+                std::unordered_set<const IR::Inst*> seen_defer;
+                if (!collect_defer(m0, inst_pos[m1], to_defer, seen_defer)) {
+                    ++idx;
+                    continue;
+                }
+                std::sort(to_defer.begin(), to_defer.end(),
+                          [&](const IR::Inst* a, const IR::Inst* b) { return inst_pos[a] < inst_pos[b]; });
+                const bool zc = is_zero_c(m0->Arg(2)) && is_zero_c(m1->Arg(2));
+                pair_of_m0[m0] = pairs.size();
+                pairs.push_back({gk, inst_seg[m0], m0, m1, zc, false, std::move(to_defer)});
+                idx += 2;
+            }
+        }
+
+        // Pass 1: Fuse pure 2-step K-chains (zero-C producer pair -> consuming accumulator pair) into PairK2ZeroC.
+        for (size_t ci = 0; ci < pairs.size(); ++ci) {
+            auto& cp = pairs[ci];
+            if (cp.consumed || cp.zero_c) continue;
+            IR::Inst* const p0 = c_src_mma(cp.m0->Arg(2));
+            IR::Inst* const p1 = c_src_mma(cp.m1->Arg(2));
+            if (!p0 || !p1) continue;
+            auto pit = pair_of_m0.find(p0);
+            if (pit == pair_of_m0.end()) continue;
+            auto& pp = pairs[pit->second];
+            if (pp.consumed || !pp.zero_c || pp.m1 != p1 || pp.seg != cp.seg) continue;
+            std::vector<IR::Inst*> dead_chain;
+            if (!is_pure_k_feed(p0, cp.m0, dead_chain) || !is_pure_k_feed(p1, cp.m1, dead_chain)) continue;
+
+            pp.consumed = true;
+            cp.consumed = true;
+            for (IR::Inst* d : dead_chain) fs.skip_insts.insert(d);
+            for (IR::Inst* d : cp.deferred) fs.skip_insts.insert(d);
+            for (IR::Inst* sk_m : {p0, p1, cp.m0}) {
+                EmitContext::Wmma16Step sk{};
+                sk.kind = EmitContext::Wmma16Step::Kind::Skip;
+                fs.steps[sk_m] = std::move(sk);
+            }
+            EmitContext::Wmma16Step st{};
+            st.kind = EmitContext::Wmma16Step::Kind::PairK2ZeroC;
+            st.m0 = p0;
+            st.m1 = p1;
+            st.m2 = cp.m0;
+            st.m3 = cp.m1;
+            st.deferred_extracts = std::move(cp.deferred);
+            fs.steps[cp.m1] = std::move(st);
+        }
+
+        // Pass 2: Fuse adjacent unconsumed zero-C pairs sharing canonical A into QuadZeroC.
+        for (size_t i = 0; i + 1 < pairs.size(); ++i) {
+            auto& p0 = pairs[i];
+            auto& p1 = pairs[i + 1];
+            if (p0.consumed || p1.consumed || !p0.zero_c || !p1.zero_c || p0.gk != p1.gk) continue;
+            std::vector<IR::Inst*> to_defer;
+            std::unordered_set<const IR::Inst*> seen_defer;
+            const u32 lim = inst_pos[p1.m1];
+            if (!collect_defer(p0.m0, lim, to_defer, seen_defer) ||
+                !collect_defer(p0.m1, lim, to_defer, seen_defer) ||
+                !collect_defer(p1.m0, lim, to_defer, seen_defer)) {
+                continue;
+            }
+            std::sort(to_defer.begin(), to_defer.end(),
+                      [&](const IR::Inst* a, const IR::Inst* b) { return inst_pos[a] < inst_pos[b]; });
+            p0.consumed = true;
+            p1.consumed = true;
+            for (IR::Inst* d : to_defer) fs.skip_insts.insert(d);
+            for (IR::Inst* sk_m : {p0.m0, p0.m1, p1.m0}) {
+                EmitContext::Wmma16Step sk{};
+                sk.kind = EmitContext::Wmma16Step::Kind::Skip;
+                fs.steps[sk_m] = std::move(sk);
+            }
+            EmitContext::Wmma16Step st{};
+            st.kind = EmitContext::Wmma16Step::Kind::QuadZeroC;
+            st.m0 = p0.m0;
+            st.m1 = p0.m1;
+            st.m2 = p1.m0;
+            st.m3 = p1.m1;
+            st.deferred_extracts = std::move(to_defer);
+            fs.steps[p1.m1] = std::move(st);
+            ++i;
+        }
+
+        // Pass 3: Remaining pairs -> PairZeroC or Pair.
+        for (auto& p : pairs) {
+            if (p.consumed) continue;
+            for (IR::Inst* d : p.deferred) fs.skip_insts.insert(d);
+            EmitContext::Wmma16Step sk{};
+            sk.kind = EmitContext::Wmma16Step::Kind::Skip;
+            sk.m0 = p.m0;
+            sk.m1 = p.m1;
+            fs.steps[p.m0] = std::move(sk);
+
+            EmitContext::Wmma16Step st{};
+            st.kind = p.zero_c ? EmitContext::Wmma16Step::Kind::PairZeroC : EmitContext::Wmma16Step::Kind::Pair;
+            st.m0 = p.m0;
+            st.m1 = p.m1;
+            st.deferred_extracts = std::move(p.deferred);
+            fs.steps[p.m1] = std::move(st);
+        }
+    }
+
+    if (fs.steps.empty()) return;
+
+    const Id scratch{ctx.interfaces[ctx.interfaces.size() - 2]};
+    const Id subgroup_id{ctx.interfaces.back()};
+    const bool explicit_layout = ctx.uses_explicit_workgroup_layout && program.shared_memory_size != 0;
+
+    const Id u32ty{ctx.U32[1]};
+    const Id word_pointer{ctx.TypePointer(spv::StorageClass::Workgroup, u32ty)};
+    const auto imm = [&](u32 v) { return ctx.Const(v); };
+    const auto add = [&](Id a, Id b) { return ctx.OpIAdd(u32ty, a, b); };
+    const auto at = [&](Id index) {
+        return explicit_layout ? ctx.OpAccessChain(word_pointer, scratch, ctx.u32_zero_value, index)
+                               : ctx.OpAccessChain(word_pointer, scratch, index);
+    };
+    const auto store = [&](Id index, Id value) { ctx.OpStore(at(index), value, spv::MemoryAccessMask::NonPrivatePointer); };
+    const auto load = [&](Id index) { return ctx.OpLoad(u32ty, at(index), spv::MemoryAccessMask::NonPrivatePointer); };
+    const Id subgroup_scope{imm(static_cast<u32>(spv::Scope::Subgroup))};
+    const auto barrier = [&] {
+        ctx.OpControlBarrier(subgroup_scope, subgroup_scope,
+                             imm(static_cast<u32>(spv::MemorySemanticsMask::AcquireRelease |
+                                                  spv::MemorySemanticsMask::WorkgroupMemory |
+                                                  spv::MemorySemanticsMask::MakeAvailable |
+                                                  spv::MemorySemanticsMask::MakeVisible)));
+    };
+    const Id f16{ctx.F16[1]};
+    const auto type = [&](spv::CooperativeMatrixUse use) {
+        return ctx.TypeCooperativeMatrixKHR(f16, subgroup_scope, imm(16), imm(16), imm(static_cast<u32>(use)));
+    };
+    const Id a_type{type(spv::CooperativeMatrixUse::MatrixAKHR)};
+    const Id b_type{type(spv::CooperativeMatrixUse::MatrixBKHR)};
+    const Id c_type{type(spv::CooperativeMatrixUse::MatrixAccumulatorKHR)};
+    const Id f16_zero{ctx.Constant(f16, 0U)};
+    const Id zero{ctx.u32_zero_value};
+    const Id row_major{imm(0)}, column_major{imm(1)}, stride{imm(8)};
+    const auto part = [&](Id words, u32 index) { return ctx.OpCompositeExtract(u32ty, words, index); };
+    constexpr u32 region_a = 0, region_b_lo = 1, region_b_hi = 2, region_c = 3;
+
+    fs.active = true;
+
+    const auto emit_addr_setup = [&] {
+        const Id plane{ctx.OpBitwiseAnd(u32ty, ctx.OpLoad(u32ty, ctx.subgroup_local_invocation_id), imm(31))};
+        const Id pbase{ctx.OpIMul(u32ty, ctx.OpLoad(u32ty, subgroup_id), imm(mma_wmma16_tile_words))};
+        const Id pg{ctx.OpShiftRightLogical(u32ty, plane, imm(2))};
+        const Id pi{ctx.OpBitwiseAnd(u32ty, plane, imm(3))};
+        const Id pgi{add(ctx.OpShiftLeftLogical(u32ty, pg, imm(3)), pi)};
+        return std::pair{pbase, pgi};
+    };
+    const auto emit_store_a = [&](Id pbase, Id pgi, Id pa) {
+        const auto pword = [&](u32 region, u32 plus_rows, u32 plus_words) {
+            return add(add(pbase, imm(region * 128 + plus_rows * 8 + plus_words)), pgi);
+        };
+        store(pword(region_a, 0, 0), part(pa, 0));
+        store(pword(region_a, 8, 0), part(pa, 1));
+        store(pword(region_a, 0, 4), part(pa, 2));
+        store(pword(region_a, 8, 4), part(pa, 3));
+    };
+    const auto emit_store_b = [&](Id pbase, Id pgi, Id pb0, Id pb1) {
+        const auto pword = [&](u32 region, u32 plus_rows, u32 plus_words) {
+            return add(add(pbase, imm(region * 128 + plus_rows * 8 + plus_words)), pgi);
+        };
+        if (mma_wmma16_fast) {
+            store(pword(region_b_lo, 0, 0), part(pb0, 0));
+            store(pword(region_b_lo, 0, 4), part(pb0, 1));
+            store(pword(region_b_lo, 8, 0), part(pb1, 0));
+            store(pword(region_b_lo, 8, 4), part(pb1, 1));
+        } else {
+            store(pword(region_b_lo, 0, 0), part(pb0, 0));
+            store(pword(region_b_lo, 0, 4), zero);
+            store(pword(region_b_lo, 8, 0), part(pb1, 0));
+            store(pword(region_b_lo, 8, 4), zero);
+            store(pword(region_b_hi, 0, 0), zero);
+            store(pword(region_b_hi, 0, 4), part(pb0, 1));
+            store(pword(region_b_hi, 8, 0), zero);
+            store(pword(region_b_hi, 8, 4), part(pb1, 1));
+        }
+    };
+    const auto emit_load_d = [&](Id pbase, Id pgi) {
+        const auto pw = [&](u32 plus_rows, u32 plus_words) {
+            return add(add(pbase, imm(region_c * 128 + plus_rows * 8 + plus_words)), pgi);
+        };
+        const Id d0_0{load(pw(0, 0))};
+        const Id d0_1{load(pw(8, 0))};
+        const Id d1_0{load(pw(0, 4))};
+        const Id d1_1{load(pw(8, 4))};
+        return ctx.OpCompositeConstruct(ctx.U32[4], d0_0, d0_1, d1_0, d1_1);
+    };
+    const auto ptile = [&](Id pbase, Id matrix_type, u32 region, Id layout) {
+        return ctx.OpCooperativeMatrixLoadKHR(matrix_type, at(add(pbase, imm(region * 128))), layout, stride,
+                                              spv::MemoryAccessMask::NonPrivatePointer);
+    };
+
+    // 1. General N-pair with non-zero C: pair_fn(a, b0, b1, c0, c1) -> U32[4]
+    {
+        const Id fn_type{ctx.TypeFunction(ctx.U32[4], ctx.U32[4], ctx.U32[2], ctx.U32[2], ctx.U32[2], ctx.U32[2])};
+        fs.pair_fn = ctx.OpFunction(ctx.U32[4], spv::FunctionControlMask::DontInline, fn_type);
+        const Id pa{ctx.OpFunctionParameter(ctx.U32[4])};
+        const Id pb0{ctx.OpFunctionParameter(ctx.U32[2])};
+        const Id pb1{ctx.OpFunctionParameter(ctx.U32[2])};
+        const Id pc0{ctx.OpFunctionParameter(ctx.U32[2])};
+        const Id pc1{ctx.OpFunctionParameter(ctx.U32[2])};
+        ctx.AddLabel();
+        const auto [pbase, pgi] = emit_addr_setup();
+        barrier();
+        emit_store_a(pbase, pgi, pa);
+        emit_store_b(pbase, pgi, pb0, pb1);
+        const auto pword = [&](u32 region, u32 plus_rows, u32 plus_words) {
+            return add(add(pbase, imm(region * 128 + plus_rows * 8 + plus_words)), pgi);
+        };
+        store(pword(region_c, 0, 0), part(pc0, 0));
+        store(pword(region_c, 8, 0), part(pc0, 1));
+        store(pword(region_c, 0, 4), part(pc1, 0));
+        store(pword(region_c, 8, 4), part(pc1, 1));
+        barrier();
+        const Id pa_mat{ptile(pbase, a_type, region_a, row_major)};
+        Id pd{ctx.OpCooperativeMatrixMulAddKHR(c_type, pa_mat, ptile(pbase, b_type, region_b_lo, column_major),
+                                               ptile(pbase, c_type, region_c, row_major))};
+        if (!mma_wmma16_fast)
+            pd = ctx.OpCooperativeMatrixMulAddKHR(c_type, pa_mat, ptile(pbase, b_type, region_b_hi, column_major), pd);
+        barrier();
+        ctx.OpCooperativeMatrixStoreKHR(at(add(pbase, imm(region_c * 128))), pd, row_major, stride,
+                                        spv::MemoryAccessMask::NonPrivatePointer);
+        barrier();
+        ctx.OpReturnValue(emit_load_d(pbase, pgi));
         ctx.OpFunctionEnd();
+    }
+
+    // 2. Zero-C N-pair: pair_zero_c_fn(a, b0, b1) -> U32[4] (2 barriers, no C LDS store/load)
+    {
+        const Id fn_type{ctx.TypeFunction(ctx.U32[4], ctx.U32[4], ctx.U32[2], ctx.U32[2])};
+        fs.pair_zero_c_fn = ctx.OpFunction(ctx.U32[4], spv::FunctionControlMask::DontInline, fn_type);
+        const Id pa{ctx.OpFunctionParameter(ctx.U32[4])};
+        const Id pb0{ctx.OpFunctionParameter(ctx.U32[2])};
+        const Id pb1{ctx.OpFunctionParameter(ctx.U32[2])};
+        ctx.AddLabel();
+        const Id null_c{ctx.OpCompositeConstruct(c_type, f16_zero)};
+        const auto [pbase, pgi] = emit_addr_setup();
+        emit_store_a(pbase, pgi, pa);
+        emit_store_b(pbase, pgi, pb0, pb1);
+        barrier();
+        const Id pa_mat{ptile(pbase, a_type, region_a, row_major)};
+        Id pd{ctx.OpCooperativeMatrixMulAddKHR(c_type, pa_mat, ptile(pbase, b_type, region_b_lo, column_major), null_c)};
+        if (!mma_wmma16_fast)
+            pd = ctx.OpCooperativeMatrixMulAddKHR(c_type, pa_mat, ptile(pbase, b_type, region_b_hi, column_major), pd);
+        ctx.OpCooperativeMatrixStoreKHR(at(add(pbase, imm(region_c * 128))), pd, row_major, stride,
+                                        spv::MemoryAccessMask::NonPrivatePointer);
+        barrier();
+        ctx.OpReturnValue(emit_load_d(pbase, pgi));
+        ctx.OpFunctionEnd();
+    }
+
+    // 3. Zero-C Quad-A: quad_zero_c_fn(a, b0, b1, b2, b3) -> {U32[4], U32[4]} (keeps A in cooperative matrix VGPRs)
+    fs.quad_ret_type = ctx.TypeStruct(ctx.U32[4], ctx.U32[4]);
+    {
+        const Id fn_type{ctx.TypeFunction(fs.quad_ret_type, ctx.U32[4], ctx.U32[2], ctx.U32[2], ctx.U32[2], ctx.U32[2])};
+        fs.quad_zero_c_fn = ctx.OpFunction(fs.quad_ret_type, spv::FunctionControlMask::DontInline, fn_type);
+        const Id pa{ctx.OpFunctionParameter(ctx.U32[4])};
+        const Id pb0{ctx.OpFunctionParameter(ctx.U32[2])};
+        const Id pb1{ctx.OpFunctionParameter(ctx.U32[2])};
+        const Id pb2{ctx.OpFunctionParameter(ctx.U32[2])};
+        const Id pb3{ctx.OpFunctionParameter(ctx.U32[2])};
+        ctx.AddLabel();
+        const Id null_c{ctx.OpCompositeConstruct(c_type, f16_zero)};
+        const auto [pbase, pgi] = emit_addr_setup();
+        emit_store_a(pbase, pgi, pa);
+        emit_store_b(pbase, pgi, pb0, pb1);
+        barrier();
+        const Id pa_mat{ptile(pbase, a_type, region_a, row_major)};
+        Id pd0{ctx.OpCooperativeMatrixMulAddKHR(c_type, pa_mat, ptile(pbase, b_type, region_b_lo, column_major), null_c)};
+        if (!mma_wmma16_fast)
+            pd0 = ctx.OpCooperativeMatrixMulAddKHR(c_type, pa_mat, ptile(pbase, b_type, region_b_hi, column_major), pd0);
+        ctx.OpCooperativeMatrixStoreKHR(at(add(pbase, imm(region_c * 128))), pd0, row_major, stride,
+                                        spv::MemoryAccessMask::NonPrivatePointer);
+        barrier();
+        const Id res0{emit_load_d(pbase, pgi)};
+        emit_store_b(pbase, pgi, pb2, pb3);
+        barrier();
+        Id pd1{ctx.OpCooperativeMatrixMulAddKHR(c_type, pa_mat, ptile(pbase, b_type, region_b_lo, column_major), null_c)};
+        if (!mma_wmma16_fast)
+            pd1 = ctx.OpCooperativeMatrixMulAddKHR(c_type, pa_mat, ptile(pbase, b_type, region_b_hi, column_major), pd1);
+        ctx.OpCooperativeMatrixStoreKHR(at(add(pbase, imm(region_c * 128))), pd1, row_major, stride,
+                                        spv::MemoryAccessMask::NonPrivatePointer);
+        barrier();
+        const Id res1{emit_load_d(pbase, pgi)};
+        ctx.OpReturnValue(ctx.OpCompositeConstruct(fs.quad_ret_type, res0, res1));
+        ctx.OpFunctionEnd();
+    }
+
+    // 4. Zero-C 2-step K-chain pair: pair_k2_zero_c_fn(a0, b00, b01, a1, b10, b11) -> U32[4]
+    // Keeps the intermediate K-step accumulator in cooperative matrix VGPRs (eliminates intermediate CoopStore/load/C-store/CoopLoad).
+    {
+        const Id fn_type{ctx.TypeFunction(ctx.U32[4], ctx.U32[4], ctx.U32[2], ctx.U32[2], ctx.U32[4], ctx.U32[2], ctx.U32[2])};
+        fs.pair_k2_zero_c_fn = ctx.OpFunction(ctx.U32[4], spv::FunctionControlMask::DontInline, fn_type);
+        const Id pa0{ctx.OpFunctionParameter(ctx.U32[4])};
+        const Id pb00{ctx.OpFunctionParameter(ctx.U32[2])};
+        const Id pb01{ctx.OpFunctionParameter(ctx.U32[2])};
+        const Id pa1{ctx.OpFunctionParameter(ctx.U32[4])};
+        const Id pb10{ctx.OpFunctionParameter(ctx.U32[2])};
+        const Id pb11{ctx.OpFunctionParameter(ctx.U32[2])};
+        ctx.AddLabel();
+        const Id null_c{ctx.OpCompositeConstruct(c_type, f16_zero)};
+        const auto [pbase, pgi] = emit_addr_setup();
+        emit_store_a(pbase, pgi, pa0);
+        emit_store_b(pbase, pgi, pb00, pb01);
+        barrier();
+        const Id pa0_mat{ptile(pbase, a_type, region_a, row_major)};
+        Id pd{ctx.OpCooperativeMatrixMulAddKHR(c_type, pa0_mat, ptile(pbase, b_type, region_b_lo, column_major), null_c)};
+        if (!mma_wmma16_fast)
+            pd = ctx.OpCooperativeMatrixMulAddKHR(c_type, pa0_mat, ptile(pbase, b_type, region_b_hi, column_major), pd);
+        barrier();
+        emit_store_a(pbase, pgi, pa1);
+        emit_store_b(pbase, pgi, pb10, pb11);
+        barrier();
+        const Id pa1_mat{ptile(pbase, a_type, region_a, row_major)};
+        pd = ctx.OpCooperativeMatrixMulAddKHR(c_type, pa1_mat, ptile(pbase, b_type, region_b_lo, column_major), pd);
+        if (!mma_wmma16_fast)
+            pd = ctx.OpCooperativeMatrixMulAddKHR(c_type, pa1_mat, ptile(pbase, b_type, region_b_hi, column_major), pd);
+        ctx.OpCooperativeMatrixStoreKHR(at(add(pbase, imm(region_c * 128))), pd, row_major, stride,
+                                        spv::MemoryAccessMask::NonPrivatePointer);
+        barrier();
+        ctx.OpReturnValue(emit_load_d(pbase, pgi));
+        ctx.OpFunctionEnd();
+    }
+}
+
+void EmitMatrixMulAddF16Fused(EmitContext& ctx, IR::Inst* inst) {
+    auto& fs = ctx.wmma16_fused;
+    const auto it = fs.steps.find(inst);
+    if (it == fs.steps.end() || it->second.kind == EmitContext::Wmma16Step::Kind::Single) {
+        const Id res = EmitMatrixMulAddF16(ctx, ctx.Def(inst->Arg(0)), ctx.Def(inst->Arg(1)), ctx.Def(inst->Arg(2)));
+        inst->SetDefinition(res);
+        return;
+    }
+    const auto& step = it->second;
+    if (step.kind == EmitContext::Wmma16Step::Kind::Skip) return;
+
+    const Id u32ty{ctx.U32[1]};
+    const auto unpack_pair = [&](Id packed, IR::Inst* dst0, IR::Inst* dst1) {
+        const Id d0_0{ctx.OpCompositeExtract(u32ty, packed, 0U)};
+        const Id d0_1{ctx.OpCompositeExtract(u32ty, packed, 1U)};
+        const Id d1_0{ctx.OpCompositeExtract(u32ty, packed, 2U)};
+        const Id d1_1{ctx.OpCompositeExtract(u32ty, packed, 3U)};
+        dst0->SetDefinition(ctx.OpCompositeConstruct(ctx.U32[2], d0_0, d0_1));
+        dst1->SetDefinition(ctx.OpCompositeConstruct(ctx.U32[2], d1_0, d1_1));
+    };
+
+    if (step.kind == EmitContext::Wmma16Step::Kind::Pair) {
+        const Id packed{ctx.OpFunctionCall(ctx.U32[4], fs.pair_fn,
+                                           ctx.Def(step.m0->Arg(0)),
+                                           ctx.Def(step.m0->Arg(1)), ctx.Def(step.m1->Arg(1)),
+                                           ctx.Def(step.m0->Arg(2)), ctx.Def(step.m1->Arg(2)))};
+        unpack_pair(packed, step.m0, step.m1);
+    } else if (step.kind == EmitContext::Wmma16Step::Kind::PairZeroC) {
+        const Id packed{ctx.OpFunctionCall(ctx.U32[4], fs.pair_zero_c_fn,
+                                           ctx.Def(step.m0->Arg(0)),
+                                           ctx.Def(step.m0->Arg(1)), ctx.Def(step.m1->Arg(1)))};
+        unpack_pair(packed, step.m0, step.m1);
+    } else if (step.kind == EmitContext::Wmma16Step::Kind::QuadZeroC) {
+        const Id ret{ctx.OpFunctionCall(fs.quad_ret_type, fs.quad_zero_c_fn,
+                                        ctx.Def(step.m0->Arg(0)),
+                                        ctx.Def(step.m0->Arg(1)), ctx.Def(step.m1->Arg(1)),
+                                        ctx.Def(step.m2->Arg(1)), ctx.Def(step.m3->Arg(1)))};
+        unpack_pair(ctx.OpCompositeExtract(ctx.U32[4], ret, 0U), step.m0, step.m1);
+        unpack_pair(ctx.OpCompositeExtract(ctx.U32[4], ret, 1U), step.m2, step.m3);
+    } else if (step.kind == EmitContext::Wmma16Step::Kind::PairK2ZeroC) {
+        const Id packed{ctx.OpFunctionCall(ctx.U32[4], fs.pair_k2_zero_c_fn,
+                                           ctx.Def(step.m0->Arg(0)),
+                                           ctx.Def(step.m0->Arg(1)), ctx.Def(step.m1->Arg(1)),
+                                           ctx.Def(step.m2->Arg(0)),
+                                           ctx.Def(step.m2->Arg(1)), ctx.Def(step.m3->Arg(1)))};
+        unpack_pair(packed, step.m2, step.m3);
+    }
+
+    for (IR::Inst* ext : step.deferred_extracts) {
+        if (ext->GetOpcode() == IR::Opcode::CompositeExtractU32x2) {
+            ext->SetDefinition(ctx.OpCompositeExtract(u32ty, ctx.Def(ext->Arg(0)), ext->Arg(1).U32()));
+        } else if (ext->GetOpcode() == IR::Opcode::Identity) {
+            ext->SetDefinition(ctx.Def(ext->Arg(0)));
+        }
     }
 }
 
@@ -507,7 +1418,9 @@ void DefineSoftwareMatrixFunction(EmitContext& ctx) {
 // lane's fragment registers hold its elements in the console's order (two f16 a word); they go to and come
 // from the device's elements in its own order (mma_layout.h, measured by vk_coopmat.cpp).
 Id EmitMatrixMulAddF16(EmitContext& ctx, Id a, Id b, Id c) {
-    if (mma_software) return ctx.OpFunctionCall(ctx.U32[2], ctx.software_matrix_function, a, b, c);
+    if (ctx.wmma16_function.value != 0) return ctx.OpFunctionCall(ctx.U32[2], ctx.wmma16_function, a, b, c);
+    if (ctx.software_matrix_function.value != 0)
+        return ctx.OpFunctionCall(ctx.U32[2], ctx.software_matrix_function, a, b, c);
     const Id f16{ctx.F16[1]};
     const Id scope{ctx.Const(static_cast<u32>(spv::Scope::Subgroup))};
     const auto type = [&](u32 rows, u32 columns, spv::CooperativeMatrixUse use) {

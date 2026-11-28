@@ -1,0 +1,24 @@
+[package]
+name = "longshot-packager"
+description = "A release's packaging of longshot-builder (docs/dev/reference/releases.md): never shipped"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+build-compile.workspace = true
+build-core.workspace = true
+build-driver.workspace = true
+crc32fast.workspace = true
+release.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+release = { workspace = true, features = ["testkit"] }
+ruzstd.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true

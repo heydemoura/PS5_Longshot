@@ -36,10 +36,15 @@ def main():
 #include <string.h>
 enum { AX_LX, AX_LY, AX_RX, AX_RY };
 static struct { unsigned rested; signed char held[4]; } pads[2];
-static int options[20];
+/* (the Stick range row at 100%: the sticks as the pad reports them, tests/test_stick_range.py has the scaling) */
+enum { HOS_OPT_STICK_RANGE = 77 };
+static int options[HOS_OPT_STICK_RANGE + 1] = {[HOS_OPT_STICK_RANGE] = 100};
 static int rx_option(int id, int fallback) { (void)fallback; return options[id]; }
+typedef long LONG;
+#define InterlockedExchange(p, v) (*(p) = (v))
+static volatile LONG pad_left_raw[2];
 static int16_t hos_sdl_pad_axis(void *gc, int axis) { return ((int16_t *)gc)[axis]; }
-''' + function(hid, "void hos_filter_stick(int16_t x, int16_t y, int zone, int32_t out[2]) {") + r'''
+''' + function(hid, "void hos_filter_stick(int16_t x, int16_t y, int zone, int32_t out[2]) {") +     function(hid, "void hos_stick_range(int percent, int32_t v[4]) {") + r'''
 static void poll(int i, int16_t raw[4], int32_t output[4]) {
     void *gc = raw;
 ''' + pad[start:end] + r'''

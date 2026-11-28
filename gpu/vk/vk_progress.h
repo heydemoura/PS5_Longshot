@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <algorithm>
 #include <string>
@@ -74,7 +75,7 @@ inline std::string left_text(double secs) {
     return b;
 }
 
-/// The version as players see it, from the build's name (nx2/version.py: "<release> (source 1a2b3c4d)"), without the source
+/// The version as players see it, from the build's name (builder/crates/build-compile/src/generated/version.rs: "<release> (source 1a2b3c4d)"), without the source
 /// fingerprint (the log's first line and bug reports keep it): a release as its tag, "v3.0.0" or "v3.0.0-rc.1"; a nightly
 /// ("nightly-46-434712bb") as the launcher names it, "Nightly 46 · 434712bb"; a build between tags ("v3.0.0-rc.1-2-g619c897-dirty",
 /// git describe) as its tag and "dev"; anything else as it is
@@ -149,7 +150,7 @@ struct StartupState {
 };
 
 /// What goes under the bar on the right: the time left while there is work counted, and once all of it is (the bar full, the
-/// start not finished) what the start still does, not "a few seconds left" for as long as that takes (#714)
+/// start not finished) what the start still does, not "a few seconds left" for as long as that takes
 inline std::string waiting_text(const StartupState& s) {
     if (s.saving) return "Saving the pipeline cache";
     const bool counted = s.whole >= 0 ? s.whole >= 1 : s.total && s.done >= s.total;
@@ -208,6 +209,28 @@ struct PrepareBar {
         else f = 1;
         shown = std::max(shown, f);
         return shown;
+    }
+};
+
+/// (longshot) prepare_run's count of the shader programs (PrepareBar's part 0), each at what it costs. The count is still in
+/// programs, as the log and the screen show it ("12,345 / 38,809 shaders"), and is all of them only when all the work is done.
+/// A graphics program is three translations of a few milliseconds; a compute program whose variants the driver compiles (up to 64
+/// of them) takes seconds, on Intel's drivers minutes. Counted one program each, the compute programs, prepared first and about one
+/// in eighteen of the seed, would hold the bar still for as long as they take (0% after 43 minutes on an Intel Arc). Work is counted in thirds of a graphics program
+struct PrepareWork {
+    static constexpr uint64_t kGraphics = 3;       // (a program's translations, one for each of its three bone inputs)
+    static constexpr uint64_t kComputeWarm = 45;   // (a compute program's driver compiles: the cost of fifteen graphics programs)
+    size_t programs = 0;
+    uint64_t whole = 0;       // (all the work)
+    uint64_t warm_each = 0;   // (one compute program's driver compiles; 0 when this run compiles none)
+
+    PrepareWork(size_t programs_, size_t computes, bool warm)
+        : programs(programs_), whole(kGraphics * programs_ + (warm ? kComputeWarm * computes : 0)),
+          warm_each(warm ? kComputeWarm : 0) {}
+    /// The programs' worth done, for progress(done, programs): under programs until all the work is done
+    size_t done(uint64_t work) const {
+        if (work >= whole) return programs;
+        return (size_t)(work * programs / whole);
     }
 };
 

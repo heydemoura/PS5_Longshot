@@ -3,6 +3,9 @@
 #define _GNU_SOURCE
 #include <windows.h>
 #include <mmsystem.h>
+#ifdef TRACY_ENABLE
+#include "../hos_tracy.h"
+#endif
 
 #include <dirent.h>
 #include <dlfcn.h>
@@ -13,6 +16,7 @@
 #include <linux/futex.h>
 #endif
 #include <signal.h>
+#include <sys/file.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -21,7 +25,7 @@
 #include "../ps5/win32_ps5.h"
 #endif
 
-/* the guest window (third_party/a64-kit/rt/a64.h A64_HOST_BASE, host/hos.h HOS_GUEST_SPACE): one mapping, all of it
+/* the guest window (builder/rt/a64.h A64_HOST_BASE, host/hos.h HOS_GUEST_SPACE): one mapping, all of it
    readable and writable, which VirtualQuery reports as committed without asking the kernel */
 #ifdef __PROSPERO__
 #define GUEST_LO HOS_PS5_GUEST_LO
@@ -99,20 +103,23 @@ static struct timespec rel_ms(DWORD ms) {
     struct timespec ts = {(time_t)(ms / 1000), (long)(ms % 1000) * 1000000L};
     return ts;
 }
-void WakeConditionVariable(CONDITION_VARIABLE *cv) {
+/* A sleeper registers under its associated lock before releasing that lock.
+   The sequence handles a wake between the unlock and entering the kernel. */
+static void cv_wake(CONDITION_VARIABLE *cv, int count) {
+    if (!__atomic_load_n(&cv->waiters, __ATOMIC_SEQ_CST)) return;
     __atomic_add_fetch(&cv->seq, 1, __ATOMIC_SEQ_CST);
-    futex(&cv->seq, FUTEX_WAKE_PRIVATE, 1, NULL);
+    futex(&cv->seq, FUTEX_WAKE_PRIVATE, count, NULL);
 }
-void WakeAllConditionVariable(CONDITION_VARIABLE *cv) {
-    __atomic_add_fetch(&cv->seq, 1, __ATOMIC_SEQ_CST);
-    futex(&cv->seq, FUTEX_WAKE_PRIVATE, INT_MAX, NULL);
-}
+void WakeConditionVariable(CONDITION_VARIABLE *cv) { cv_wake(cv, 1); }
+void WakeAllConditionVariable(CONDITION_VARIABLE *cv) { cv_wake(cv, INT_MAX); }
 static BOOL cv_wait(CONDITION_VARIABLE *cv, DWORD ms, void (*unlock)(void *), void (*relock)(void *, ULONG), void *l, ULONG flags) {
+    __atomic_add_fetch(&cv->waiters, 1, __ATOMIC_SEQ_CST);
     const uint32_t seq = __atomic_load_n(&cv->seq, __ATOMIC_SEQ_CST);
     unlock(l);
     struct timespec ts = rel_ms(ms);
     const long r = futex(&cv->seq, FUTEX_WAIT_PRIVATE, seq, ms == INFINITE ? NULL : &ts);
     const int timed_out = r == -1 && errno == ETIMEDOUT;
+    __atomic_sub_fetch(&cv->waiters, 1, __ATOMIC_SEQ_CST);
     relock(l, flags);
     if (timed_out) { last_error = ERROR_TIMEOUT; return FALSE; }
     return TRUE;
@@ -157,6 +164,17 @@ BOOL WaitOnAddress(volatile void *addr, void *compare, SIZE_T size, DWORD ms) {
 }
 void WakeByAddressSingle(void *addr) { futex((volatile uint32_t *)((uintptr_t)addr & ~(uintptr_t)3), FUTEX_WAKE_PRIVATE, INT_MAX, NULL); }
 void WakeByAddressAll(void *addr) { futex((volatile uint32_t *)((uintptr_t)addr & ~(uintptr_t)3), FUTEX_WAKE_PRIVATE, INT_MAX, NULL); }
+
+/* A guest atomic word needs the kernel's 32-bit comparison, with no plain read by the caller. */
+int hos_posix_wait_atomic32(volatile uint32_t *word, uint32_t expected, DWORD ms) {
+    struct timespec ts = rel_ms(ms);
+    const long r = futex(word, FUTEX_WAIT_PRIVATE, expected, ms == INFINITE ? NULL : &ts);
+    return r == 0 || errno == EAGAIN || errno == EINTR;
+}
+
+void hos_posix_wake_atomic32(volatile uint32_t *word, int all) {
+    futex(word, FUTEX_WAKE_PRIVATE, all ? INT_MAX : 1, NULL);
+}
 
 /* ---- time ---- */
 void Sleep(DWORD ms) {
@@ -213,8 +231,11 @@ static void thread_unref(HThread *t) {
         free(t);
     }
 }
+/* (NULL when calloc is refused: CreateThread then fails as Windows' does, rather than write through NULL; the out-of-memory
+   notice's thread is started after a host allocation kept failing, when this one may be refused too) */
 static HThread *thread_new(void) {
     HThread *t = (HThread *)calloc(1, sizeof *t);
+    if (!t) return NULL;
     t->h.type = H_THREAD;
     monitor_init(&t->mu, &t->cv);
     return t;
@@ -223,7 +244,7 @@ static HThread *thread_new(void) {
    only the threads'. Read from the asking thread each time, it was that thread's own mask, which shrank once hos_thread_pin
    pinned it off the reserved core: the Presentation Thread's pin, asked for from a game thread kept off that core, then
    saw no reserved core in the "process" mask and kept the Presentation Thread off it too, against render_thread_on_reserved
-   (host/hos_thread.c; Ryzen 9 9950X3D, 2026-11-09). Taken once, before main, when no thread is pinned yet.
+   (host/hos_thread.c). Taken once, before main, when no thread is pinned yet.
    Also applied when a thread first registers here (CreateThread's thread_entry, or a std::thread in thread_self on its
    first GetCurrentThread call in SetThreadDescription / SetThreadPriority), so a thread made inside a pinned replay
    (ReplayPin in gpu/vk/vk_replay.cpp) starts with the process's affinity as on Windows rather than inheriting the pin.
@@ -310,6 +331,10 @@ static void *thread_entry(void *p) {
 HANDLE CreateThread(void *attr, SIZE_T stack, LPTHREAD_START_ROUTINE fn, void *arg, DWORD flags, DWORD *id) {
     (void)attr;
     HThread *t = thread_new();
+    if (!t) {
+        last_error = ERROR_NOT_ENOUGH_MEMORY;
+        return NULL;
+    }
     t->fn = fn, t->arg = arg, t->refs = 2;   /* (the handle's and the thread's own) */
     if (flags & CREATE_SUSPENDED) fprintf(stderr, "[win32] CreateThread: CREATE_SUSPENDED is not supported: started at once\n");
 #ifdef __PROSPERO__   /* (the stack in direct memory, freed once the thread has ended: host/ps5/win32_ps5.c) */
@@ -462,6 +487,9 @@ HRESULT SetThreadDescription(HANDLE h, PCWSTR name) {
     char shortname[16];
     snprintf(shortname, sizeof shortname, "%s", t->name);   /* (the kernel keeps 15 characters) */
     pthread_setname_np(t->th, shortname);
+#ifdef TRACY_ENABLE
+    if (pthread_equal(t->th, pthread_self())) HT_THREAD_NAME(t->name);   /* (LONGSHOT_TRACY: the whole name) */
+#endif
     return S_OK;
 }
 HRESULT GetThreadDescription(HANDLE h, PWSTR *name) {
@@ -1283,6 +1311,36 @@ DWORD GetFileAttributesA(LPCSTR name) {
     if (lstat(path, &link) == 0 && S_ISLNK(link.st_mode)) at |= FILE_ATTRIBUTE_REPARSE_POINT;
     return at;
 }
+/* (save path checks must see a dangling link too; other callers keep their existing attribute results) */
+DWORD hos_posix_save_attributes(LPCSTR name) {
+    DWORD at = GetFileAttributesA(name);
+    if (at != INVALID_FILE_ATTRIBUTES) return at;
+    char path[PATH_MAX];
+    slashes(path, sizeof path, name);
+    struct stat st;
+    if (lstat(path, &st) == 0 && S_ISLNK(st.st_mode)) return FILE_ATTRIBUTE_REPARSE_POINT;
+    return INVALID_FILE_ATTRIBUTES;
+}
+/* (only save walks need read and close errors; the game's directory calls keep their usual path) */
+BOOL hos_posix_save_walk(LPCSTR name, int (*visit)(void *, const char *, DWORD), void *arg) {
+    char path[PATH_MAX];
+    slashes(path, sizeof path, name);
+    DIR *dir = opendir(path);
+    if (!dir) return fail_errno();
+    BOOL ok = TRUE;
+    struct dirent *e;
+    while ((errno = 0, e = readdir(dir)) != NULL) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char full[PATH_MAX];
+        if (!e->d_name[0] || strchr(e->d_name, '/') || strchr(e->d_name, '\\') ||
+            snprintf(full, sizeof full, "%s/%s", path, e->d_name) >= (int)sizeof full) { ok = FALSE; break; }
+        DWORD at = hos_posix_save_attributes(full);
+        if (at == INVALID_FILE_ATTRIBUTES || !visit(arg, e->d_name, at)) { ok = FALSE; break; }
+    }
+    if (ok && errno) ok = fail_errno();
+    if (closedir(dir)) ok = fail_errno();
+    return ok;
+}
 BOOL CreateDirectoryA(LPCSTR name, void *attr) {
     (void)attr;
     char path[PATH_MAX];
@@ -1300,6 +1358,32 @@ BOOL DeleteFileA(LPCSTR name) {
     char path[PATH_MAX];
     slashes(path, sizeof path, name);
     return unlink(path) == 0 ? TRUE : fail_errno();
+}
+/* (the save owner keeps this descriptor until process exit; a busy save still mounts in place) */
+int hos_posix_save_owner(LPCSTR name, int *busy) {
+    char path[PATH_MAX];
+    slashes(path, sizeof path, name);
+    *busy = 0;
+    int fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) return -1;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        *busy = errno == EWOULDBLOCK || errno == EAGAIN;
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+/* (save journals need directory entries on disk too, before relying on a flushed file's name) */
+BOOL hos_posix_sync_directory(LPCSTR name) {
+    char path[PATH_MAX];
+    slashes(path, sizeof path, name);
+    const int fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) return fail_errno();
+    int result = fsync(fd);
+    const int why = errno;
+    if (close(fd) && !result) return fail_errno();
+    if (result) { errno = why; return fail_errno(); }
+    return TRUE;
 }
 BOOL MoveFileExA(LPCSTR from, LPCSTR to, DWORD flags) {
     char a[PATH_MAX], b[PATH_MAX];
@@ -1438,15 +1522,18 @@ BOOL CloseHandle(HANDLE h) {
         return TRUE;
     }
     case H_TIMER: o->type = 0; free(o); return TRUE;
+    case H_FILE: {
 #ifdef __PROSPERO__
-    case H_FILE:
-        if (NUP_FILE((HFile *)h)) nup_romfs_close(((HFile *)h)->nup);
-        else close(((HFile *)h)->fd);
-        o->type = 0, free(o);
-        return TRUE;
-#else
-    case H_FILE: close(((HFile *)h)->fd); o->type = 0; free(o); return TRUE;
+        if (NUP_FILE((HFile *)h)) {
+            nup_romfs_close(((HFile *)h)->nup);
+            o->type = 0, free(o);
+            return TRUE;
+        }
 #endif
+        const int result = close(((HFile *)h)->fd);
+        o->type = 0; free(o);
+        return result == 0 ? TRUE : fail_errno();
+    }
     case H_FIND: return FindClose(h);
     }
     last_error = ERROR_INVALID_HANDLE;
@@ -1708,13 +1795,16 @@ int MessageBoxA(HWND w, LPCSTR text, LPCSTR caption, UINT type) {
 
 /* ---- waveOut on SDL's audio (host/hos_sdl.c): a callback takes the written blocks in order and marks them done ---- */
 /* (the executable's: this file is in the Vulkan back end too, which plays no sound and has no hos_sdl.c) */
-int hos_sdl_audio_open(int freq, int channels, int s16, void (*pull)(void *user, uint8_t *out, int len), void *user)
+void *hos_sdl_audio_open(unsigned device, int freq, int channels, int s16, int frames, void (*pull)(void *user, uint8_t *out, int len), void *user)
     __attribute__((weak));
+void hos_sdl_audio_close(void *audio) __attribute__((weak));
+int hos_sdl_audio_alive(void *audio) __attribute__((weak));
 typedef struct {
     pthread_mutex_t mu;
     WAVEHDR *q[64];
     int head, count;
     DWORD pos;
+    void *audio;
 } WaveOut;
 static void wave_pull(void *user, uint8_t *out, int len) {
     WaveOut *w = (WaveOut *)user;
@@ -1734,12 +1824,14 @@ static void wave_pull(void *user, uint8_t *out, int len) {
     if (len > 0) memset(out, 0, (size_t)len);   /* (behind: silence) */
 }
 MMRESULT waveOutOpen(HWAVEOUT *out, UINT device, const WAVEFORMATEX *f, DWORD_PTR cb, DWORD_PTR inst, DWORD flags) {
-    (void)device, (void)cb, (void)inst, (void)flags;
+    (void)cb, (void)inst, (void)flags;
     /* (the same SDL as the window's and the controllers', beside the executable first: hos_sdl.c) */
-    if (!hos_sdl_audio_open) return MMSYSERR_ERROR;
+    if (!hos_sdl_audio_open || !hos_sdl_audio_close || !hos_sdl_audio_alive || !out || !f) return MMSYSERR_ERROR;
     WaveOut *w = (WaveOut *)calloc(1, sizeof *w);
-    pthread_mutex_init(&w->mu, NULL);
-    if (!hos_sdl_audio_open((int)f->nSamplesPerSec, (int)f->nChannels, f->wBitsPerSample == 16, wave_pull, w)) {
+    if (!w) return MMSYSERR_ERROR;
+    if (pthread_mutex_init(&w->mu, NULL)) { free(w); return MMSYSERR_ERROR; }
+    w->audio = hos_sdl_audio_open(device, (int)f->nSamplesPerSec, (int)f->nChannels, f->wBitsPerSample == 16, 0, wave_pull, w);
+    if (!w->audio) {
         pthread_mutex_destroy(&w->mu);
         free(w);
         return MMSYSERR_ERROR;
@@ -1752,6 +1844,7 @@ MMRESULT waveOutUnprepareHeader(HWAVEOUT w, WAVEHDR *h, UINT size) { (void)w, (v
 MMRESULT waveOutWrite(HWAVEOUT hw, WAVEHDR *h, UINT size) {
     (void)size;
     WaveOut *w = (WaveOut *)hw;
+    if (!hos_sdl_audio_alive(w->audio)) return MMSYSERR_NODRIVER;
     pthread_mutex_lock(&w->mu);
     if (w->count >= 60) {
         WAVEHDR *old = w->q[w->head];
@@ -1777,4 +1870,13 @@ MMRESULT waveOutReset(HWAVEOUT hw) {
     pthread_mutex_unlock(&w->mu);
     return 0;
 }
-MMRESULT waveOutClose(HWAVEOUT hw) { waveOutReset(hw); return 0; }
+MMRESULT waveOutClose(HWAVEOUT hw) {
+    WaveOut *w = (WaveOut *)hw;
+    if (!w) return MMSYSERR_ERROR;
+    /* Closing synchronizes callbacks before their queue/userdata are destroyed. Holding mu would deadlock. */
+    hos_sdl_audio_close(w->audio);
+    waveOutReset(hw);
+    pthread_mutex_destroy(&w->mu);
+    free(w);
+    return MMSYSERR_NOERROR;
+}

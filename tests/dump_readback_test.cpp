@@ -24,11 +24,18 @@ using VmaAllocation=Allocation*;
 struct Texture {
     VkImage image{}; VkSampleCountFlagBits samples=VK_SAMPLE_COUNT_1_BIT;
     VkImageAspectFlags aspect=VK_IMAGE_ASPECT_COLOR_BIT;
+    VkImageLayout layout=VK_IMAGE_LAYOUT_GENERAL;
     VkFormat format=VK_FORMAT_R32G32B32A32_SFLOAT;
     uint64_t gpu=0; int id=1;
     uint32_t levels=1,width=2,height=1,layers=1,depth=1;
     VkImageType type=VK_IMAGE_TYPE_2D;
 };
+inline bool is_depth_texture(const Texture* t) {
+    return t && (t->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
+}
+void texture_transition_layout(VkCommandBuffer, Texture* tex, VkImageLayout target, bool = false) {
+    if (is_depth_texture(tex) && tex->image) tex->layout = target;
+}
 struct Device {VkPhysicalDevice physical{};} dev;
 std::vector<std::unique_ptr<Allocation>> allocations;
 std::vector<uint8_t> payload, png;
@@ -36,8 +43,8 @@ std::vector<std::string> lines;
 bool coherent=false, implicit_host=false;
 int invalidations=0;
 int waits=0;
-std::atomic<bool> par_active{false};
-std::atomic<uint64_t> work_epoch{0};
+thread_local uint64_t work_epoch=0;   // (vk_work.h's counts, as vk_texture.cpp defines them: full_barrier reads and sets them)
+thread_local bool other_work_since_barrier=true;
 VkCommandBuffer last_barrier_cmd{};
 uint64_t last_barrier_epoch=UINT64_MAX;
 std::atomic<int64_t> st_barriers_left_out{0}, st_barriers_made{0};
@@ -115,7 +122,7 @@ int main(int argc,char** argv) {
     if(which=="empty") {
         consume_dump(false);require(waits==0 && invalidations==0 && png.empty(),"empty queue reads/waits");return 0;
     }
-    armed=true;
+    dump_armed=true;
     if(which=="ssbo" || which=="ssbo-tail") {
         std::vector<uint32_t> words(which=="ssbo"?8:16384);
         words[1]=1;words[3]=2;words.back()=3;upload(words);

@@ -7,10 +7,17 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # (python -I leaves the check's own folder off the path)
+from menu_model_fixture import menu_text, output_engine  # noqa: E402
 
 RUN_ALL_ARGS = ["--cxx", "{cxx}"]
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# (env_on, the switches' rule, before the code cut out of the sources: gpu/vk/compat/longshot_env.h)
+ENV_ON_H = str(Path(__file__).resolve().parents[1] / "gpu" / "vk" / "compat" / "longshot_env.h")
 
 
 def main():
@@ -19,7 +26,8 @@ def main():
     args = parser.parse_args()
 
     host = (ROOT / "host/nn_applet.c").read_text(encoding="utf-8")
-    menu = (ROOT / "gpu/vk/vk_menu.cpp").read_text(encoding="utf-8")
+    menu = (ROOT / "gpu" / "vk" / "vk_menu.cpp").read_text(encoding="utf-8")
+    upscaler = (ROOT / "gpu" / "vk" / "menu" / "upscaler.cpp").read_text(encoding="utf-8")   # (tx_resolution: the module's)
     fixture = r'''
 #define _CRT_SECURE_NO_WARNINGS
 #include <algorithm>
@@ -59,9 +67,9 @@ using namespace mkwvk;
 namespace ur = upscaler_rows;
 // (the screen's display modes: none, so the sizes offered before them)
 std::vector<display_modes::Size> screen_modes() { return {}; }
-''' + host[host.index("int hos_ini_option(const char *key, int otherwise);"):host.index("HLE(_ZN2nn2oe16GetOperationModeEv)")] + menu[
-        menu.index("struct Out {"):menu.index("/// The Render resolution: the value chosen")] + menu[
-        menu.index("const char* tx_output_res("):menu.index("const char* tx_speed(")] + r'''
+''' + host[host.index("int hos_ini_option(const char *key, int otherwise);"):host.index("HLE(_ZN2nn2oe16GetOperationModeEv)")] + \
+        output_engine(ROOT, "/// The Output resolution: the game's own reduced size") + \
+        upscaler[upscaler.index("const char* tx_resolution(int v) {"):upscaler.index("\n}\n", upscaler.index("const char* tx_resolution(int v) {")) + 3] + r'''
 int main(int argc, char **argv) {
     assert(argc == 7);
     const int mode = atoi(argv[1]), pool = atoi(argv[5]);   // (mode: the menu's choice, 6 the player's own size)
@@ -307,8 +315,9 @@ int main(int argc, char **argv) {
         ("2560x1600", 0, None, 6, 2560, 1600, "2560x1600", 512, "2560x1600"),
         ("320x200", 0, None, 0, 2560, 1440, "2048x1152 (reduced)", 512, "2048x1152"),   # (out of range: the game's own)
         ("9999x9999", 0, None, 0, 2560, 1440, "2048x1152 (reduced)", 512, "2048x1152"),
-        ("7680x4320", 0, None, 0, 2560, 1440, "2048x1152 (reduced)", 512, "2048x1152"),   # (more than 5120x2880's pixels)
-        ("6144x2560", 0, None, 0, 2560, 1440, "2048x1152 (reduced)", 512, "2048x1152"),
+        ("7680x4320", 0, None, 0, 2560, 1440, "2048x1152 (reduced)", 512, "2048x1152"),   # (more than 7680x2160's pixels)
+        ("6144x2560", 0, None, 6, 6144, 2560, "6144x2560", 900, "6144x2560"),   # (under 7680x2160's pixels)
+        ("7680x2160", 0, None, 6, 7680, 2160, "7680x2160", 900, "7680x2160"),   # (32:9 native: kept, pool at 900 MB)
         ("640x4320", 0, None, 0, 2560, 1440, "2048x1152 (reduced)", 512, "2048x1152"),   # (narrower than 5:4)
         ("5760x1080", 0, None, 6, 5760, 1080, "5760x1080", 515, "5760x1080"),
         ("7680x1440", 0, None, 6, 7680, 1440, "7680x1440", 900, "7680x1440"),   # (5120x2160's pixels: full size)
@@ -355,13 +364,13 @@ int main() {
     with tempfile.TemporaryDirectory(prefix="output-default-") as tmp:
         source, exe = Path(tmp) / "rule.cpp", Path(tmp) / "rule.exe"
         source.write_text(rule, encoding="utf-8")
-        subprocess.run([args.cxx, "-std=c++17", "-I", str(ROOT), str(source), "-o", str(exe)], check=True)
+        subprocess.run([args.cxx, "-std=c++17", "-include", ENV_ON_H, "-I", str(ROOT), str(source), "-o", str(exe)], check=True)
         subprocess.run([str(exe)], check=True)
     with tempfile.TemporaryDirectory(prefix="output-resolution-") as tmp:
         work = Path(tmp)
         source, exe = work / "fixture.cpp", work / "fixture.exe"
         source.write_text(fixture, encoding="utf-8")
-        subprocess.run([args.cxx, "-std=c++17", "-I", str(ROOT), str(source), "-o", str(exe)], check=True)
+        subprocess.run([args.cxx, "-std=c++17", "-include", ENV_ON_H, "-I", str(ROOT), str(source), "-o", str(exe)], check=True)
         for saved, handheld, override, mode, w, h, label, pool, writes in cases:
             (work / "longshot_options.ini").write_text(   # (saved None: no output_res= line, a new install)
                 ("" if saved is None else f"output_res={saved}\n") + f"handheld_profile={handheld}\n", encoding="ascii")

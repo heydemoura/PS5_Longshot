@@ -44,12 +44,14 @@ building from source and the rest describe the PC game, not this port.
 
 ---
 
-Longshot is a static recompilation of a supported console game. The game's code is translated to C and compiled into a Windows or Linux program, rebuilding the graphics on Vulkan, with the console's system software reimplemented. All of this happens **on your PC, from your own copy of the game**.
+Longshot is a static recompilation tool. It translates a supported console game's code to C and compiles it into a
+native Windows or Linux program, with the graphics rebuilt on Vulkan and the console's system software reimplemented.
+All of this happens **on your PC, from your own copy of the game**.
 
-Longshot is a continuation of [Hookshot](https://github.com/NotRexed/Hookshot). The top maintainers have moved to this project.
+Longshot is a continuation of [Hookshot](https://github.com/NotRexed/Hookshot). The top maintainers have moved to this
+project.
 
 **[Join us on Discord](https://discord.gg/magicbean)!**
-<br>
 
 > [!IMPORTANT]
 > This repository **does not contain the game, keys or an executable**, and it does not explain how to get them. You
@@ -623,7 +625,11 @@ the settings in the in-game menu.
 On **Minimum (4GB)**, when the driver reports a nonzero VRAM budget of at most 4.5 GiB, or the GPU is integrated
 and the PC has 16 GB of RAM or less (its "VRAM" is that RAM, whatever budget the driver reports), sampled ASTC textures
 use a 1024 dimension limit and an 8 MiB decoded-size threshold for leaving out their top mip levels. This lowers texture
-detail to reduce the working set. Other presets and larger or unknown budgets keep the 2048 / 64 MiB defaults;
+detail to reduce the working set. The same holds on Auto (this PC) at Minimum, and on Custom after either; Custom with
+no preset behind it (chosen on the Quality preset row, or an options file from before `memory_budget` existed) goes by
+what Auto picks for this PC, which is Minimum on every integrated GPU and on cards of 4.5 GB or less. Applying Low or a
+higher preset, or `RX_VK_LOW_VRAM_MIPS=0`, keeps full-size textures there. Other presets and larger or unknown budgets
+keep the 2048 / 64 MiB defaults;
 uncompressed render targets, depth images and the separate `RX_VK_TEX_MAX_MB` allocation limit keep their handling.
 The driver budget is sampled at the first texture creation and kept for the session. It is a heuristic, not a physical
 VRAM measurement: other applications can lower the budget even on a larger card.

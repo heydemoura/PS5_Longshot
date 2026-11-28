@@ -59,6 +59,7 @@ struct {
     Pipe scale; VkSampler linear = 0; Img cropped, scaled;
     uint32_t cropped_w = 0, cropped_h = 0, scaled_w = 0, scaled_h = 0;
 } fg;
+bool dlssg_active() { return false; }   // (vk_dlssg.cpp: NVIDIA DLSS Frame Generation not running; framegen_on asks)
 bool vkCmdPushDescriptorSetKHR = true;
 int pipe_calls = 0, sampler_calls = 0, image_calls = 0, dispatches = 0, blits = 0, copies = 0, logs = 0;
 int destroyed_pipes = 0, destroyed_layouts = 0, destroyed_sets = 0, waits = 0, flushes = 0;
@@ -69,6 +70,7 @@ int made_usage = 0, made_format = 0, dispatched_mode = -1;
 uint64_t dispatched_pipe = 0;
 float dispatched_sharp = -1, dispatched_x0 = -1, dispatched_x1 = -1;
 int dispatched_side = -1;
+int dispatched_crop[4] = {-1, -1, -1, -1};
 VkImageView sampled_view = 0;
 VkImageBlit last_blit;
 VkImageCopy last_copy;
@@ -76,7 +78,7 @@ VkImageCopy last_copy;
 bool make_pipe(Pipe& p, const uint32_t* code, size_t bytes, std::initializer_list<int> types, uint32_t push) {
     const bool pq = code == FG_SCALE_PQ_COMP_SPV;
     CHECK((pq ? bytes == sizeof FG_SCALE_PQ_COMP_SPV : code == FG_SCALE_COMP_SPV && bytes == sizeof FG_SCALE_COMP_SPV));
-    CHECK(types.size() == 3 && push == 20);
+    CHECK(types.size() == 3 && push == 36);
     CHECK(*types.begin() == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && *(types.begin() + 1) == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE);
     const bool fail = pq ? pq_pipe_fail : pipe_fail;
     ++pipe_calls; p.set = 1; p.layout = 2; p.pipe = fail ? 0 : pq ? 5 : 3; return !fail;
@@ -115,13 +117,14 @@ void vkCmdCopyImage(int, VkImage src, int, VkImage dst, int, int count, const Vk
 }
 void pass(int, const Pipe& p, std::initializer_list<std::pair<VkImageView, VkSampler>> b,
           uint32_t w, uint32_t h, const void* data, uint32_t bytes) {
-    CHECK((p.pipe == 3 || p.pipe == 5) && b.size() == 3 && b.begin()->first && b.begin()->second == 4 && bytes == 20);
+    CHECK((p.pipe == 3 || p.pipe == 5) && b.size() == 3 && b.begin()->first && b.begin()->second == 4 && bytes == 36);
     CHECK((b.begin() + 2)->first && (b.begin() + 2)->second == 4);
     CHECK((b.begin() + 1)->first && !(b.begin() + 1)->second);
-    struct PC { int mode; float sharp; float x0, x1; int side; } pc;
+    struct PC { int mode; float sharp; float x0, x1; int side; int crop[4]; } pc;
     std::memcpy(&pc, data, sizeof pc);
     ++dispatches; dispatched_mode = pc.mode; dispatched_sharp = pc.sharp;
     dispatched_side = pc.side; dispatched_x0 = pc.x0; dispatched_x1 = pc.x1;
+    std::memcpy(dispatched_crop, pc.crop, sizeof dispatched_crop);
     dispatched_w = w; dispatched_h = h; sampled_view = b.begin()->first; dispatched_pipe = p.pipe;
 }
 void logf(const char*, ...) { CHECK(dispatches > 0); ++logs; }
@@ -194,14 +197,14 @@ int main() {
     CHECK(draw()); CHECK(image_calls == 3 && dispatches == 2); // old size must allocate again after failure
     reset(); opts.upscale = 2;
     const int crop[] = {2500, 1400, 100, 100}; CHECK(draw(crop, 1920, 1080));
-    CHECK(blits == 1 && last_blit.srcOffsets[1].x == 2560 && last_blit.srcOffsets[1].y == 1440);
-    CHECK(last_blit.dstOffsets[1].x == 60 && last_blit.dstOffsets[1].y == 40 && sampled_view == scale.cropped.view);
-    const int resized_crop[] = {0,0,1280,720}; image_fail = true; CHECK(!draw(resized_crop));
-    CHECK(!scale.cropped.image && scale.cropped_w == 0 && scale.cropped_h == 0);
-    CHECK(draw(crop, 1920, 1080)); CHECK(blits == 2 && !fg.init && !fg.thread_started);
+    CHECK(blits == 0 && copies == 0 && sampled_view == 12 && !scale.cropped.image);
+    CHECK(dispatched_crop[0] == 2500 && dispatched_crop[1] == 1400 && dispatched_crop[2] == 60 && dispatched_crop[3] == 40);
+    const int resized_crop[] = {0,0,1280,720}; CHECK(draw(resized_crop, 1920, 1080));
+    CHECK(blits == 0 && copies == 0 && sampled_view == 12 && !fg.init && !fg.thread_started);
+    CHECK(dispatched_crop[0] == 0 && dispatched_crop[1] == 0 && dispatched_crop[2] == 1280 && dispatched_crop[3] == 720);
     CHECK(logs == (std::getenv("RX_VK_UPSCALE_LOG") ? 1 : 0));
-    // (Native HDR, pq: the game's PQ picture scaled by fg_scale_pq, made at its first use, into RGB10A2 images; the crop copied
-    // as its bits, not blitted (the texture's image may be RGBA8 with the RGB10A2 picture in it); the SDR picture's images
+    // (Native HDR, pq: the game's PQ picture scaled by fg_scale_pq, made at its first use, into RGB10A2 images; cropped
+    // scaling samples src directly through its PQ view with crop UVs, zero scale.cropped copy; the SDR picture's images
     // made again in RGBA8 after it)
     reset(); opts.sharpness = 50;
     CHECK(draw(nullptr, 2560, 1440, true));
@@ -209,12 +212,12 @@ int main() {
     CHECK(draw(nullptr, 2560, 1440, true)); CHECK(pipe_calls == 2 && image_calls == 1 && dispatched_pipe == 5);
     const int pq_crop[] = {160, 90, 2240, 1260};
     CHECK(draw(pq_crop, 2560, 1440, true));
-    CHECK(copies == 1 && blits == 0 && sampled_view == scale.cropped.view && made_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32);
-    CHECK(last_copy.srcOffset.x == 160 && last_copy.srcOffset.y == 90 && last_copy.extent.width == 2240 && last_copy.extent.height == 1260);
+    CHECK(copies == 0 && blits == 0 && sampled_view == 12 && made_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32);
+    CHECK(dispatched_crop[0] == 160 && dispatched_crop[1] == 90 && dispatched_crop[2] == 2240 && dispatched_crop[3] == 1260);
     const int waited = waits;
     CHECK(draw(pq_crop, 2560, 1440, false));
-    CHECK(dispatched_pipe == 3 && blits == 1 && copies == 1 && made_format == VK_FORMAT_R8G8B8A8_UNORM && waits > waited);
-    CHECK(draw(pq_crop, 2560, 1440, true) && dispatched_pipe == 5 && copies == 2 && pipe_calls == 2);
+    CHECK(dispatched_pipe == 3 && blits == 0 && copies == 0 && made_format == VK_FORMAT_R8G8B8A8_UNORM && waits > waited);
+    CHECK(draw(pq_crop, 2560, 1440, true) && dispatched_pipe == 5 && copies == 0 && pipe_calls == 2);
     // (ultrawide's blurred sides: fg_scale_pq writes the 1/8 picture too, so it is RGB10A2 as well)
     reset(); wide_now = WideSides{0.25f, 1}; CHECK(draw(nullptr, 2560, 1440, true));
     CHECK(dispatches == 2 && dispatched_pipe == 5 && image_calls == 2 && made_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32);

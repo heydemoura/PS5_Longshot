@@ -58,6 +58,9 @@ def main():
         'namespace Shader {',
         block(info_h, 'enum class HandleOp : u32 {'),
         block(info_h, 'template <typename ReadCbuf, typename ReadStorage>\nstd::optional<u32> EvaluateHandleProgram('),
+        # (the simulated-turf private storage buffers' encoding, which stage_storage_base reads through)
+        info_h[info_h.index('inline constexpr u32 kSimTurfStorageBit'):info_h.index('[[nodiscard]] constexpr u32 SimTurfStorageOrig(')],
+        block(info_h, '[[nodiscard]] constexpr u32 SimTurfStorageOrig('),
         '}',
         'namespace Shader::Optimization {',
         block(texture_pass, 'size_t HandleOperands(HandleOp op)'),
@@ -66,11 +69,16 @@ def main():
         block(shader, 'uint64_t stage_storage_base('),
         block(shader, 'uint32_t stage_storage_word('),
         block(shader, 'uint32_t stage_handle(const NvnState& s, const Stage& st, uint32_t program, uint32_t element)'),
+        # (stage_handles asks them for the table's own count: tests/test_handle_table_count.py)
+        block(shader, 'uint32_t handle_table_live('),
+        block(shader, 'bool handle_table_count_on()'),
         block(shader, 'void stage_handles('),
     ])
     prelude = r'''
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <mutex>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -80,7 +88,7 @@ def main():
 #include <vector>
 using u32 = uint32_t; using s32 = int32_t; using u64 = uint64_t;
 namespace Shader {
-struct StorageBufferDescriptor { u32 cbuf_index, cbuf_offset; };
+struct StorageBufferDescriptor { u32 cbuf_index, cbuf_offset, count = 1; };
 struct Info {
  static constexpr size_t MAX_SSBOS{64};
  std::vector<StorageBufferDescriptor> storage_buffers_descriptors;
@@ -97,12 +105,15 @@ uint32_t stage_cbuf_word(const NvnState&, const Stage&, uint32_t index, uint32_t
  ++cbuf_reads; return index == 3 && offset / 4 < 64 ? bank[offset / 4] : 0;
 }
 bool env_on(const char*) { return false; }
-void ub_read(uint64_t addr, void* out, size_t n) {
+void logf(const char*, ...) {}
+bool ub_read(uint64_t addr, void* out, size_t n) {
  ++memory_reads; uint32_t v = addr >= 0x10000 && addr < 0x10000 + 4096 ? memory[(addr - 0x10000) / 4] : 0; std::memcpy(out, &v, n);
+ return true;
 }
 struct Host { void gpu_read(uint64_t addr, void* out, size_t n) { ub_read(addr, out, n); } } host_object;
 Host* host = &host_object;
 uint32_t stage_handle(const NvnState& s, const Stage& st, uint32_t program, uint32_t element = 0);   // (vk_shader.h's)
+void stage_handles(const NvnState& s, const Stage& st, uint32_t program, uint32_t count, uint32_t* out, uint64_t key = 0);   // (vk_shader.h's)
 '''
     checks = r'''
 int main() {
@@ -207,18 +218,9 @@ int main() {
         require(tables, f'need("{limit}", l.{limit}, ', 'the log line names the limit that turned handle tables off')
     stamp = block(shader, 'uint64_t translator_stamp() {')
     require(stamp, 'if (!handle_tables_on()) {', 'programs translated without handle tables must not share the cache')
-    # The offline copies of host_info: a bank baked offline must be translated as a live run with the same stamp is
-    bake = (root / 'nx2/bake_ds/bake_ds.cpp').read_text(encoding='utf-8')
-    require(block(bake, 'Shader::HostTranslateInfo host_info() {'), 'h.support_handle_table_arrays = g_handle_tables;',
-            'bake_ds translates with handle tables as live does')
-    require(block(bake, 'uint64_t disk_stamp(uint64_t translator_stamp, uint32_t depth) {'), 'if (!g_handle_tables) {',
-            'a bank baked without handle tables carries live\'s "nhtb" word')
-    batch = (root / 'gpu/shaderbatch.cpp').read_text(encoding='utf-8')
-    require(block(batch, 'Shader::HostTranslateInfo make_host() {'), 'h.support_handle_table_arrays = true;',
-            'shaderbatch translates with handle tables as live does')
     pointer = block(draw, 'bool handle_is_storage_pointer(')
     require(pointer, 'if (d.handle_is_pointer_word) return true;', 'a pointer word binds no texture')
-    require(draw, 'stage_handles(s, st, d.handle_program, d.count, table.data());', 'the draw binds every entry of a handle table')
+    require(draw, 'stage_handles(s, st, d.handle_program, d.count, table.data(), p.key);', 'the draw binds every entry of a handle table')
     require(draw, 'is_table && view && tex && d.is_depth && !is_depth_format(tex->format)',
             'a table entry naming a colour texture for a depth comparison binds nothing')
     require(draw, 'if (is_table && k + 1 == d.count && view) {',

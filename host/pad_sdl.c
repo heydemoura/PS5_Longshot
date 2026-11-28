@@ -12,7 +12,11 @@
    accelerometer (Switch Pro and pads in Switch mode, DualSense, DualShock 4, others) that was used last has them read
    each poll and turned into the six-axis state OoT aims with (host/hos_motion.h), which nn_hid.c's
    GetSixAxisSensorStates gives the game; Motion sensitivity X/Y and Invert motion X/Y apply there. Off, or with no such pad, the game sees the pad
-   lying still, as before. */
+   lying still, as before.
+
+   (longshot) The Steam Deck's own sensors: started from Steam, SDL opens only Steam Input's stand-in pad, which has
+   none, so with no pad of that kind open the Deck's controller is read instead (host/deck_imu.c): the same report and
+   the same filter, and the pad path is never displaced while a pad has a gyroscope. */
 #include "hos.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,7 +25,11 @@
 #include <windows.h>
 #include "hos_sdl.h"
 #include "hd_rumble.h"
+#include "vibration.h"
+#include "rumble_renhdrum.h"
+#include "pad_speaker.h"
 #include "hos_motion.h"
+#include "deck_imu.h"
 #include "steam_pads.h"
 #include "../gpu/vk/vk_api.h"   /* (HOS_PAD_*) */
 #ifndef LONGSHOT_ENV_H   /* (env_on: the switches' one rule) */
@@ -36,7 +44,12 @@ enum { BTN_A, BTN_B, BTN_X, BTN_Y, BTN_BACK, BTN_GUIDE, BTN_START, BTN_LSTICK, B
        BTN_TOUCHPAD = 20, BTN_N = 21 };
 enum { AX_LX, AX_LY, AX_RX, AX_RY, AX_LT, AX_RT };
 
+/* Serializes SDL pad initialization, polling and teardown, on either SDL owner thread. */
+static SRWLOCK pad_poll_lock = SRWLOCK_INIT;
+static volatile LONG pads_stopped;
+
 #define MAX_PADS 8
+#define MOTION_SRC_DECK (-2)   /* (motion_pad's value while the Deck's own sensors are the source: no pad, no serial) */
 /* (motion: whether it has the sensors, whether they are on, when to try again after they would not turn on; used_ns:
    its last button or stick change; serial: which opening this is, so a pad reconnecting into the slot is a new one;
    bias: its gyroscope's learned resting rate, kept while another pad has motion) */
@@ -45,18 +58,31 @@ static struct {
     int32_t id;
     uint16_t rumble_lo, rumble_hi;
     int64_t rumble_ns;
-    uint8_t hd, hd_kind, hd_ever;   /* HD rumble (hd_rumble.h): HD_RUMBLE_UNKNOWN / ON / OFF, the pad's kind, sent once */
-    uint8_t hd_sent[HD_RUMBLE_PACKET_SIZE];
+    uint8_t hd, hd_kind, hd_ever, virtual_pad;   /* HD rumble (hd_rumble.h): HD_RUMBLE_UNKNOWN / ON / OFF, the pad's kind, sent once */
+    /* (longshot) what plays its vibration (host/vibration.h: -1 not chosen yet), the kind of pad and its transport for
+       that; a backend that would not open, and when to try it again; an Xbox pad's four motors as last sent */
+    int8_t vib, vib_kind, wireless, vib_failed;
+    int64_t vib_retry_ns, four_ns;
+    int usb_token;        /* its four-channel sound card at the last look, or -1 */
+    int64_t usb_next_look;
+    uint16_t four[4];
+    uint8_t hd_sent[HD_RUMBLE_PACKET_SIZE], rh_switch_packet[HD_RUMBLE_PACKET_SIZE];
     int64_t hd_ns;
     int motion, motion_on;
     int64_t motion_retry_ns, used_ns;
     uint64_t input_sig;
-    unsigned rested;   /* (longshot) the sticks' axes seen at rest since it was opened, a bit each: only those steer */
+    unsigned rested;   /* (longshot) the sticks' axes seen at rest since it was opened, a bit each (AX_LX ... AX_RY):
+                          only those steer; and its triggers seen let go (AX_LT, AX_RT): only those press */
     signed char held[4];   /* (the way each axis was last held, -1, 0 or 1: one held the other way has passed its rest) */
+    int64_t opened_ns;        /* (longshot) when it was opened; since when each trigger has read held, and let go, */
+    int64_t trig_held_ns[2];  /* without a break (0: not now); what the log said of them, and how many of their */
+    int64_t trig_rest_ns[2];  /* changes it gave at debug (trigger_pull) */
+    uint8_t trig_said, trig_changes[2];
     uint32_t serial;
     float bias[3], bias_t;
     int has_bias;
-    uint16_t vendor;      /* (longshot) its USB vendor, and its Steam Input handle: not 0 for a Steam stand-in pad */
+    uint16_t vendor;      /* (longshot) its USB vendor and product, and its Steam Input handle: not 0 for a Steam stand-in pad */
+    uint16_t product;     /* (longshot) its USB product id (host/vibration.h: a Steam Controller (2026); the Deck's built-in controls, host/steam_pads.h) */
     uint64_t steam;
     int motion_only;      /* (host/steam_pads.h) a real Valve pad while a Steam stand-in pad is open: motion, no input */
 } pads[MAX_PADS];
@@ -65,8 +91,14 @@ static SRWLOCK state_lock = SRWLOCK_INIT;
 static uint64_t state_buttons;
 static int32_t state_stick[4];
 static int state_count;
+static int state_deck_builtin;   /* (longshot) the Deck's built-in controls gave gameplay input in that poll */
 static char state_name[128];   /* the first controller's name (host/prompts.c: the button prompts' Auto) */
+static int state_type, state_sdl;   /* and its SDL type (the loaded SDL's numbers, 0 unknown), and that SDL (3, 2; 0 none) */
 static volatile LONG rumble_low, rumble_high;   /* 0..65535, set by the vibration HLE */
+/* (the Insert menu's Rumble strength row, changed: a short rumble at the new strength, so the player feels what the row
+   does, and that the controller rumbles at all) until when, hos_now_ns */
+static int64_t rumble_test_until;
+void hos_sdl_rumble_test(void) { __atomic_store_n(&rumble_test_until, hos_now_ns() + 400000000LL, __ATOMIC_RELAXED); }
 /* the game's own vibration values per side (0 left, 1 right: {amp_low, freq_low, amp_high, freq_high}), for the pads
    that play HD rumble; silence until the game sends one */
 static SRWLOCK hd_lock = SRWLOCK_INIT;
@@ -83,6 +115,7 @@ static int motion_head, motion_count, motion_live;
 static volatile LONG gyro_status;   /* 0 no controller, 1 controllers but none with a gyro, 2 one with a gyro */
 
 void hos_filter_stick(int16_t x, int16_t y, int zone, int32_t out[2]);   /* nn_hid.c */
+void hos_stick_range(int percent, int32_t v[4]);                         /* nn_hid.c */
 
 /* SDL's controller support started; 0 when it could not be */
 static int pads_start(void) {
@@ -95,11 +128,9 @@ static int pads_start(void) {
        Controller's A, on the right, at the bottom button's place: A acted as B and X as Y: SkyboundTotk issue 12. SDL3's
        are by position always) */
     hos_sdl_hint("SDL_GAMECONTROLLER_USE_BUTTON_LABELS", "0");
-    /* (with no window nothing reads SDL's quit event: SDL's own SIGINT/SIGTERM handlers turned a timeout's or a service
-       manager's SIGTERM into that event, and the run went on until SIGKILL. Without them the signals end it as usual) */
-    if (env_on("HOS_HEADLESS")) hos_sdl_hint("SDL_NO_SIGNAL_HANDLERS", "1");
+    /* (headless, SDL's SIGINT/SIGTERM handlers are off before any subsystem starts: hos_sdl_load, host/hos_sdl.c) */
     /* (longshot) Valve's own pads taken out of the ignore list Steam sets for the games it starts, so that their motion
-       sensors are read (host/steam_pads.h, #1897). Only with an SDL that tells Steam's stand-in pads apart: without
+       sensors are read (host/steam_pads.h). Only with an SDL that tells Steam's stand-in pads apart: without
        that, a real pad and its stand-in would both play. A list emptied or unset in Steam's launch options is left as
        it is */
     {
@@ -218,28 +249,35 @@ static void motion_poll(int64_t now, int count) {
         }
         if (want && pads[i].motion_on && (pick < 0 || pads[i].used_ns > pads[pick].used_ns)) pick = i;
     }
-    InterlockedExchange(&gyro_status, any ? 2 : count ? 1 : 0);
+    /* (longshot) the Deck's reader is released whenever its fallback is not the source: Motion controls off, or an open
+       pad with sensors of its own. Its setting goes back then, and it opens again if the fallback is needed later */
+    if (!want || any) deck_imu_stop();
     float a[3], g[3];
     const int read = pick >= 0 && hos_sdl_pad_sensor(pads[pick].gc, HOS_SDL_SENSOR_ACCEL, a, 3) &&
                      hos_sdl_pad_sensor(pads[pick].gc, HOS_SDL_SENSOR_GYRO, g, 3);
-    /* (a gyroscope reading the very same values for over a second has stopped: a real one always moves a little. Seen with a
-       Steam Controller under Steam after Alt+Tab, when Steam's layout switch left its sensors off while SDL still had them on.
-       Off and on again, as the menu's Motion controls row does, brings it back) */
+    float deck_a[3], deck_g[3];   /* (the Deck's, read from the controller itself: SDL's frame and units too) */
+    const int deck_read = !read && want && !any && deck_imu_poll(deck_a, deck_g, now);
+    /* (the row's status follows a reading: no pad with sensors and no report read is still "the pad has no gyro") */
+    InterlockedExchange(&gyro_status, (any || deck_read) ? 2 : count ? 1 : 0);
+    /* (a gyroscope reading the very same values for over a second has stopped when its accelerometer does too: a real
+       accelerometer always moves a little, while a gyroscope may read exactly 0 at rest, as a Steam Deck's in its dock
+       does. Seen with a Steam Controller under Steam after Alt+Tab, when Steam's layout switch left its sensors off while
+       SDL still had them on. Off and on again, as the menu's Motion controls row does, brings it back) */
     {
-        static float last_g[3];
+        static float last_a[3], last_g[3];
         static int64_t same_since, rearm_ns;
-        if (read && !memcmp(g, last_g, sizeof g)) {
+        if (read && !memcmp(g, last_g, sizeof g) && !memcmp(a, last_a, sizeof a)) {
             if (!same_since) same_since = now;
             else if (now - same_since > 1200000000LL && now >= rearm_ns) {
                 hos_sdl_pad_sensor_enable(pads[pick].gc, HOS_SDL_SENSOR_ACCEL, 0);
                 hos_sdl_pad_sensor_enable(pads[pick].gc, HOS_SDL_SENSOR_GYRO, 0);
                 pads[pick].motion_on = 0;   /* (turned on again by the loop above on the next poll) */
-                hos_log("hid: \"%s\": its gyroscope stopped changing: motion sensors turned off and on again",
-                        hos_sdl_pad_name(pads[pick].gc));
+                hos_log("hid: \"%s\": its gyroscope and accelerometer stopped changing: motion sensors turned off "
+                        "and on again", hos_sdl_pad_name(pads[pick].gc));
                 same_since = 0, rearm_ns = now + 3000000000LL;
             }
         } else {
-            if (read) memcpy(last_g, g, sizeof g);
+            if (read) memcpy(last_a, a, sizeof a), memcpy(last_g, g, sizeof g);
             same_since = 0;
         }
     }
@@ -249,22 +287,30 @@ static void motion_poll(int64_t now, int count) {
         memcpy(pads[motion_pad].bias, motion.bias, sizeof motion.bias);
         pads[motion_pad].bias_t = motion.learned_t, pads[motion_pad].has_bias = 1;
     }
-    if (!read) {
+    if (!read && !deck_read) {
         motion_pad = -1;
+        if (!want || any) deck_imu_stop();   /* (Motion off, or a pad's own sensors took over: its setting goes back) */
         AcquireSRWLockExclusive(&state_lock);
         motion_live = 0, motion_count = 0;
         ReleaseSRWLockExclusive(&state_lock);
         return;
     }
     int fresh = 0;
-    if (pick != motion_pad || pads[pick].serial != motion_serial) {   /* (another pad, or one reconnected: a fresh filter) */
+    /* (motion_pad: the pad's index, or MOTION_SRC_DECK while the Deck's own sensors are read: no pad, no serial) */
+    const int src = deck_read ? MOTION_SRC_DECK : pick;
+    const int src_serial = src >= 0 ? pads[src].serial : 0;
+    const char *src_name = src >= 0 ? hos_sdl_pad_name(pads[src].gc) : "the Steam Deck's built-in controls";
+    if (src != motion_pad || src_serial != motion_serial) {   /* (another pad, or one reconnected: a fresh filter) */
         hos_motion_reset(&motion);
-        if (pads[pick].has_bias)
-            memcpy(motion.bias, pads[pick].bias, sizeof motion.bias), motion.learned_t = pads[pick].bias_t;
-        motion_pad = pick, motion_serial = pads[pick].serial, motion_ns = now;
+        if (src >= 0 && pads[src].has_bias)
+            memcpy(motion.bias, pads[src].bias, sizeof motion.bias), motion.learned_t = pads[src].bias_t;
+        motion_pad = src, motion_serial = src_serial, motion_ns = now;
         fresh = 1;
         motion_start_ns = now, motion_warned = 0;
-        hos_log("hid: motion controls from \"%s\"", hos_sdl_pad_name(pads[pick].gc));
+        if (src >= 0)
+            hos_log("hid: motion controls from \"%s\"", src_name);
+        else
+            hos_log("hid: motion controls from the Steam Deck's built-in controls, read from the controller");
     }
     /* the filter runs outside the lock (the game's input calls take it); a repeat of the last reading is no reading */
     const int64_t dt_ns = now - motion_ns;
@@ -274,7 +320,8 @@ static void motion_poll(int64_t now, int count) {
         const int z = rx_option(HOS_OPT_GYRO_DEADZONE, 1);
         motion.threshold = zone[z < 0 ? 0 : z > 2 ? 2 : z];
     }
-    if (!hos_motion_update(&motion, a, g, (float)(dt_ns / 1e9), rx_option(HOS_OPT_GYRO_SENS_X, 100) / 100.0f,
+    const float *ma = deck_read ? deck_a : a, *mg = deck_read ? deck_g : g;
+    if (!hos_motion_update(&motion, ma, mg, (float)(dt_ns / 1e9), rx_option(HOS_OPT_GYRO_SENS_X, 100) / 100.0f,
                            rx_option(HOS_OPT_GYRO_SENS_Y, 100) / 100.0f, rx_option(HOS_OPT_GYRO_INV_X, 0),
                            rx_option(HOS_OPT_GYRO_INV_Y, 0)) && !fresh)
         return;
@@ -282,7 +329,7 @@ static void motion_poll(int64_t now, int count) {
         motion_warned = 1;   /* (a pad noisier than the stillness test allows: its drift is never taken off) */
         hos_log("hid: motion: \"%s\" has not been set down yet, so its gyroscope's drift is not learned: set it on a "
                 "table for a second (if it is on a table and this stays, its sensor may be noisier than the stillness "
-                "test allows)", hos_sdl_pad_name(pads[pick].gc));
+                "test allows)", src_name);
     }
     if (debug && now >= motion_log_ns) {   /* (twice a second: what the game gets) */
         motion_log_ns = now + 500000000LL;
@@ -324,9 +371,213 @@ static void motion_only_used(int i, int64_t now) {
     if (sig != pads[i].input_sig) pads[i].input_sig = sig, pads[i].used_ns = now;
 }
 
+/* ---- (longshot) what plays each pad's vibration (host/vibration.h); RenHDrum's backends are host/rumble_renhdrum.c ---- */
+static int vib_force = -1;   /* HOS_RUMBLE_BACKEND, read once */
+/* RenHDrum for a pad of this kind: loaded (once) only for a pad it would play */
+static int vib_rh_for(int kind) {
+    if (vib_force == VIB_FORCE_HD || vib_force == VIB_FORCE_MOTORS || kind == VIB_PAD_OTHER) return 0;
+    return rh_load();
+}
+/* what played pad i lets go of it, and its motors are stopped (whatever plays next sends what is playing) */
+static void vib_leave(int i, int64_t now) {
+    (void)now;
+    void *gc = pads[i].gc;
+    switch (pads[i].vib) {
+    case VIB_RH_DS_USB: rh_usb_close(); break;
+    case VIB_RH_DS_BT: rh_bt_close(); break;
+    case VIB_RH_XBOX:
+        rh_pad_close(gc);
+        hos_sdl_pad_rumble_triggers(gc, 0, 0, 0);
+        break;
+    case VIB_RH_SWITCH:
+        rh_pad_close(gc);
+        /* fall through */
+    case VIB_HD:
+        if (pads[i].hd_ever) {
+            uint8_t neutral[4], packet[HD_RUMBLE_PACKET_SIZE];
+            hd_rumble_neutral(neutral);
+            hd_rumble_packet(HD_RUMBLE_PRO, neutral, neutral, packet);
+            hos_sdl_pad_effect(gc, packet, sizeof packet);
+            memcpy(pads[i].hd_sent, packet, sizeof packet);
+        }
+        break;
+    case VIB_RH_STEAM: rh_steam_close(); break;
+    default: break;
+    }
+    if (pads[i].vib >= 0) hos_sdl_pad_rumble(gc, 0, 0, 0);
+    pads[i].rumble_lo = pads[i].rumble_hi = 0, pads[i].rumble_ns = 0;
+    pads[i].hd_ever = 0;
+    memset(pads[i].four, 0, sizeof pads[i].four), pads[i].four_ns = 0;
+    pads[i].vib = -1;
+}
+static void vib_choose(int i, int mode, int64_t now) {
+    void *gc = pads[i].gc;
+    const int kind = pads[i].vib_kind;
+    /* (one that stopped playing: let go, and chosen again below) */
+    if (pads[i].vib == VIB_RH_DS_USB && !rh_usb_alive()) {
+        hos_log("vibration: the DualSense's sound card went away: its motors until it is back");
+        vib_leave(i, now);
+        pads[i].usb_token = -1, pads[i].usb_next_look = now + 2000000000LL;
+    } else if (pads[i].vib == VIB_RH_DS_BT && !rh_bt_alive()) {
+        vib_leave(i, now);
+        pads[i].vib_failed = VIB_RH_DS_BT, pads[i].vib_retry_ns = now + 30000000000LL;
+    } else if (pads[i].vib == VIB_RH_STEAM && !rh_steam_alive()) {
+        vib_leave(i, now);
+        pads[i].vib_failed = VIB_RH_STEAM, pads[i].vib_retry_ns = now + 30000000000LL;
+    }
+    const int hd = !pads[i].virtual_pad && !pads[i].steam &&
+                   pads[i].hd_kind != HD_RUMBLE_NONE && pads[i].hd != HD_RUMBLE_OFF;
+    int eligible = 1;
+    if (kind == VIB_PAD_SWITCH)
+        eligible = hd && pads[i].hd_kind == HD_RUMBLE_PRO &&
+                   vibration_switch_pro(pads[i].vendor, pads[i].product, pads[i].virtual_pad, pads[i].steam != 0);
+    else if (kind == VIB_PAD_XBOX)
+        eligible = pads[i].vendor == 0x045e;
+    const int rh = eligible && vib_rh_for(kind);
+    int ds_usb = 0, ds_hid = 0;
+    if (rh && kind == VIB_PAD_DUALSENSE && mode == VIB_MODE_AUTO) {
+        void *owner = rh_usb_owner();
+        if (owner == gc) ds_usb = 1;
+        else if (!owner && pads[i].wireless != 1) {
+            if (now >= pads[i].usb_next_look) {
+                pads[i].usb_token = rh_usb_find(gc), pads[i].usb_next_look = now + 2000000000LL;
+            }
+            ds_usb = pads[i].usb_token >= 0;
+        }
+        owner = rh_bt_owner();
+        ds_hid = owner == gc || (!owner && hos_sdl_hid_can() && *hos_sdl_pad_path(gc));
+    } else if (rh && kind == VIB_PAD_STEAM && mode == VIB_MODE_AUTO) {   /* (its grips: its HID device, one pad at a time) */
+        void *owner = rh_steam_owner();
+        ds_hid = owner == gc || (!owner && hos_sdl_hid_can() && *hos_sdl_pad_path(gc));
+    }
+    int want = vibration_pick(mode, vib_force, kind, pads[i].wireless, hd, rh, ds_usb, ds_hid);
+    if (want == pads[i].vib_failed && now < pads[i].vib_retry_ns) want = VIB_MOTORS;   /* (it would not open: not yet) */
+    if (want == pads[i].vib) return;
+    vib_leave(i, now);
+    int ok = 1;
+    if (want == VIB_RH_DS_USB) ok = rh_usb_open(gc, pads[i].usb_token);
+    else if (want == VIB_RH_DS_BT) ok = rh_bt_open(gc, hos_sdl_pad_path(gc));
+    else if (want == VIB_RH_STEAM) ok = rh_steam_open(gc, hos_sdl_pad_path(gc), pads[i].product == VIB_STEAM_CABLE);
+    else if (want == VIB_RH_XBOX || want == VIB_RH_SWITCH)
+        ok = rh_pad_open(gc, want, pads[i].wireless == 1, pads[i].hd_kind == HD_RUMBLE_PRO);
+    if (!ok) {
+        pads[i].vib_failed = (int8_t)want, pads[i].vib_retry_ns = now + 5000000000LL;
+        want = VIB_MOTORS;
+    }
+    if (want != VIB_MOTORS || pads[i].vib_kind != VIB_PAD_OTHER)
+        hos_log("vibration: \"%s\": %s", hos_sdl_pad_name(gc),
+                want == VIB_NONE ? "off" : want == VIB_MOTORS ? "its motors" : want == VIB_HD ? "its own HD rumble" :
+                want == VIB_RH_DS_USB ? "fine haptics on its cable (RenHDrum)" :
+                want == VIB_RH_DS_BT ? "fine haptics over Bluetooth (RenHDrum)" :
+                want == VIB_RH_XBOX ? "four motors (RenHDrum)" :
+                want == VIB_RH_STEAM ? "its grips (RenHDrum, experimental)" : "HD rumble (RenHDrum)");
+    pads[i].vib = (int8_t)want;
+}
+/* an Xbox pad's four motors (RenHDrum): sent when RenHDrum says, and every 100 ms while they turn
+   (SDL's trigger rumble expires after 200 ms) */
+static void four_poll(int i, int64_t now) {
+    uint16_t m[4];
+    int due = rh_xbox_poll(pads[i].gc, now, m);
+    if (!due) {
+        if (!(pads[i].four[0] | pads[i].four[1] | pads[i].four[2] | pads[i].four[3]) || now - pads[i].four_ns < 100000000LL)
+            return;
+        memcpy(m, pads[i].four, sizeof m);
+    }
+    const int on = m[0] || m[1] || m[2] || m[3];
+    hos_sdl_pad_rumble(pads[i].gc, m[0], m[1], on ? 1000 : 0);
+    hos_sdl_pad_rumble_triggers(pads[i].gc, m[2], m[3], on ? 200 : 0);
+    memcpy(pads[i].four, m, sizeof m), pads[i].four_ns = now;
+}
+
+/* Stock SDL does not refresh raw wired Switch reports. The core already schedules Bluetooth resends. */
+static int switch_poll(int i, int64_t now, int strength) {
+    void *gc = pads[i].gc;
+    uint8_t *packet = pads[i].rh_switch_packet;
+    const int fresh = rh_switch_poll(gc, now, packet);
+    uint8_t output[HD_RUMBLE_PACKET_SIZE];
+    if (fresh || pads[i].hd_ever) {
+        memcpy(output, packet, sizeof output);
+        hd_rumble_scale_standard(output + 2, strength);
+        hd_rumble_scale_standard(output + 6, strength);
+        if (pads[i].wireless == 1) {
+            if (!fresh) return 1;
+        } else if (pads[i].hd_ever) {
+            const int64_t elapsed = now - pads[i].hd_ns;
+            const int changed = memcmp(output + 2, pads[i].hd_sent + 2, sizeof output - 2) != 0;
+            /* Keep resends and new wired packets at least one core USB interval apart. */
+            if (elapsed < 15000000LL ||
+                (!changed && (hd_rumble_silent(output) || elapsed < HD_RUMBLE_REFRESH_NS)))
+                return 1;
+        }
+        if (!hos_sdl_pad_effect(gc, output, sizeof output)) {
+            hos_log("vibration: \"%s\": SDL refused the Switch rumble report; its motors instead", hos_sdl_pad_name(gc));
+            pads[i].hd_ever = 0;   /* the effect call just refused this pad */
+            vib_leave(i, now);
+            pads[i].hd = HD_RUMBLE_OFF;
+            pads[i].vib = VIB_MOTORS;
+            return 0;
+        }
+        memcpy(pads[i].hd_sent, output, sizeof output);
+        pads[i].hd_ever = 1;
+        pads[i].hd_ns = now;
+    }
+    return 1;
+}
+
+/* (longshot) Pad i's trigger t (0 left, 1 right) at its reading a (SDL's 0 to 32767): what it gives the game, a, or 0
+   until it counts. It counts once it has read let go (8000 or below) for a second without a break since the pad was
+   opened, as a stick steers once seen at rest. A device whose trigger reads held for good held ZL and ZR from every pad
+   (#2327: a ShanWan USB receiver, 2563:0575), kept the Controls page from listening for a binding (it waits for every
+   input to be let go) and, once the Insert menu closed, kept the player's own triggers from the game (nn_hid.c: an
+   input down at the close waits to be let go). One let-go reading was not enough: with that receiver plugged in,
+   "seen let go once" still let its triggers through (a let-go reading as it opens, or for a moment now and then). A
+   real trigger rests when its pad opens, so it counts after a second. The log says, once each: still not counting 3 s
+   after the pad opened, counting after that, and held 30 s without a break once it counts, with the pad's name and the
+   reading; and, at debug, its first reading and its first changes between let go and held, so a log shows how a
+   device's trigger reads. */
+#define TRIGGER_REST_NS 1000000000LL
+enum { TRIG_SAID_HELD = 1, TRIG_SAID_COUNTS = 4, TRIG_SAID_LONG = 16 };   /* (<< t: the left's bit, then the right's) */
+static int trigger_pull(int i, int t, int a, int64_t now) {
+    const char *side = t ? "right" : "left";
+    const int held = a > 8000;
+    if (!pads[i].trig_changes[t] || (held != (pads[i].trig_held_ns[t] != 0) && pads[i].trig_changes[t] < 9)) {
+        pads[i].trig_changes[t]++;
+        hos_log_at(HOS_LOG_DEBUG, "hid: \"%s\": its %s trigger reads %d of 32767 (%s), %.3f s after it was opened",
+                   hos_sdl_pad_name(pads[i].gc), side, a, held ? "held" : "let go",
+                   (double)(now - pads[i].opened_ns) / 1e9);
+    }
+    if (held) {
+        pads[i].trig_rest_ns[t] = 0;
+        if (!pads[i].trig_held_ns[t]) pads[i].trig_held_ns[t] = now;
+    } else {
+        pads[i].trig_held_ns[t] = 0;
+        if (!pads[i].trig_rest_ns[t]) pads[i].trig_rest_ns[t] = now;
+        if (now - pads[i].trig_rest_ns[t] >= TRIGGER_REST_NS) pads[i].rested |= 1u << (AX_LT + t);
+    }
+    const int counts = pads[i].rested >> (AX_LT + t) & 1;
+    if (!counts && now - pads[i].opened_ns >= 3000000000LL && !(pads[i].trig_said & TRIG_SAID_HELD << t)) {
+        pads[i].trig_said |= TRIG_SAID_HELD << t;
+        hos_log("hid: \"%s\": its %s trigger reads %d of 32767 and has not read let go for a second since it was "
+                "opened, so it does not count until it does", hos_sdl_pad_name(pads[i].gc), side, a);
+    }
+    if (counts && (pads[i].trig_said & TRIG_SAID_HELD << t) && !(pads[i].trig_said & TRIG_SAID_COUNTS << t)) {
+        pads[i].trig_said |= TRIG_SAID_COUNTS << t;
+        hos_log("hid: \"%s\": its %s trigger has read let go for a second (%d of 32767): it counts from now",
+                hos_sdl_pad_name(pads[i].gc), side, a);
+    }
+    if (counts && pads[i].trig_held_ns[t] && now - pads[i].trig_held_ns[t] >= 30000000000LL &&
+        !(pads[i].trig_said & TRIG_SAID_LONG << t)) {
+        pads[i].trig_said |= TRIG_SAID_LONG << t;
+        hos_log("hid: \"%s\": its %s trigger has read held (%d of 32767) for 30 s without a break",
+                hos_sdl_pad_name(pads[i].gc), side, a);
+    }
+    return counts ? a : 0;
+}
+
 /* one poll: controllers plugged in or gone (each second), then every open one's buttons, sticks and rumble */
 static void pads_poll(void) {
     static int64_t next_scan = 0;
+    if (vib_force < 0) vib_force = vibration_force(getenv("HOS_RUMBLE_BACKEND"));
     hos_sdl_pads_update();
         const int64_t now = hos_now_ns();
         if (now >= next_scan) {   /* new controllers (and ones that went away) */
@@ -334,6 +585,8 @@ static void pads_poll(void) {
             for (int i = 0; i < MAX_PADS; i++)
                 if (pads[i].gc && !hos_sdl_pad_connected(pads[i].gc)) {
                     hos_log("hid: controller \"%s\" disconnected (SDL)", hos_sdl_pad_name(pads[i].gc));
+                    hos_pad_speaker_forget(pads[i].gc);
+                    vib_leave(i, now);   /* (longshot) what played its vibration lets go of it first */
                     hos_sdl_pad_close(pads[i].gc);
                     pads[i].gc = NULL;
                     pads[i].rumble_lo = pads[i].rumble_hi = 0;
@@ -355,37 +608,74 @@ static void pads_poll(void) {
                 if (!gc) continue;
                 pads[slot].gc = gc;
                 pads[slot].id = hos_sdl_pad_id(gc);
+                pads[slot].virtual_pad = hos_sdl_pad_virtual(id, opens[j]);
                 pads[slot].rumble_lo = pads[slot].rumble_hi = 0;
                 pads[slot].rumble_ns = 0;
                 hd_open(slot, gc);
+                /* (longshot) what plays its vibration is chosen by the poll below (host/vibration.h) */
+                pads[slot].vib = -1, pads[slot].vib_failed = -1, pads[slot].vib_retry_ns = 0;
+                pads[slot].usb_token = -1, pads[slot].usb_next_look = 0;
+                pads[slot].product = hos_sdl_pad_product(gc);
+                pads[slot].vib_kind = (int8_t)vibration_pad_kind(hos_sdl_load(), hos_sdl_pad_type(gc), hos_sdl_pad_name(gc),
+                                                                 hos_sdl_pad_vendor(gc), pads[slot].product);
+                pads[slot].wireless = (int8_t)hos_sdl_pad_wireless(gc);
                 pads[slot].motion = hos_sdl_pad_has_sensor(gc, HOS_SDL_SENSOR_GYRO) && hos_sdl_pad_has_sensor(gc, HOS_SDL_SENSOR_ACCEL);
                 pads[slot].motion_on = 0;
                 pads[slot].motion_retry_ns = 0;
                 pads[slot].used_ns = now, pads[slot].input_sig = 0;   /* (just connected: the one about to be used) */
                 pads[slot].rested = 0;
                 memset(pads[slot].held, 0, sizeof pads[slot].held);
+                pads[slot].opened_ns = now;
+                pads[slot].trig_held_ns[0] = pads[slot].trig_held_ns[1] = 0;
+                pads[slot].trig_rest_ns[0] = pads[slot].trig_rest_ns[1] = 0;
+                pads[slot].trig_said = 0;
+                pads[slot].trig_changes[0] = pads[slot].trig_changes[1] = 0;
                 pads[slot].serial = ++pads_opened;
                 pads[slot].has_bias = 0;
                 pads[slot].vendor = hos_sdl_pad_vendor(gc);
+                pads[slot].product = hos_sdl_pad_product(gc);
                 pads[slot].steam = hos_sdl_pad_steam_handle(gc);
                 pads[slot].motion_only = 0;   /* (the poll below decides, and says so) */
                 hos_sdl_pad_log_connection(gc, pads[slot].motion, pads[slot].steam != 0);
+            }
+            {   /* (longshot) the controller speaker follows the DualSense that is open (host/pad_speaker.c) */
+                void *dualsense = NULL;
+                int wired = 0;
+                /* Prefer the first known wired pad; otherwise try the first with an unknown transport. */
+                for (int i = 0; i < MAX_PADS; i++) {
+                    const char *name = pads[i].gc ? hos_sdl_pad_name(pads[i].gc) : NULL;
+                    if (!name || pads[i].vendor != 0x054c || (!strstr(name, "DualSense") && !strstr(name, "PS5"))) continue;
+                    const int wireless = hos_sdl_pad_wireless(pads[i].gc);
+                    if (wireless == 0) { dualsense = pads[i].gc; wired = 1; break; }
+                    if (wireless < 0 && !dualsense) { dualsense = pads[i].gc; wired = 1; }
+                }
+                hos_pad_speaker_pad(dualsense, wired);
             }
         }
         uint64_t b = 0;
         int32_t s[4] = {0};
         int count = 0;
         int rx_option(int id, int otherwise);
-        const int strength = rx_option(9, 100);   /* (the menu's Rumble strength: the motors' and HD rumble's) */
+        /* (longshot) the Controls page's Vibration (Auto, Basic, Off) and Vibration strength (percent of the game's, every
+           backend's: host/vibration.h). An options file's Rumble strength of 0 is Off */
+        int strength = rx_option(9, 100);
+        int mode = rx_option(HOS_OPT_VIBRATION, VIB_MODE_AUTO);
+        if (mode < VIB_MODE_AUTO || mode > VIB_MODE_OFF) mode = VIB_MODE_AUTO;
+        if (strength <= 0) mode = VIB_MODE_OFF, strength = 100;
         uint16_t motors[2];
-        rumble_strength((uint16_t)rumble_low, (uint16_t)rumble_high, strength, motors);
-        const uint16_t lo = motors[0], hi = motors[1];
+        /* (Test vibration, or a strength just changed: three quarters of the motors, as the game's is scaled) */
+        const int testing = now < __atomic_load_n(&rumble_test_until, __ATOMIC_RELAXED);
+        /* (RenHDrum's backends: the test, a side gone quiet, the strength, and the Controls page's DualSense HD Haptics) */
+        rh_tick(now, testing, strength, strength * hos_pad_speaker_pad_rumble_percent(rh_usb_owner()) / 100,
+                rx_option(HOS_OPT_DS_HD_HAPTICS, 1) != 0);
+        rumble_strength(testing ? 0xC000 : (uint16_t)rumble_low, testing ? 0xC000 : (uint16_t)rumble_high, strength, motors);
         uint8_t side[3][4];   /* (the HD rumble pads': each side's bytes, then both merged for a single Joy-Con) */
         {
             float hv[2][4], felt[3][4];
             AcquireSRWLockShared(&hd_lock);
             memcpy(hv, hd_values, sizeof hv);
             ReleaseSRWLockShared(&hd_lock);
+            if (testing) hv[0][0] = hv[0][2] = hv[1][0] = hv[1][2] = 0.5f;   /* (HD rumble pads: both bands, at their frequencies) */
             hd_rumble_felt(hv[0], felt[0]);   /* (the game's small amplitudes, as the motors get them) */
             hd_rumble_felt(hv[1], felt[1]);
             hd_rumble_encode(felt[0], strength, side[0]);
@@ -394,6 +684,9 @@ static void pads_poll(void) {
             hd_rumble_encode(felt[2], strength, side[2]);
         }
         int stand_in = 0;   /* (longshot) a Steam stand-in pad open (host/steam_pads.h) */
+        int64_t status_used = -1;   /* (longshot) the Controls page's vibration line: the pad used last */
+        int status_pad = -1;
+        int deck_builtin = 0;   /* (longshot) the Deck's built-in controls give gameplay input: its mouse must not */
         for (int i = 0; i < MAX_PADS; i++) stand_in |= pads[i].gc && pads[i].steam;
         for (int i = 0; i < MAX_PADS; i++) {
             void *gc = pads[i].gc;
@@ -404,8 +697,10 @@ static void pads_poll(void) {
             const int motion_only = steam_pads_motion_only(pads[i].vendor, pads[i].steam, stand_in);
             if (motion_only != pads[i].motion_only) {
                 pads[i].motion_only = motion_only;
+                /* (its rumble goes through Steam's stand-in now: what played it here lets go, or it would play twice) */
+                if (motion_only && pads[i].vib >= 0) vib_leave(i, now);
                 /* (a real Valve pad this SDL opens with no gyroscope: an SDL with no driver for it, so the loosened
-                   list gives no motion, said once so the next person with #1897 sees why) */
+                   list gives no motion, said once so the player sees why) */
                 if (motion_only && !pads[i].motion)
                     hos_log("hid: \"%s\": no motion sensors through this SDL, so Motion controls can't read it; "
                             "its buttons come through Steam Input's pad", hos_sdl_pad_name(gc));
@@ -418,6 +713,7 @@ static void pads_poll(void) {
                 motion_only_used(i, now);
                 continue;
             }
+            if (steam_pads_deck_builtin(pads[i].vendor, pads[i].product, pads[i].steam)) deck_builtin = 1;
             count++;
             uint64_t sig = 0;
             for (int k = BTN_A; k <= BTN_RIGHT; k++)   /* (SDL3's gamepad buttons are in SDL2's order) */
@@ -429,8 +725,13 @@ static void pads_poll(void) {
             /* (longshot) a DualShock 4's or DualSense's touchpad click: it opens the Insert menu as F1 does (vk_menu.cpp).
                SDL numbers it 20, past the buttons above; an SDL without it answers 0 */
             if (hos_sdl_pad_button(gc, BTN_TOUCHPAD)) b |= 1ULL << HOS_PAD_TOUCHPAD;
-            if (hos_sdl_pad_axis(gc, AX_LT) > 8000) b |= 1ULL << HOS_PAD_LTRIGGER;
-            if (hos_sdl_pad_axis(gc, AX_RT) > 8000) b |= 1ULL << HOS_PAD_RTRIGGER;
+            /* (longshot) A trigger presses once it has read let go for a second since the pad was opened (trigger_pull,
+               #2327). */
+            int pull[2];   /* (each trigger's axis, 0 until it counts: HD Haptics' triggers below too) */
+            for (int t = 0; t < 2; t++) {
+                pull[t] = trigger_pull(i, t, hos_sdl_pad_axis(gc, AX_LT + t), now);
+                if (pull[t] > 8000) b |= 1ULL << (t ? HOS_PAD_RTRIGGER : HOS_PAD_LTRIGGER);
+            }
             const int inv_x = rx_option(16, 0);
             const int inv_y = rx_option(17, 0);
             const int z = rx_option(11, 0);   /* (the menu's Stick dead zone) */
@@ -441,8 +742,8 @@ static void pads_poll(void) {
             v[3] = -v[3];
             /* (longshot) An axis steers once it has been seen at rest (inside the dead zone) since the pad was opened. The sticks are
                the strongest of all the pads', so a device whose axis reads held for good (a mapping that puts a trigger or an
-               unused axis on a stick, a second virtual pad) turned the camera or walked Link in circles on its own, with the
-               player's pad at rest (#1673: Xbox 360 pad, CachyOS; #1661: GameSir 2 Lite, wired). A real stick rests at the start. */
+               unused axis on a stick, a second virtual pad) would turn the camera or walk Link in circles on its own, with the
+               player's pad at rest. A real stick rests at the start. */
             /* (a worn stick resting just past a small dead zone counts once it is pushed the other way: it went past its rest) */
             /* Rest is judged per axis, as before the circle: a phantom axis held past the dead zone keeps its partner
                outside the circle, and the partner must still rest at its own center. */
@@ -458,8 +759,9 @@ static void pads_poll(void) {
                the dead zone. Values are already clamped and the circle keeps them, so this changes nothing otherwise. */
             hos_filter_stick((int16_t)v[0], (int16_t)v[1], z, v);
             hos_filter_stick((int16_t)v[2], (int16_t)v[3], z, v + 2);
+            hos_stick_range(rx_option(HOS_OPT_STICK_RANGE, 100), v);   /* (the menu's Stick range: once, after the dead zone) */
             /* Camera inversion changes output, not whether the physical stick crossed its rest position. Otherwise
-               toggling the setting admits a held phantom axis, which stays admitted after the setting is restored (#2273). */
+               toggling the setting admits a held phantom axis, which stays admitted after the setting is restored. */
             if (inv_x) v[2] = -v[2];
             if (inv_y) v[3] = -v[3];
             for (int k = 0; k < 4; k++)
@@ -468,7 +770,30 @@ static void pads_poll(void) {
                 for (int k = 0; k < 4; k++) sig |= (uint64_t)(v[k] > 0 ? 1 : v[k] < 0 ? 2 : 0) << (32 + 2 * k);
                 if (sig != pads[i].input_sig) pads[i].input_sig = sig, pads[i].used_ns = now;
             }
-            if (hd_poll(i, side, now)) continue;
+            /* (longshot) what plays its vibration: chosen again each poll (host/vibration.h), then played */
+            vib_choose(i, mode, now);
+            if (pads[i].used_ns >= status_used) status_used = pads[i].used_ns, status_pad = i;
+            if (pads[i].vib == VIB_NONE) continue;
+            if (pads[i].vib == VIB_HD && hd_poll(i, side, now)) continue;   /* (refused: its motors, and chosen again) */
+            if (pads[i].vib == VIB_RH_DS_USB || pads[i].vib == VIB_RH_DS_BT) {   /* (their own threads play) */
+                /* (HD Haptics' triggers: how far each is pulled, 0 to 255, and whether another button is held) */
+                const int lt = pull[0], rt = pull[1];
+                rh_ds_triggers(gc, now, lt > 0 ? lt * 255 / 32767 : 0, rt > 0 ? rt * 255 / 32767 : 0,
+                               (sig & 0xFFFFFFFFULL) != 0);
+                continue;
+            }
+            if (pads[i].vib == VIB_RH_STEAM) continue;   /* (its own thread plays) */
+            if (pads[i].vib == VIB_RH_XBOX) {
+                four_poll(i, now);
+                continue;
+            }
+            if (pads[i].vib == VIB_RH_SWITCH && switch_poll(i, now, strength)) continue;
+            uint16_t pad_motors[2] = {motors[0], motors[1]};
+            const int pad_percent = hos_pad_speaker_pad_rumble_percent(gc);
+            if (pad_percent != 100)
+                rumble_strength(testing ? 0xC000 : (uint16_t)rumble_low, testing ? 0xC000 : (uint16_t)rumble_high,
+                                strength * pad_percent / 100, pad_motors);
+            const uint16_t lo = pad_motors[0], hi = pad_motors[1];
             if (rumble_due(lo, hi, pads[i].rumble_lo, pads[i].rumble_hi, now, pads[i].rumble_ns)) {
                 hos_sdl_pad_rumble(gc, lo, hi, lo || hi ? 1000 : 0);
                 pads[i].rumble_lo = lo;
@@ -476,29 +801,55 @@ static void pads_poll(void) {
                 pads[i].rumble_ns = now;
             }
         }
+        {   /* (longshot) the Controls page's vibration line: what plays the pad used last (host/vibration.h) */
+            void rx_option_set(int id, int value);
+            int st = vibration_status(VIB_PAD_OTHER, VIB_SAY_NO_PAD);
+            if (status_pad >= 0) {
+                const int k = pads[status_pad].vib_kind;
+                st = vibration_status(k, vibration_say(pads[status_pad].vib, k, pads[status_pad].wireless, vib_rh_for(k),
+                                                       mode));
+            }
+            rx_option_set(HOS_OPT_VIBRATION_STATUS, st);
+        }
         motion_poll(now, count);
         AcquireSRWLockExclusive(&state_lock);
         state_buttons = b;
         memcpy(state_stick, s, sizeof s);
         state_count = count;
+        state_deck_builtin = deck_builtin;
         state_name[0] = 0;
+        state_type = state_sdl = 0;
         for (int i = 0; i < MAX_PADS; i++)
             if (pads[i].gc && !pads[i].motion_only) {   /* (the stand-in's name, not its motion-only pad's) */
                 const char *name = hos_sdl_pad_name(pads[i].gc);
                 snprintf(state_name, sizeof state_name, "%s", name ? name : "");
+                static int sdl;   /* (loaded already: a pad is open; the same SDL the whole run) */
+                if (!sdl) sdl = hos_sdl_load();
+                /* (read each time, as the name: Steam Input's stand-in learns the pad behind it after it opens, and can
+                   change to another. A stand-in for a Nintendo pad says no type: Steam can swap its buttons to the letters
+                   printed on them, so its name's face, as before) */
+                const int type = hos_sdl_pad_type(pads[i].gc);
+                state_type = pads[i].steam && hd_rumble_kind(sdl, type) != HD_RUMBLE_NONE ? 0 : type;
+                state_sdl = sdl;
                 break;
             }
         ReleaseSRWLockExclusive(&state_lock);
 }
 
+static int pads_step(int state) {
+    AcquireSRWLockExclusive(&pad_poll_lock);
+    if (InterlockedCompareExchange(&pads_stopped, 0, 0)) state = -1;
+    if (!state) state = pads_start() ? 1 : -1;
+    if (state > 0) pads_poll();
+    ReleaseSRWLockExclusive(&pad_poll_lock);
+    return state;
+}
+
 static DWORD WINAPI pad_main(void *arg) {
     (void)arg;
     hos_host_thread_register_self("gamepads (SDL)");
-    if (!pads_start()) return 0;
-    for (;;) {
-        pads_poll();
-        Sleep(4);
-    }
+    for (int state = 0; (state = pads_step(state)) > 0;) Sleep(4);
+    return 0;
 }
 #ifndef _WIN32
 int hos_display_owns_sdl(void);   /* host/posix/display_sdl.c */
@@ -508,15 +859,17 @@ int hos_display_owns_sdl(void);   /* host/posix/display_sdl.c */
 static volatile LONG pads_loaded;
 void hos_sdl_pads_pump(void) {
     static int state;   /* 0 not started, 1 polling, -1 not available */
-    if (!state && pads_loaded) state = pads_start() ? 1 : -1;
-    if (state > 0) pads_poll();
+    if (state >= 0 && pads_loaded) state = pads_step(state);
 }
 #endif
 
 /* The controllers' merged state (nn_hid.c): ORs their inputs in (1 << HOS_PAD_*), keeps the larger stick
-   deflections; returns how many controllers SDL has open. Starts the SDL thread on the first call. */
-int hos_sdl_pads(uint64_t *buttons, int32_t stick[4]) {
+   deflections; returns how many controllers SDL has open. Starts the SDL thread on the first call. When
+   deck_builtin_input is not NULL it is set to whether the Deck's built-in controls gave gameplay input in that same
+   poll (host/steam_pads.h): read under this lock, so it and the buttons describe one poll. */
+int hos_sdl_pads(uint64_t *buttons, int32_t stick[4], int *deck_builtin_input) {
     static volatile LONG started;
+    if (deck_builtin_input) *deck_builtin_input = 0;
     if (!started && !InterlockedExchange(&started, 1)) {
         if (env_on("HOS_NO_SDL")) return 0;
         if (!hos_sdl_load()) {
@@ -525,6 +878,10 @@ int hos_sdl_pads(uint64_t *buttons, int32_t stick[4]) {
         }
 #ifdef _WIN32
         CreateThread(NULL, 0, pad_main, NULL, 0, NULL);
+        {   /* (longshot) the Switch 2 Pro Controller over USB, which Windows and this SDL have no driver for: host/pad_switch2.c */
+            void hos_switch2_start(void);
+            hos_switch2_start();
+        }
 #else
         if (hos_display_owns_sdl())
             InterlockedExchange(&pads_loaded, 1);   /* (the window's thread polls: hos_sdl_pads_pump) */
@@ -538,6 +895,7 @@ int hos_sdl_pads(uint64_t *buttons, int32_t stick[4]) {
     for (int k = 0; k < 4; k++)
         if ((state_stick[k] < 0 ? -state_stick[k] : state_stick[k]) > (stick[k] < 0 ? -stick[k] : stick[k]))
             stick[k] = state_stick[k];
+    if (deck_builtin_input) *deck_builtin_input = state_deck_builtin;
     ReleaseSRWLockShared(&state_lock);
     return n;
 }
@@ -553,10 +911,13 @@ int hos_sdl_motion_history(HosMotionSample *out, int max) {
 }
 /* (the Insert menu's Motion controls row) 0 no controller, 1 controllers with no gyroscope, 2 one with a gyroscope */
 int hos_sdl_gyro_status(void) { return (int)gyro_status; }
-/* The first open controller's name into out ("" with none) */
-void hos_sdl_pad_first_name(char *out, size_t cap) {
+/* The first open controller's name into out ("" with none), its SDL type into *type (0 with none, or unknown) and that SDL
+   into *sdl (3, 2; 0 with none), each when not NULL */
+void hos_sdl_pad_first(char *out, size_t cap, int *type, int *sdl) {
     AcquireSRWLockShared(&state_lock);
     snprintf(out, cap, "%s", state_name);
+    if (type) *type = state_type;
+    if (sdl) *sdl = state_sdl;
     ReleaseSRWLockShared(&state_lock);
 }
 
@@ -576,4 +937,30 @@ void hos_sdl_rumble_hd(int side, const float value[4]) {
     AcquireSRWLockExclusive(&hd_lock);
     memcpy(hd_values[side & 1], value, sizeof hd_values[0]);
     ReleaseSRWLockExclusive(&hd_lock);
+}
+
+/* Give a poll already in progress time to finish before releasing its SDL objects. */
+void hos_sdl_vibration_shutdown(void) {
+    if (InterlockedExchange(&pads_stopped, 1)) return;
+    const int64_t deadline = hos_now_ns() + 250000000LL;
+    while (!TryAcquireSRWLockExclusive(&pad_poll_lock)) {
+        if (hos_now_ns() >= deadline) {
+            hos_log("vibration: SDL pad poll did not stop in time for controller cleanup");
+            return;
+        }
+        Sleep(1);
+    }
+    for (int i = 0; i < MAX_PADS; i++) {
+        if (!pads[i].gc || pads[i].vib == VIB_RH_DS_BT || pads[i].vib == VIB_RH_STEAM) continue;
+        vib_leave(i, hos_now_ns());
+    }
+    rh_shutdown();
+    for (int i = 0; i < MAX_PADS; i++) {
+        if (!pads[i].gc) continue;
+        hos_pad_speaker_forget(pads[i].gc);
+        hos_sdl_pad_close(pads[i].gc);
+        pads[i].gc = NULL;
+    }
+    deck_imu_stop();   /* (the Deck's own sensors, if they were being read: the setting goes back as it was found) */
+    ReleaseSRWLockExclusive(&pad_poll_lock);
 }

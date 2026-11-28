@@ -4,10 +4,12 @@
 static void hos_input_clear_toggles(void) {}
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 typedef void *HWND;
 typedef void *HRAWINPUT;
 typedef unsigned UINT;
+typedef uint32_t DWORD;
 typedef int BOOL;
 typedef int32_t LONG;
 typedef uintptr_t WPARAM;
@@ -61,6 +63,10 @@ static ULONGLONG tick = 100000;
 static int awake_calls;
 static EXECUTION_STATE awake_flags;
 ULONGLONG GetTickCount64(void) { return tick; }
+/* The complete window procedure also polls monitor metadata. No display or preference is accessed here. */
+static DWORD __attribute__((unused)) GetTickCount(void) { return (DWORD)tick; }
+static void __attribute__((unused)) hos_monitor_wanted(char out[512]) { out[0] = 0; }
+static void __attribute__((unused)) refresh_monitors(void) {}
 EXECUTION_STATE SetThreadExecutionState(EXECUTION_STATE s) { awake_calls++, awake_flags = s; return 0; }
 BOOL SystemParametersInfoA(UINT action, UINT parameter, void *value, UINT flags) {
     CHECK("only read the secure screen saver policy", action == SPI_GETSCREENSAVESECURE);
@@ -127,7 +133,7 @@ static HWND GetCapture(void) { unexpected(); return NULL; }
 static BOOL ReleaseCapture(void) { unexpected(); return FALSE; }
 static void menu_press(HWND w, LPARAM lp, LONG bit) { (void)w; (void)lp; (void)bit; unexpected(); }
 static void menu_mouse(HWND w, int open, int opened_by_escape) { (void)w; (void)open; (void)opened_by_escape; unexpected(); }
-/* (the game's own menus take the mouse while one of them is shown (host/oot_menu.c); never here either) */
+/* (the game's own menus take the mouse while one of them is shown (game/oot_menu.c); never here either) */
 typedef int64_t LONG64;
 typedef struct { LONG x, y; } POINT;
 static int game_menu_open;

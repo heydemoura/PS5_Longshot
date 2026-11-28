@@ -3,7 +3,7 @@
 
 /** A launcher download link moved to a channel ('' for the best there is); any other link as it was */
 export function launcherHref(href: string, channel: string) {
-  return href.replace(/^(\/download\/launcher\/)(?:(?:stable|rc|nightly)\/)?(windows|windows-portable|linux)$/,
+  return href.replace(/^(\/download\/launcher\/)(?:(?:stable|nightly)\/)?(windows|windows-portable|linux)$/,
     (_, base, os) => base + (channel ? channel + '/' : '') + os);
 }
 
@@ -12,7 +12,7 @@ interface LauncherVersions { bestChannel: string | null; channels: Record<string
 
 /** Reject malformed metadata instead of showing a version beside unrelated download links. */
 export function validateLauncherVersions(value: any): LauncherVersions {
-  const channels = ['stable', 'rc', 'nightly'];
+  const channels = ['stable', 'nightly'];
   if (!value || (value.bestChannel !== null && !channels.includes(value.bestChannel)) || !value.channels) throw new Error('Invalid launcher versions');
   for (const channel of channels) {
     const release = value.channels[channel];
@@ -54,6 +54,8 @@ export function installLauncherChannel(document: Document, fetcher = fetch) {
     for (const { link, href, label } of originals) {
       const kind = href.split('/').at(-1)!;
       const download = release && release.downloads[kind];
+      // A release that lists no portable file has portable mode in its Windows download.
+      link.hidden = kind === 'windows-portable' && !!release && !download;
       if (versions && !download) {
         link.removeAttribute('href');
         link.setAttribute('role', 'link');
@@ -117,16 +119,21 @@ export function preferredPlatform(userAgent: string): 'windows' | 'linux' | null
 }
 
 export async function installLauncherStatus(document: Document, fetcher = fetch) {
-  const status = document.querySelector<HTMLElement>('[data-launcher-status]');
-  if (!status) return;
+  // (the front page shows it twice: under the hero and in the release section's version numbers)
+  const statuses = [...document.querySelectorAll<HTMLElement>('[data-launcher-status]')];
+  if (!statuses.length) return;
   try {
     const response = await fetcher('/download/launcher/versions.json', { signal: AbortSignal.timeout(10000) });
     if (!response.ok) return;
     const versions = validateLauncherVersions(await response.json());
     const channel = versions.bestChannel;
     const release = channel && versions.channels[channel];
-    status.textContent = release
-      ? `${channel === 'stable' ? 'Stable launcher' : channel === 'rc' ? 'Release candidate launcher' : 'Nightly launcher'}: ${release.tag}`
+    const text = release
+      ? `Longshot Launcher ${release.tag} · ${channel === 'stable' ? 'stable' : 'nightly'}`
       : 'No launcher release is available yet.';
+    for (const status of statuses) status.textContent = text;
+    if (release && !release.downloads['windows-portable']) {
+      for (const link of document.querySelectorAll<HTMLElement>('[data-launcher-portable]')) link.hidden = true;
+    }
   } catch { /* Keep the working download-page link when metadata cannot be reached. */ }
 }

@@ -27,15 +27,20 @@ struct Stage {
     // program cache (vk_progcache.cpp), which every translated program passes. Not in vk_shader.cpp, whose bytes are part of
     // the translator's stamp: a change there translates every player's programs again
     mutable uint32_t phis = 0;
+    mutable uint32_t calls = 0;   // (longshot) its OpFunctionCall instructions, noted with the phis (fallback_size_policy.h)
     // (longshot) where its SPIR-V is in longshot_programs.bin, and how many words (0: compressed or translated in this run, so
     // its module stays): once precompile_run has built its pipelines, its module can be let go on Linux and made again from the
     // file if play ever builds a new pipeline state variant for this program
     int64_t code_at = 0;
     uint64_t code_words = 0;
+    // (longshot) its SPIR-V's hash in the shader store (spirv_pack.h), when code_at is a place there: read only with it
+    uint64_t code_hash_a = 0, code_hash_b = 0;
     // (longshot) the record it was read from (its payload's position and stored size): its head is checked before code_at is read
     // again (program_cache_complete_graphics). Here and not in Program, whose size is part of the translator's stamp
     int64_t record_at = 0;
     uint64_t record_size = 0;
+    // (longshot) whether its SPIR-V has nothing that depends on the subgroup it runs in (fallback_lanes.h), noted with the phis
+    mutable bool lane_free = false;
 };
 
 /// A texture handle the stage reads from a storage buffer: its handle program (Shader::Info::handle_programs, Eden's
@@ -44,7 +49,8 @@ struct Stage {
 uint32_t stage_handle(const NvnState& s, const Stage& st, uint32_t program, uint32_t element = 0);
 /// The handles of elements 0 .. count-1 of such a table (one shadow map per light, say), into out: stage_handle for each,
 /// with the constant words and storage buffer addresses the program reads read once
-void stage_handles(const NvnState& s, const Stage& st, uint32_t program, uint32_t count, uint32_t* out);
+/// (key: the program's, for the log line that names which programs a table's count cuts)
+void stage_handles(const NvnState& s, const Stage& st, uint32_t program, uint32_t count, uint32_t* out, uint64_t key = 0);
 
 /// A translated program variant: its stages, in descriptor order. The pipeline layout and pipelines made for it live
 /// in vk_pipeline.cpp (keyed by key).
@@ -95,7 +101,7 @@ struct Program {
     std::vector<Answer> answers;
     uint64_t variant = 0;   // (a hash of the answers: key alone names all the variants of these stages)
     mutable std::atomic<int64_t> wm_sig{-1};   // (longshot: what its write masks are made from, vk_draw.cpp program_wm_sig; -1: not asked yet)
-    // (longshot) how many buffer, image and texel view descriptors its stages have, packed (vk_draw.cpp desc_counts_pack); ~0: not counted yet
+    // (longshot) how many buffer, image and texel view descriptors its stages have, packed (draw_key.h desc_counts_pack); ~0: not counted yet
     mutable std::atomic<uint64_t> desc_counts{~0ull};
     // (longshot) the translation's texture questions as answered, in the order asked: what makes this variant again with nothing
     // bound (the pipeline state list, vk_draw.cpp)
@@ -124,9 +130,12 @@ std::string program_code_keys(const NvnState& s);   // (longshot) " stage:key" f
 const Program* program_pick(const NvnState& s, ProgramKind kind, const uint8_t color_types[8]);   // (program_for without its cache)
 void program_wait(const Program* p);
 uint64_t program_cache_stamp();   // (what the kept programs and pipelines are good for)
+bool pipelines_stamp_ok(uint64_t stamp);   // (a pipeline-side file of this translator, any program cache format up to this one)
+/// (longshot) RX_VK_MESH_FB_LAYOUT, read once (mesh_mode.h mesh_rule::fb_layout): the compute fallback's record layout
+uint32_t mesh_fallback_layout();
 size_t program_cache_load_some(const std::unordered_set<uint64_t>& wanted, const std::function<void(Program&)>& fn,
                                bool computes = true, bool fallbacks = false);   // (computes: and every kept compute program)
-/// The precompile of every shader of the game (longshot_shaders.bin, from nx2/shader_census.py): how many programs it names, 0: none
+/// The precompile of every shader of the game (longshot_shaders.bin, from builder/crates/build-assets/src/census.rs): how many programs it names, 0: none
 size_t seed_open();
 std::string seed_path();   // (longshot_shaders.bin, beside the game)
 void seed_close();
@@ -149,6 +158,7 @@ struct KeptProgram {
 };
 void program_cache_each(const std::function<void(const KeptProgram&)>& fn);   // (fn: on several threads at once, in no order)
 void program_cache_borrow(uint64_t key, const std::function<void(Program&)>& fn);   // (made for fn, then let go; still kept)
+void program_cache_borrow_all(uint64_t key, const std::function<void(std::vector<std::unique_ptr<Program>>&)>& fn);   // (every variant at once)
 /// (longshot) A compute program read from the cache at its key's first pick has no code yet (vk_progcache.cpp
 /// program_cache_load): its SPIR-V is read and its module made here, before the first use of the module (vk_draw.cpp dispatch).
 /// True: it is whole (or was). False: its code did not read or made no module; it is marked failed
@@ -162,6 +172,15 @@ bool program_cache_complete_graphics(const Program& p);
 /// (longshot) Lets go of the VkShaderModules of ready programs whose pipelines are built and whose stages can be remade from
 /// longshot_programs.bin (or are compute stages that need no another pipeline); returns how many modules were destroyed
 size_t program_cache_drop_modules();
+/// (longshot) A graphics program the load at create just read (vk_programs.cpp load_work), every noted pipeline of its variant built
+/// from the caches: its vertex and fragment modules let go now, as program_cache_drop_modules lets a precompiled one's go, where
+/// every stage can be remade from longshot_programs.bin (program_cache_complete_graphics, on the worker that builds a new state
+/// variant in play). Not a fallback program's, not one already let go under another program. Returns the modules destroyed
+size_t program_cache_drop_loaded(Program& p);
+/// (longshot) Whether the load at create lets its programs' modules go (RX_VK_DROP_LOADED_MODULES: 1 on, 0 off; on by default)
+bool drop_loaded_modules_on();
+/// (longshot) Modules made again for programs whose modules were let go (program_cache_complete_graphics), for the log
+int64_t program_cache_remade();
 /// (longshot) precompile_run built p's noted graphics pipelines before the title: program_cache_drop_modules may let its graphics
 /// modules go (an un-noted program or variant keeps them for its first draw in play)
 void program_cache_note_built(const Program& p);
@@ -202,6 +221,9 @@ void shader_stats(int64_t* translated, int64_t* failed);
 /// (longshot) After the preparation's "N failed": a line for each "not translated" line's programs, all of them (those lines stop at 30)
 void shader_fail_lines();
 double shader_translate_ms();
+/// (longshot) The time draws waited for a translation (program_pick's, in place; shader_translate_ms: every translation's,
+/// the jobs' behind the game included)
+double shader_translate_wait_ms();
 void program_released(const nvn_prog* p);
 /// (longshot) A guest program as the game makes it (nvnProgramSetShaders), before any draw (vk_programs.cpp): its stages' code keys
 /// as Program::codes has them (vertex or mesh, fragment, task, the header-only stage; a compute program's stage in codes[0]),

@@ -1,4 +1,4 @@
-"""The game's file system stays inside its mounts and never works through links (host/nn_fs.c, host/mods.c).
+"""The game's file system stays inside its mounts and never works through links (host/nn_fs.c, game/mods.c).
 
 Linux only (the posix layer's FindFirstFileA marks a symbolic link as a reparse point, as Windows does). Builds, from the
 sources as they are, nn_fs.c's guest_path_ok and delete_tree and mods.c's RomFS walk over host/posix/win32_posix.c's file
@@ -33,7 +33,7 @@ def main():
         return
     posix = (ROOT / "host/posix/win32_posix.c").read_text(encoding="utf-8")
     fs = (ROOT / "host/nn_fs.c").read_text(encoding="utf-8")
-    mods = (ROOT / "host/mods.c").read_text(encoding="utf-8")
+    mods = (ROOT / "game/mods.c").read_text(encoding="utf-8")
     pieces = [
         block(posix, "static DWORD error_of(int e) {"),
         "static BOOL fail_errno(void) { last_error = error_of(errno); return FALSE; }",
@@ -51,7 +51,7 @@ def main():
         block(posix, "BOOL FindClose(HANDLE h) {"),
         block(fs, "static int guest_path_ok(const char *rest) {"),
         block(fs, "static void delete_tree(const char *dir) {"),
-        block(mods, "static int index_romfs(const char *host_dir, const char *rel, int depth) {"),
+        block(mods, "static int index_romfs(const char *host_dir, const char *rel, int depth, int mod) {"),
     ]
     fixture = r'''#define _GNU_SOURCE
 #include <windows.h>
@@ -67,10 +67,21 @@ def main():
 #include <unistd.h>
 static DWORD last_error;
 #define HOS_FS_PATH 1024   /* (host/nn_fs.c's path buffers, #1497) */
+#define HOS_PATH_CAP MAX_PATH   /* (host/hos_paths.h, as on Linux: game/mods.c's path buffers) */
 static void hos_log(const char *f, ...) { (void)f; }
 static void lower_slash(char *s) { (void)s; }
 static int nput;
-static void put(const char *key, const char *host, uint64_t size, int is_dir) { (void)key; (void)host; (void)size; (void)is_dir; nput++; }
+static void put(const char *key, const char *host, const char *rel, uint64_t size, int is_dir, int mod) {
+    (void)key; (void)host; (void)rel; (void)size; (void)is_dir; (void)mod; nput++;
+}
+typedef struct { int replaced, added; } Mod;   /* (the mod's counts: game/mods.c) */
+static Mod mods[1];
+typedef struct { char *host, *key; int mod, other; } Shipped;   /* (the size tables a mod carries) */
+static Shipped *shipped;
+static int nshipped;
+static char sizes_key[] = "system/resource/resourcesizetable.product.111.nin_ounce_nvn2.rsizetable.zs";
+static int is_sizes(const char *key) { return strstr(key, ".rsizetable.zs") != NULL; }
+static int game_file(const char *rel, char *out, size_t cap, uint64_t *size) { (void)rel; (void)out; (void)cap; (void)size; return 0; }   /* (game/mods.c: no game file here) */
 ''' + "\n".join(pieces) + r'''
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); return 1; } } while (0)
 int main(int argc, char **argv) {
@@ -96,13 +107,13 @@ int main(int argc, char **argv) {
     snprintf(cmd, sizeof cmd, "mkdir -p '%s/UI' && echo m > '%s/UI/a.bin' && ln -s . '%s/up1' && ln -s . '%s/up2' && "
              "ln -s '%s' '%s/UI/b.bin'", romfs, romfs, romfs, romfs, keep, romfs);
     CHECK(system(cmd) == 0);
-    const int files = index_romfs(romfs, "", 0);
+    const int files = index_romfs(romfs, "", 0, 0);
     CHECK(files == 2);                /* a.bin and the file link b.bin; not the folder links */
     char linked_root[PATH_MAX];       /* a mod whose romfs folder itself is a link */
     snprintf(linked_root, sizeof linked_root, "%s/linked-romfs", argv[1]);
     snprintf(cmd, sizeof cmd, "ln -s '%s' '%s'", romfs, linked_root);
     CHECK(system(cmd) == 0);
-    CHECK(index_romfs(linked_root, "", 0) == 0);
+    CHECK(index_romfs(linked_root, "", 0, 0) == 0);
     char dirlink[PATH_MAX];
     snprintf(dirlink, sizeof dirlink, "%s/up1", romfs);
     CHECK((GetFileAttributesA(dirlink) & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) ==

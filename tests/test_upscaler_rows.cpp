@@ -12,6 +12,10 @@ int main() {
     using ur::DLAA;
     using ur::DLSS;
     using ur::GAME;
+    CHECK("NR engines", ur::supports_nr(ur::DLSS) && ur::supports_nr(ur::DLAA) && ur::supports_nr(ur::FSR3) &&
+                        ur::supports_nr(ur::FSR4) && ur::supports_nr(ur::FSR4_AA));
+    CHECK("unvalidated NR routes excluded", !ur::supports_nr(ur::GAME) && !ur::supports_nr(ur::OFF) &&
+                        !ur::supports_nr(ur::XESS) && !ur::supports_nr(ur::XESS_AA));
     // (the values saved before keep their shares; the new ones are DLSS's ratios, each a twelfth of the output)
     CHECK("saved values keep their shares", ur::percent(0) == 0 && ur::percent(1) == 100 && ur::percent(2) == 75 &&
                                                 ur::percent(3) == 67 && ur::percent(4) == 50);
@@ -214,9 +218,40 @@ int main() {
                                                 !ur::preset_env("05") && ur::dlss_preset(ur::MODEL_M, "7") == 13 &&
                                                 ur::dlss_preset(ur::MODEL_L, "") == 12);
     CHECK("preset letters", ur::preset_letter(11) == 'K' && ur::preset_letter(13) == 'M' && ur::preset_letter(0) == '0');
-    CHECK("model row shown only where DLSS runs", ur::model_shown(true) && !ur::model_shown(false));
+    // (the K row on a card with less than 7 GB of video memory: NVIDIA's CNN, preset E; the row's text and DLSS both ask
+    // cnn_for_vram. 0: the card's memory not known, K)
+    {
+        const uint64_t gb6 = 6ull << 30, gb7 = 7ull << 30, gb8 = 8ull << 30;
+        CHECK("preset E is 5", ur::kPresetE == 5 && ur::preset_letter(ur::kPresetE) == 'E');
+        CHECK("6 GB: the K row draws E", ur::dlss_preset(ur::MODEL_K, nullptr, gb6) == 5 && ur::model_preset(ur::MODEL_K, gb6) == 5 &&
+                                             ur::cnn_for_vram(ur::MODEL_K, gb6) && ur::cnn_for_vram(ur::MODEL_K, gb7 - 1));
+        CHECK("7 GB and more, or not known: K", ur::dlss_preset(ur::MODEL_K, nullptr, gb8) == 11 &&
+                                                    ur::dlss_preset(ur::MODEL_K, nullptr, gb7) == 11 &&
+                                                    ur::dlss_preset(ur::MODEL_K, nullptr, 0) == 11 && !ur::cnn_for_vram(ur::MODEL_K, 0));
+        CHECK("6 GB: M, L and NVIDIA's default as chosen", ur::dlss_preset(ur::MODEL_M, nullptr, gb6) == 13 &&
+                                                               ur::dlss_preset(ur::MODEL_L, nullptr, gb6) == 12 &&
+                                                               ur::dlss_preset(ur::MODEL_DEFAULT, nullptr, gb6) == 0 &&
+                                                               !ur::cnn_for_vram(ur::MODEL_M, gb6) && !ur::cnn_for_vram(ur::MODEL_DEFAULT, gb6));
+        CHECK("6 GB: RX_VK_DLSS_PRESET wins", ur::dlss_preset(ur::MODEL_K, "K", gb6) == 11 && ur::dlss_preset(ur::MODEL_K, "m", gb6) == 13 &&
+                                                  ur::dlss_preset(ur::MODEL_K, "0", gb6) == 0);
+        CHECK("6 GB: a switch that is no preset leaves E", ur::dlss_preset(ur::MODEL_K, "1", gb6) == 5 &&
+                                                               ur::dlss_preset(ur::MODEL_K, "", gb6) == 5 &&
+                                                               ur::dlss_preset(ur::MODEL_K, "05", gb6) == 5);
+    }
+    CHECK("model row shown only with DLSS chosen where it runs", ur::model_shown(true, DLSS) && ur::model_shown(true, DLAA) &&
+                                                                 !ur::model_shown(false, DLSS) && !ur::model_shown(true, GAME) &&
+                                                                 !ur::model_shown(true, ur::OFF) && !ur::model_shown(true, ur::FSR4));
     CHECK("model row fixed with the game's own or the switch", ur::model_fixed(GAME, false) && !ur::model_fixed(DLSS, false) &&
                                                                !ur::model_fixed(DLAA, false) && ur::model_fixed(DLSS, true));
+    // the FSR 4 model row: Auto or Lite, shown only where FSR 4 and its Lite provider run, fixed with another upscaler or
+    // the switch
+    CHECK("FSR 4 model values", ur::FSR4_MODEL_AUTO == 0 && ur::FSR4_MODEL_LITE == 1 && ur::kFsr4Models == 2);
+    CHECK("FSR 4 model row shown only with FSR 4 and Lite", ur::fsr4_model_shown(true, true) && !ur::fsr4_model_shown(true, false) &&
+                                                               !ur::fsr4_model_shown(false, true));
+    CHECK("FSR 4 model row fixed with another upscaler or the switch", !ur::fsr4_model_fixed(ur::FSR4, false) &&
+                                                                          !ur::fsr4_model_fixed(ur::FSR4_AA, false) &&
+                                                                          ur::fsr4_model_fixed(ur::DLSS, false) &&
+                                                                          ur::fsr4_model_fixed(ur::FSR4, true));
 
     // Native under its engine: the Upscaler row by engine, DLAA / FSR 4's native AA as the Render
     // resolution row's Native (Auto, Native, then the modes)
@@ -297,12 +332,17 @@ int main() {
         CHECK("offset 0: the render size's own detail (as before)", near(ur::upscale_lod_bias_for(DLSS, 6667, 0.0f), std::log2(6667 / 7500.0f)) &&
                                                                       ur::upscale_lod_bias_for(DLSS, 0, 0.0f) == 0.0f &&
                                                                       ur::upscale_lod_bias_for(DLAA, 0, 0.0f) == 0.0f);
-        CHECK("FSR: the output's mips below 3/4 only", near(ur::upscale_lod_bias_for(ur::FSR3, 5000, -1.0f), std::log2(5000 / 7500.0f)) &&
-                                                         ur::upscale_lod_bias_for(ur::FSR4, 0, -1.0f) == 0.0f &&
-                                                         ur::upscale_lod_bias_for(ur::FSR3, 10000, -1.0f) == 0.0f);
-        CHECK("no bias for the game's own, Off and FSR 4's native AA",
-              ur::upscale_lod_bias_for(GAME, 6667, -1.0f) == 0.0f && ur::upscale_lod_bias_for(ur::OFF, 5000, -1.0f) == 0.0f &&
-                  ur::upscale_lod_bias_for(ur::FSR4_AA, 0, -1.0f) == 0.0f);
+        CHECK("FSR 3.1 / FSR 4: same -1.0 offset as DLSS",
+              near(ur::upscale_lod_bias_for(ur::FSR3, 5000, -1.0f), -1.585f) &&
+                  near(ur::upscale_lod_bias_for(ur::FSR4, 0, -1.0f), -1.0f) &&
+                  near(ur::upscale_lod_bias_for(ur::FSR3, 10000, -1.0f), -0.585f) &&
+                  near(ur::upscale_lod_bias_for(ur::FSR4_AA, 0, -1.0f), -0.585f));
+        CHECK("XeSS: the output's mips below 3/4 only",
+              near(ur::upscale_lod_bias_for(ur::XESS, 5000, -1.0f), std::log2(5000 / 7500.0f)) &&
+                  ur::upscale_lod_bias_for(ur::XESS, 0, -1.0f) == 0.0f &&
+                  ur::upscale_lod_bias_for(ur::XESS_AA, 0, -1.0f) == 0.0f);
+        CHECK("no bias for the game's own and Off",
+              ur::upscale_lod_bias_for(GAME, 6667, -1.0f) == 0.0f && ur::upscale_lod_bias_for(ur::OFF, 5000, -1.0f) == 0.0f);
     }
     std::puts("upscaler rows: all checks passed");
 }

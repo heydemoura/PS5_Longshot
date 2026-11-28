@@ -1,5 +1,5 @@
 /* (longshot) Whole frames out of a frame step that can be under one, for the game's counters that add the step, or the step
-   times a whole number, cut to whole frames (nx2/oot_patches.py patch_whole_frames). At the console's 60 fps the step is 1 and
+   times a whole number, cut to whole frames (the hook sites frame.whole*). At the console's 60 fps the step is 1 and
    they count frames. Under a Frame rate cap above 60 the step is the frame's own time (host/nn_vi.c, hos_frame_seconds_bits):
    0.42 at 144 fps, cut to 0 every frame, and the counter never moves, so what waits on it never comes: the pick-up indicator
    above Link's head counts the rupees shown up to the wallet's (f_80a87e50: the shown +864 moves by (int)(step * the
@@ -44,4 +44,18 @@ static inline uint32_t frame_whole(FrameWhole *w, uint64_t at, uint32_t amount_b
     const uint32_t whole = frame_whole_cut(sum);
     w->rem[slot] = sum - (float)whole;
     return whole;
+}
+
+/* (the whole frames of the amount, times a whole number of substeps each, for a counter that runs that many substeps a frame:
+   the water's ripple simulation, f_800672e0). The game cuts the amount and then multiplies, so above 60 fps a frame runs all its
+   substeps or none, and the ripples stand still for a frame and then jump. With the carry the substeps are
+   handed out instead, their fractions kept per counter: 2 or 3 of 4 a frame at 108 fps. Without it, cut as the game cuts it. */
+static inline uint32_t frame_whole_times(FrameWhole *w, uint64_t at, uint32_t amount_bits, uint32_t times, int carry) {
+    float amount;
+    memcpy(&amount, &amount_bits, 4);
+    if (!carry) return frame_whole_cut(amount) * times;
+    const float scaled = amount * (float)times;
+    uint32_t scaled_bits;
+    memcpy(&scaled_bits, &scaled, 4);
+    return frame_whole(w, at, scaled_bits, 1);
 }

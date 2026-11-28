@@ -18,14 +18,18 @@ def main():
     docs = (ROOT / "docs" / "PS5.md").read_text(encoding="utf-8")
     mode = replay[replay.index("int render_thread_mode() {"):]
     mode = mode[:mode.index("\n}\n")]
+    choice = menu[menu.index("static const threaded::Choice& threaded_choice() {"):]
+    choice = choice[:choice.index("\n}\n")]
+    ps5 = choice[choice.index("#ifdef __PROSPERO__"):choice.index("#endif")]
     checks = [
-        (bool(re.search(r"#ifdef __PROSPERO__\n(?:\s*//[^\n]*\n)*\s*return e \? atoi\(e\) : 0;\n#else\n"
-                        r"\s*return e \? atoi\(e\) : menu_threaded_rendering\(\) \? 1 : 0;\n#endif", mode)),
+        # (this tree's row has two halves, threaded_rendering.h: the render thread's reader asks the menu for its half, and the
+        # console's choice never has it)
+        ("return e ? atoi(e) : menu_render_thread() ? 1 : 0;" in mode, "the render thread's mode does not ask the row's render half"),
+        ("rec::g_setting_thread = menu_recorder_thread" in replay, "the row's On does not reach the recorder"),
+        (bool(re.search(r"if \(c\.why == threaded::Why::On\) \{\n\s*c\.render_thread = false;", ps5)),
          "the console's row can start the render thread"),
-        ("rec::g_setting_thread = menu_threaded_rendering" in replay, "the row's On does not reach the recorder"),
-        (bool(re.search(r"#ifdef __PROSPERO__\n(?:\s*//[^\n]*\n)*\s*if \(c\.why == threaded::Why::AutoCpus \|\| "
-                        r"c\.why == threaded::Why::AutoFewCpus\) \{\n\s*c = threaded::Choice\{false, threaded::Why::AutoUnsafe\};",
-                        menu)),
+        (bool(re.search(r"if \(threaded::auto_picked\(c\) \|\| c\.why == threaded::Why::AutoFewCores\) \{\n"
+                        r"\s*c = threaded::Choice\{false, false, threaded::Why::AutoUnsafe\};", ps5)),
          "Auto is not Off on the console"),
         ('{"RX_VK_DESC_POOL_DIV", "8"}' in host, "the console's descriptor pools are no longer an eighth"),
         ("RX_VK_RECORDER" not in host, "hos_main.c sets a recorder switch on the console"),

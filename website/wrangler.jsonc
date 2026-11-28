@@ -1,6 +1,7 @@
 // The Worker serving longshot.magicbean.dev: the built site (dist/), with worker/index.ts answering /download (the
-// Longshot Launcher's permanent download links). Deployed from main by .forgejo/workflows/website.yml; a pull request's
-// preview uploads a version without deploying it.
+// Longshot Launcher's permanent download links). Deployed from main by MagicBeanAdmin/Release's longshot-website.yml; a pull
+// request's preview (its longshot-website-preview.yml) uploads a version without deploying it. Release checks this file as
+// data before a deploy: the Worker's name, route and assets folder below, no `build`, `site` or `env` (its scripts/website.py).
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "longshot-website",

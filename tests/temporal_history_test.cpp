@@ -13,6 +13,7 @@
 namespace dlss_math = mkwvk::dlss_math;
 struct State {
     uint64_t last_frame = 99;
+    uint64_t moved = 0;   // (draw_engine's: the engine's frame before, kept across a change of DLAA's place)
     int last_format = 122; bool last_psycho = false;
     float last_vp[16]{}, last_jitter[2]{};
     struct { unsigned width = 1920, height = 1080; } frame;
@@ -23,8 +24,9 @@ struct Decision { bool reset, motion; };
 enum Engine { DLSS, FSR4, XESS };
 Decision temporal(State& s, const Camera& cam, uint64_t now, Engine engine) {
     const uint64_t last = s.last_frame;
+    const uint64_t moved = s.moved;
     /* CHAIN_POLICY */
-    (void)show_motion;
+    (void)show_motion; (void)moved;
     struct { bool reset; } f{};
     /* CHAIN_SINK */
     struct { unsigned InReset; } ep{};
@@ -124,6 +126,21 @@ int main() {
             for (float v : out) check(std::isfinite(v), "accepted non-finite shader coefficient");
         }
     }
+    // (longshot) DLAA before the bloom changing place: the engine's history restarts (last_frame 0), and the motion
+    // stays, the engine having drawn the frame before at the other place (moved); not after a gap, nor with no frame
+    // before
+    identity(s.last_vp); identity(camera.current);
+    s.last_frame = 0;
+    for (uint64_t moved : {99, 98, 97, 0}) {
+        s.moved = moved;
+        for (auto call : {dlss, fsr4, xess}) {
+            const Decision d = call(s, camera, 100);
+            check(d.reset, "a change of place kept the engine's history");
+            check(d.motion == (moved >= 98), moved >= 98 ? "a change of place lost the motion"
+                                                         : "a change of place after a gap kept the motion");
+        }
+    }
+    s.moved = 0;
     identity(s.last_vp); identity(camera.current);
     s.last_frame=99;s.last_format=122;s.last_psycho=false;
     check(fsr_format(s,camera,100,97,true).reset,"FSR kept history across Psycho/format change");

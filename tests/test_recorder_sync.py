@@ -12,10 +12,9 @@ python -I -B tests/test_recorder_sync.py --headers <Vulkan-Headers/include> [--c
    Run with RX_VK_RECORDER=sync and without, so the switch is read as the renderer reads it.
    RX_VK_RECORDER=defer (step 1.5), against the fake's command buffer lifecycle: two command buffers recorded into interleaved,
    reset/begun/ended/submitted/waited for twice, a query read and a destruction, the caller's memory poisoned; a recording handed
-   between two threads under the replay lock; a 2 KB soft budget; a 1 MB hard budget; the second chunk's allocation failing; a
-   parallel replay running (par_active). Each must log what the direct calls log, no command outside its command buffer's recording,
-   no exception out of a vkCmd*, no block lost. Run with RX_VK_RECORDER=defer (mode 2, logged once) and with RX_VK_PARALLEL=4 too
-   (refused: off, logged once).
+   between two threads under the replay lock; a 2 KB soft budget; a 1 MB hard budget; the second chunk's allocation failing.
+   Each must log what the direct calls log, no command outside its command buffer's recording, no exception out of a vkCmd*, no
+   block lost. Run with RX_VK_RECORDER=defer (mode 2, logged once).
    RX_VK_RECORDER=thread (step 2): the same frame and lifecycle with every vkCmd* run by a recorder thread, the fake driver slowed
    (1 us a call) so the recorder lags, and in the ordering scenarios the recorder held (50 ms) at each point the producer must wait
    for it (a recording's end, a submit while another command buffer records, the replay lock let go, a pool reset), so a missing
@@ -23,12 +22,12 @@ python -I -B tests/test_recorder_sync.py --headers <Vulkan-Headers/include> [--c
    violation), the caller's memory poisoned and each packet poisoned once run; a handoff under the lock; a submit while another
    command buffer's commands are in flight; a pool reset while recording; the lock let go, then the recording ended on another
    thread; an 8 KB ring (backpressure); a packet bigger than its room (made directly, in order; again first in an empty ring); no
-   memory for the ring; teardown with work queued (stop, join, lazy restart, vkDestroyDevice); par_active; >= 1e6 packets through a
-   16 KB ring, twice, hashed against the direct stream. --throw: a driver call that throws on the recorder thread ends the process
-   (exit code 3, FATAL). Run with RX_VK_RECORDER=thread (mode 3, logged once) and with RX_VK_PARALLEL=4 (refused).
+   memory for the ring; teardown with work queued (stop, join, lazy restart, vkDestroyDevice); >= 1e6 packets through a 16 KB
+   ring, twice, hashed against the direct stream. --throw: a driver call that throws on the recorder thread ends the process
+   (exit code 3, FATAL). Run with RX_VK_RECORDER=thread (mode 3, logged once).
 3. The test has teeth: vk_recorder.h with a copy left shallow (all of them, or only the descriptor writes' image infos), with the
    fallback's drain left out, with no drain before vkEndCommandBuffer, with the replay lock let go without a drain, with a throwing
-   allocation (exception safety broken), with the failure's drain left out, or with the parallel refusal left out, must fail it.
+   allocation (exception safety broken), or with the failure's drain left out, must fail it.
    Thread (each run with --only thread, so the recorder thread's checks alone catch it): no wait before vkEndCommandBuffer, before
    vkQueueSubmit2, at the replay lock's release, before vkResetCommandPool; no backpressure (the ring overwritten); no join at
    teardown; a packet bigger than its room written into the ring when the ring has more free; the recorder's exception swallowed
@@ -47,13 +46,13 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 
 # (env_on, the switches' rule, before the code cut out of the sources: gpu/vk/compat/longshot_env.h)
 ENV_ON_H = str(Path(__file__).resolve().parents[1] / "gpu" / "vk" / "compat" / "longshot_env.h")
 
 RUN_ALL_ARGS = ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"]
+RUN_ALL_ALONE = True   # (it measures time or CPU, or races threads: beside other checks on a loaded runner it failed or timed out)
 
 ROOT = Path(__file__).resolve().parents[1]
 VK = ROOT / "gpu" / "vk"
@@ -95,11 +94,14 @@ B_DIRECT_STMT = "::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);"
 
 C_COMMENT_OR_STRING = re.compile(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])*\'', re.S)
 UI_RECORD_CALL = re.compile(r"\bui\s*::\s*record(?:_to)?\s*\(")
-NGX_RECORD_CALL = re.compile(r"\bNGX_(?:VULKAN_\w+_EXT|VK_\w+_DLSSG)\s*\(")   # (NVIDIA NGX's create/evaluate, DLSS's and frame generation's: its own commands into cmd)
+# (and DLSS 5's direct path, vk_dlss.cpp NrDirect: the FP16 model's own create and evaluate, d.create and d.evaluate through
+# the forwarder, record into cmd as NGX's do)
+NGX_RECORD_CALL = re.compile(r"\b(?:NGX_(?:VULKAN_\w+_EXT|VK_\w+_DLSSG)|NVSDK_NGX_VULKAN_(?:CreateFeature|EvaluateFeature))\s*\("
+                             r"|\bd\s*\.\s*(?:create|evaluate)\s*\(\s*d\s*\.\s*model_(?:create|evaluate)\b")
 FFX_RECORD_CALL = re.compile(r"\bl\s*\.\s*dispatch\s*\(")   # (AMD FidelityFX's ffxDispatch, through its loaded pointer: its own commands into cmd)
 XESS_RECORD_CALL = re.compile(r"\bl\s*\.\s*execute\s*\(")   # (Intel XeSS's xessVKExecute, through its loaded pointer: its own commands into cmd)
 OPAQUE_RECORD_CALL = re.compile(UI_RECORD_CALL.pattern + "|" + NGX_RECORD_CALL.pattern + "|" + FFX_RECORD_CALL.pattern + "|" +
-                                XESS_RECORD_CALL.pattern)
+                                XESS_RECORD_CALL.pattern + r"|\bnr_(?:create|evaluate)_feature\s*\(")
 B_DIRECT_BEFORE = re.compile(r"::\s*mkwvk\s*::\s*rec\s*::\s*boundary\s*\(\s*::\s*mkwvk\s*::\s*rec\s*::\s*B_DIRECT\s*\)\s*;\Z")
 
 
@@ -125,11 +127,11 @@ def direct_unbounded(text, fname="vk_menu.cpp", call=UI_RECORD_CALL):
 
 
 def opaque_unregistered(text, fname):
-    """note_work() written out by hand marks commands vk_work.h did not see: each must follow a call this test knows
+    """note_work() or note_other_work() written out by hand marks commands vk_work.h did not see: each must follow a call this test knows
     (OPAQUE_RECORD_CALL), so a new library recording into the command buffer has to be added here, with its boundary"""
     code = blank_comments(text)
     bad = []
-    for m in re.finditer(r"(?<![\w:])(?:::\s*mkwvk\s*::\s*)?note_work\s*\(\s*\)\s*;", code):
+    for m in re.finditer(r"(?<![\w:])(?:::\s*mkwvk\s*::\s*)?note_(?:other_)?work\s*\(\s*\)\s*;", code):
         if not OPAQUE_RECORD_CALL.search(code[max(0, m.start() - 600):m.start()]):   # (in the few statements before it)
             bad.append("%s:%d: note_work() after a recording this test does not know: add it to OPAQUE_RECORD_CALL with a "
                        "B_DIRECT boundary" % (fname, code.count("\n", 0, m.start()) + 1))
@@ -237,6 +239,12 @@ def check_sources():
     problems += direct_unbounded(dlss, "vk_dlss.cpp", NGX_RECORD_CALL)
     if B_DIRECT_STMT in dlss and not direct_unbounded(dlss.replace(B_DIRECT_STMT, "", 1), "vk_dlss.cpp", NGX_RECORD_CALL):
         problems.append("the B_DIRECT check missed an NGX recording without its boundary")
+    for name in ("NVSDK_NGX_VULKAN_CreateFeature", "NVSDK_NGX_VULKAN_EvaluateFeature", "d.create", "d.evaluate"):
+        site = dlss.index(name + "(")
+        boundary = dlss.rindex(B_DIRECT_STMT, 0, site)
+        broken = dlss[:boundary] + dlss[boundary + len(B_DIRECT_STMT):]
+        if not direct_unbounded(broken, "vk_dlss.cpp", NGX_RECORD_CALL):
+            problems.append("the B_DIRECT check missed an NR recording without its boundary: " + name)
     # (AMD FSR 4 records into cmd through ffxDispatch: after a B_DIRECT boundary; control: that boundary removed)
     fsr4 = (VK / "vk_fsr4.cpp").read_text(encoding="utf-8")
     problems += direct_unbounded(fsr4, "vk_fsr4.cpp", FFX_RECORD_CALL)
@@ -282,6 +290,7 @@ def build(cxx, headers, out, recorder_text, name, extra=(), work_text=None):
     (d / "vk_work.h").write_text(work_text or (VK / "vk_work.h").read_text(encoding="utf-8"), encoding="utf-8")
     (d / "vk_recorder.h").write_text(recorder_text, encoding="utf-8")
     (d / "gpu_wait_stats.h").write_text((VK / "gpu_wait_stats.h").read_text(encoding="utf-8"), encoding="utf-8")
+    (d / "vk_new.h").write_text((VK / "vk_new.h").read_text(encoding="utf-8"), encoding="utf-8")   # (NewNothrow, issue 1280)
     exe = d / "recorder_sync_test.exe"
     cmd = [cxx, "-std=c++20", "-include", ENV_ON_H, "-O2", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function", "-Wno-missing-field-initializers", "-DVK_NO_PROTOTYPES",
            "-D_CRT_SECURE_NO_WARNINGS",
@@ -294,7 +303,8 @@ def build(cxx, headers, out, recorder_text, name, extra=(), work_text=None):
 
 def run(exe, env_mode, *args, parallel=None, timeout=600):
     env = dict(os.environ)
-    for k in ("RX_VK_RECORDER", "RX_VK_PARALLEL", "RX_VK_RECORDER_POISON", "RX_VK_RECORDER_RING_MB", "RX_VK_RECORDER_STATS"):
+    for k in ("RX_VK_RECORDER", "RX_VK_PARALLEL", "RX_VK_RECORDER_POISON", "RX_VK_RECORDER_RING_MB", "RX_VK_RECORDER_STATS",
+              "RX_VK_RECORDER_PARTS"):
         env.pop(k, None)
     if env_mode:
         env["RX_VK_RECORDER"] = env_mode
@@ -313,10 +323,8 @@ ENV_RUNS = (
     (None, None, "env mode 0", ()),
     ("defer", None, "env mode 2", ("LOG: vk: RX_VK_RECORDER=defer:",)),
     ("defer", "1", "env mode 2", ("LOG: vk: RX_VK_RECORDER=defer:",)),
-    ("defer", "4", "env mode 0", ("LOG: vk: RX_VK_RECORDER=defer refused: RX_VK_PARALLEL=4",)),
     ("thread", None, "env mode 3", ("LOG: vk: RX_VK_RECORDER=thread: vkCmd* packed",)),
     ("thread", "1", "env mode 3", ("LOG: vk: RX_VK_RECORDER=thread: vkCmd* packed",)),
-    ("thread", "4", "env mode 0", ("LOG: vk: RX_VK_RECORDER=thread refused: RX_VK_PARALLEL=4",)),
 )
 
 
@@ -369,6 +377,7 @@ def exit_test(cxx, headers, out, recorder_text, name):
     (d / "vk_work.h").write_text((VK / "vk_work.h").read_text(encoding="utf-8"), encoding="utf-8")
     (d / "vk_recorder.h").write_text(recorder_text, encoding="utf-8")
     (d / "gpu_wait_stats.h").write_text((VK / "gpu_wait_stats.h").read_text(encoding="utf-8"), encoding="utf-8")
+    (d / "vk_new.h").write_text((VK / "vk_new.h").read_text(encoding="utf-8"), encoding="utf-8")   # (NewNothrow, issue 1280)
     src = str(ROOT / "tests" / "recorder_exit_test.cpp")
     flags = ["-std=c++20", "-include", ENV_ON_H, "-O2", "-Wall", "-Wextra", "-Werror", "-DVK_NO_PROTOTYPES", "-D_CRT_SECURE_NO_WARNINGS"]
     for cmd in ([cxx, *flags, "-shared", "-DRX_EXIT_DLL", "-I" + str(d), "-I" + str(headers), src, "-o", str(d / "rx_exit.dll")],
@@ -441,7 +450,7 @@ def main():
          broken(rec, "c[i].pImageInfo = e.dup(w[i].pImageInfo, w[i].descriptorCount);",
                 "c[i].pImageInfo = w[i].pImageInfo;", "push descriptors"), work_h, ("sync", None)),
         ("fallback without the drain (order)",
-         broken(rec, "    else drain();\n    t_arena.fallbacks++;", "    t_arena.fallbacks++;", "fallback"), work_h, ("sync", None)),
+         broken(rec, "    else drain();\n    t_arena().fallbacks++;", "    t_arena().fallbacks++;", "fallback"), work_h, ("sync", None)),
         ("defer: no drain before vkEndCommandBuffer",
          rec, no_wait(work_h, "vkEndCommandBuffer"), (None, None)),
         ("defer: the replay lock let go without a drain",
@@ -452,9 +461,6 @@ def main():
         ("defer: an allocation failure's call made before the held ones (no drain)",
          broken(rec, "            if (md == DEFER) drain();   // (what is held first", "            if (0) drain();   // (what is held first",
                 "failure drain"), work_h, (None, None)),
-        ("defer: the parallel refusal left out (RX_VK_PARALLEL=4)",
-         broken(rec, "        if (!parallel_configured()) return e[0] == 'd' ? DEFER : THREAD;", "        return e[0] == 'd' ? DEFER : THREAD;",
-                "parallel"), work_h, ("defer", "4")),
         # (the recorder thread's: run with --only thread)
         ("thread: no wait before vkEndCommandBuffer", rec, no_wait(work_h, "vkEndCommandBuffer"), ("--only", None)),
         ("thread: no wait before vkQueueSubmit2", rec, no_wait(work_h, "vkQueueSubmit2"), ("--only", None)),
@@ -484,22 +490,14 @@ def main():
         # in flight must fail; with none listed, nothing to check)
         ("thread: the calls of unordered() (%s) waiting after all" % ", ".join(unordered_calls(rec)),
          broken(rec, "        else if (unordered(k)) return;\n", "", "skip"), work_h, ("--only", None))
-    ][:1 if unordered_calls(rec) else 0] + [
-        ("thread: the parallel refusal left out (RX_VK_PARALLEL=4)",
-         broken(rec, "        if (!parallel_configured()) return e[0] == 'd' ? DEFER : THREAD;", "        return e[0] == 'd' ? DEFER : THREAD;",
-                "parallel"), work_h, ("thread", "4")),
-    ]
+    ][:1 if unordered_calls(rec) else 0]
     # (built a few at once, while the ones before them run: each is still run and reported in its order)
     pool = concurrent.futures.ThreadPoolExecutor(min(4, os.cpu_count() or 1))
     builds = [pool.submit(build, a.cxx, a.headers, out, text, "broken%d" % i, work_text=wtext)
               for i, (_, text, wtext, _) in enumerate(variants)]
     for i, (what, text, wtext, (env_mode, parallel)) in enumerate(variants):
         exe_b = builds[i].result()
-        if parallel:
-            refused = [e for e in ENV_RUNS if e[0] == env_mode and e[1] == "4"][0]
-            ok, r = env_run_ok(exe_b, env_mode, parallel, "env mode 0", refused[3], show=False)
-            caught = not ok
-        elif env_mode == "--only":
+        if env_mode == "--only":
             r = run(exe_b, None, "--only", "thread", timeout=120)
             caught = r.returncode != 0
         elif env_mode == "--throw":
@@ -516,7 +514,7 @@ def main():
         if not caught:
             raise SystemExit("FAIL: a broken recorder (%s) passed" % what)
     pool.shutdown()
-    if a.bench or a.overlap:   # (with the renderer's CPU flags, nx2/build.py's CPU: RX_MARCH or x86-64-v3)
+    if a.bench or a.overlap:   # (with the renderer's CPU flags, the builder's CPU: RX_MARCH or x86-64-v3)
         fast = build(a.cxx, a.headers, out, rec, "bench", ["-march=" + os.environ.get("RX_MARCH", "x86-64-v3"), "-ffp-contract=off"])
         if a.bench:
             r = run(fast, None, "--bench", str(a.bench))

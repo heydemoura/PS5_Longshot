@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Render the maintained menu without a game, Vulkan device, window or private assets.
 Linux capture helper; optional SDL2/libpng/C++/Vulkan-header dependencies are not used
-by documentation builds. See docs/images/guide/README.md for the capture contract.
+by documentation builds. See docs/user/images/guide/README.md for the capture contract.
 """
 import argparse
 import hashlib
@@ -25,8 +25,13 @@ def main():
     parser.add_argument('--vulkan-headers', type=Path, default=Path('/usr/include'), help='include directory containing vulkan/vulkan.h')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--cxx', default='clang++')
+    parser.add_argument('--views', nargs='+', choices=[v + theme for v in ('graphics', 'graphics-screen', 'audio', 'controls', 'startup') for theme in ('', '-classic')],
+                        default=['graphics', 'audio', 'controls'], help='maintained views to capture; graphics-screen selects Fullscreen')
     args = parser.parse_args()
     source, output = args.source.resolve(), args.output.resolve()
+    if not (source / 'gpu/vk/menu_model.cpp').is_file():
+        parser.error('--source predates the modular menu or is incomplete. For rc.8, use the capture helper '
+                     'from commit f4fa8dae. See docs/user/images/guide/README.md.')
     if not (args.vulkan_headers / 'vulkan/vulkan.h').is_file():
         parser.error('--vulkan-headers must contain vulkan/vulkan.h (headers only; no Vulkan SDK runtime needed)')
     output.mkdir(parents=True, exist_ok=True)
@@ -39,13 +44,21 @@ def main():
                    '-Wno-deprecated-enum-enum-conversion', '-Wno-deprecated-enum-float-conversion',
                    '-DVK_NO_PROTOTYPES', '-DIMGUI_DISABLE_DEFAULT_SHELL_FUNCTIONS',
                    '-DLONGSHOT_VERSION="' + describe + ' (UI fixture)"',
-                   '-I' + str(source), '-I' + str(source / 'host/posix'), '-I' + str(source / 'gpu/vk/compat'),
+                   '-I' + str(source), '-I' + str(source / 'gpu/vk'), '-I' + str(source / 'host/posix'), '-I' + str(source / 'gpu/vk/compat'),
                    '-I' + str(source / 'third_party/imgui'), '-I' + str(args.vulkan_headers.resolve()),
-                   str(Path(__file__).with_name('menu.cpp')), str(source / 'gpu/vk/vk_menu_i18n.cpp')]
+                   str(Path(__file__).with_name('menu.cpp')), str(source / 'gpu/vk/vk_menu_i18n.cpp'), str(source / 'gpu/vk/menu_model.cpp')]
+        game_rows = source / 'game/menu/rows.c'
+        game_command = None
+        if game_rows.is_file():
+            command.append('-DLONGSHOT_CAPTURE_GAME_ROWS')
+            game_command = [args.cxx, '-x', 'c', '-std=c11', '-ffunction-sections', '-fdata-sections', str(game_rows)]
+        command += [str(p) for p in sorted((source / 'gpu/vk/menu').glob('*.cpp'))]   # (the Insert menu's modules: the rows)
         command += [str(source / 'third_party/imgui' / p) for p in ['imgui.cpp', 'imgui_draw.cpp', 'imgui_widgets.cpp', 'imgui_tables.cpp']]
         # Ask the compiler which repository files this translation unit actually uses.
         # System dependencies are described by their toolchain versions below.
         dep_text = run(command + flags + ['-MM', '-MT', 'capture'], capture_output=True).stdout
+        if game_command:
+            dep_text += run(game_command + ['-MM', '-MT', 'capture'], capture_output=True).stdout
         dependencies = shlex.split(dep_text.replace('\\\n', ' '))
         fixture_cpp = Path(__file__).with_name('menu.cpp').resolve()
         sources = set()
@@ -57,6 +70,7 @@ def main():
                 sources.add(dep.relative_to(source).as_posix())
         sources.update(p.relative_to(source).as_posix()
                        for p in (source / 'third_party/fonts/libertinus').iterdir() if p.is_file())
+        sources.add('assets/longshot.png')   # the banner's logo, loaded by the fixture
         tracked = set(run(['git', '-C', str(source), 'ls-files', '-z'], capture_output=True).stdout.split('\0'))
         if sources - tracked:
             parser.error('capture inputs must be tracked source files: ' + ', '.join(sorted(sources - tracked)))
@@ -64,14 +78,19 @@ def main():
         if dirty:
             parser.error('capture inputs differ from the named source revision; commit them or use a clean checkout:\n' + dirty)
         hashes = {p: hashlib.sha256((source / p).read_bytes()).hexdigest() for p in sorted(sources)}
+        if game_command:
+            game_rows_obj = Path(tmp) / 'game_rows.o'
+            run(game_command + ['-c', '-o', str(game_rows_obj)])
+            command.append(str(game_rows_obj))
         command += flags + ['-Wl,--gc-sections', '-o', str(exe)]
         run(command)
         # No ambient game settings or display modes affect the fixture. A temporary cwd
         # also prevents accidentally reading files in the checkout or game installation.
         env = {k: v for k, v in os.environ.items() if not k.startswith(('HOS_', 'RX_', 'LONGSHOT_'))}
         env['HOS_DISPLAY_MODES'] = '1280x720'
-        for view in ['graphics', 'audio', 'controls']:
-            run([str(exe), str(source / 'third_party/fonts/libertinus'), view, str(output / f'settings-{view}.png')], cwd=tmp, env=env)
+        for view in dict.fromkeys(args.views):
+            run([str(exe), str(source / 'third_party/fonts/libertinus'), str(source / 'assets/longshot.png'), view,
+                 str(output / f'settings-{view}.png')], cwd=tmp, env=env)
     metadata = {'source_revision': revision, 'source_version': describe, 'source_files': hashes,
                 'fixture_files': {p: hashlib.sha256((ROOT / p).read_bytes()).hexdigest()
                                   for p in ['scripts/screenshots/menu.cpp', 'scripts/screenshots/capture_menu.py']},
@@ -81,10 +100,11 @@ def main():
                 'toolchain': {'compiler': run([args.cxx, '--version'], capture_output=True).stdout.splitlines()[0],
                               'sdl2': run(['pkg-config', '--modversion', 'sdl2'], capture_output=True).stdout.strip(),
                               'libpng': run(['pkg-config', '--modversion', 'libpng'], capture_output=True).stdout.strip()},
+                'views': list(dict.fromkeys(args.views)),
                 'images': {f'settings-{view}.png': hashlib.sha256((output / f'settings-{view}.png').read_bytes()).hexdigest()
-                           for view in ['graphics', 'audio', 'controls']}}
+                           for view in dict.fromkeys(args.views)}}
     (output / 'menu-capture.json').write_text(json.dumps(metadata, indent=2) + '\n', encoding='utf-8')
-    print('Captured graphics, audio and controls from ' + describe + ' @ ' + revision)
+    print('Captured ' + ', '.join(dict.fromkeys(args.views)) + ' from ' + describe + ' @ ' + revision)
 
 
 if __name__ == '__main__':

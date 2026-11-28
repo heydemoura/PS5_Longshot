@@ -1,10 +1,11 @@
-"""Every game-free check in one run: each tests/test_*.py and nx2/test_*.py in its own process, the C++ unit tests under
+"""Every game-free check in one run: each tests/test_*.py in its own process, the C++ unit tests under
 gpu/vk/tests and a byte-compile of every tracked Python file. All of them run even when one fails; the failures are
-printed whole at the end, with a table of every check (slowest first), also to $GITHUB_STEP_SUMMARY when it is set.
-Exits 1 when anything failed.
+printed whole at the end, with a table of every check (slowest first). $GITHUB_STEP_SUMMARY, when it is set, gets the\nfailures first, each with its first error line, then that table.
+Exits 1 when anything failed. On Linux a check that ends or times out takes every process it started with it.
 
     python -I -B tests/run_all.py [--jobs N] [--timeout SECONDS] [--strict] [--no-skip] [--shard K/N]
                                   [--list] [--junit FILE] [--exact] [name ...]
+    python -I -B tests/run_all.py --container [any of these]   (Linux: in a container with CI's tools, scripts/linux/checks.sh)
     python -I -B tests/run_all.py --changed [BASE]   (only the checks that read files changed since BASE: main on the
                                                      remote that points at Longshot, else origin/main)
 
@@ -14,16 +15,22 @@ SPIR-V or Vulkan headers, spirv-val) fails instead of being skipped (CI installs
 test skips on this OS too. --list prints the checks a run would start, one a line, and runs none. --junit FILE also
 writes the results as JUnit XML. Standard library only: no package is installed for the runner itself.
 
-A test says what it needs in its own file, with up to three top-level assignments of plain literals (after its
+The shader recompiler's SPIR-V fixtures (tests/global_load_16, tests/native_suatom, tests/f2i_immediate) are three checks:
+each built with cmake (CC, CXX), its program run to emit the modules, and every module checked by spirv-val (Linux).
+
+A test says what it needs in its own file, with up to four top-level assignments of plain literals (after its
 docstring and imports). The runner reads them with ast and never imports the test; a test that declares none runs with
 no arguments and its own defaults.
 
     RUN_ALL_ARGS = ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"]   # its command-line arguments
     RUN_ALL_MODULES = ["zstandard"]                                       # Python packages it imports
     RUN_ALL_SKIP = {"windows": "needs spirv-val: checked on Linux"}       # OS ("linux", "windows") -> why it is skipped
+    RUN_ALL_ALONE = True                                                  # it measures time or CPU: run alone, after
+                                                                          # the others, one at a time
 
-{name} in an argument is a tool or folder find_tools looks for (cxx, vulkan_headers, spirv_headers, spirv_val, glslang,
-dotnet, dav1d); a check whose tool, compiler (the word after --cc or --cxx) or module is missing here is skipped, or fails
+{name} in an argument is a tool or folder find_tools looks for (cc, cxx, clang, vulkan_headers, spirv_headers, spirv_val,
+glslang, dav1d, cargo, llvm_mc, cmake; clang is a C compiler that is clang on every OS, $CLANG else PATH's, for the checks
+that link an object clang made); a check whose tool, compiler (the word after --cc or --cxx) or module is missing here is skipped, or fails
 with --strict. A check skipped on both OSes (a GPU, the game) names both. A declaration that is not a plain literal of
 that shape, names an unknown placeholder or OS, or any other RUN_ALL_ name, stops the run with the file and line; so
 does one set or changed anywhere but its own top-level line (inside an if or a try, .append(...), +=, a subscript).
@@ -36,6 +43,11 @@ parts, which split the checks by those times so the parts take about as long (CI
 in exactly one part, whatever the times say, so stale times only make the parts uneven. After a full run on one OS,
 --write-times puts that run's times in the file, for that OS.
 
+Each check starts through tests/check_cache_boot.py, which sends its compiler calls (and the C++ checks' own) through
+tests/check_cache.py: a compile keyed by its preprocessed source, flags and compiler, kept in a folder shared by every
+worktree, so a compile done before is copied instead of run. The summary ends with its hits and misses.
+LONGSHOT_CHECK_CACHE=<dir> moves it; LONGSHOT_CHECK_CACHE=0 starts each check as `python -I -B <check>` again.
+
 The byte-compile of every tracked .py is listed as BYTE_COMPILE_ATOM, a name with no spaces, so it can be passed on a
 command line (--exact).
 """
@@ -43,21 +55,27 @@ import argparse
 import ast
 import concurrent.futures
 import importlib.util
+import itertools
 import json
 import os
+import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "tests"))
+from compiler_command import parse_compiler  # noqa: E402
 WINDOWS = os.name == "nt"
 OS = "windows" if WINDOWS else "linux"
 
 # What a check needs is declared in the test file itself, as top-level literals the runner reads with ast (the test is
 # never imported): see the docstring above and read_declarations below.
-DECLARATIONS = ("RUN_ALL_ARGS", "RUN_ALL_MODULES", "RUN_ALL_SKIP")
+DECLARATIONS = ("RUN_ALL_ARGS", "RUN_ALL_MODULES", "RUN_ALL_SKIP", "RUN_ALL_ALONE")
 # (a list's or a dict's methods that change it in place: a declaration changed that way is not what the runner reads)
 MUTATORS = {"append", "extend", "insert", "remove", "pop", "clear", "update", "setdefault", "popitem", "sort",
             "reverse", "__setitem__", "__delitem__", "__iadd__", "__ior__"}
@@ -68,6 +86,15 @@ TIMES = os.path.join(ROOT, "tests", "run_all_times.json")
 BYTE_COMPILE_ATOM = "tests/byte_compile_tracked.py"
 DEFAULT_SECS = 1.0   # (a check not in TIMES: most take about that or less)
 TIMES_MIN = 2.0      # (--write-times keeps only the checks that took this long or longer)
+# (the checks' compiles through tests/check_cache.py; None when it is turned off, or not beside this file)
+BOOT = os.path.join(ROOT, "tests", "check_cache_boot.py")
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import check_cache
+except ImportError:
+    check_cache = None
+finally:
+    sys.path.pop(0)
 
 # Retired: the central tables these declarations replaced. They stay, empty, so that an entry a branch from before the
 # move adds here stops the run and says where it belongs, instead of being dropped without a word. Do not add to them.
@@ -84,10 +111,11 @@ def which(*names):
 
 
 def header_dir(env, cpm_name, probe):
-    """A headers folder: the environment variable, else the CPM cache nx2/build.py reads (RX_CPM, build-linux/deps/cpm)"""
+    """A headers folder: the environment variable, else the CPM cache the build reads (RX_CPM, else the checkout's
+    tools/cpm: mise run tools)"""
     if os.environ.get(env):
         return os.environ[env]
-    for cpm in (os.environ.get("RX_CPM"), os.path.join(ROOT, "build-linux", "deps", "cpm")):
+    for cpm in (os.environ.get("RX_CPM"), os.path.join(ROOT, "tools", "cpm")):
         d = os.path.join(cpm or "", cpm_name)
         if cpm and os.path.isdir(d) and os.listdir(d):
             inc = os.path.join(d, sorted(os.listdir(d))[-1], "include")
@@ -98,17 +126,29 @@ def header_dir(env, cpm_name, probe):
 
 def dav1d_prefix():
     """A dav1d to build against (its include/dav1d/dav1d.h, and lib/libdav1d.a or the system's -ldav1d): LONGSHOT_DAV1D, else
-    the CPM cache's (scripts/windows/dav1d.sh), the Linux dependencies' (scripts/linux/deps.sh), the system's"""
+    the CPM cache's (RX_CPM, else the checkout's tools/cpm), the checkout's tools/ffmpeg (mise run tools), the system's"""
     roots = [os.environ.get("LONGSHOT_DAV1D")]
-    for cpm in (os.environ.get("RX_CPM"), os.path.join(ROOT, "build-linux", "deps", "cpm")):
+    for cpm in (os.environ.get("RX_CPM"), os.path.join(ROOT, "tools", "cpm")):
         d = os.path.join(cpm or "", "dav1d")
         if cpm and os.path.isdir(d) and os.listdir(d):
             roots.append(os.path.join(d, sorted(os.listdir(d))[-1]))
-    roots += [os.path.join(ROOT, "build-linux", "deps", "ffmpeg"), "/usr"]
+    roots += [os.path.join(ROOT, "tools", "ffmpeg"), "/usr"]
     for r in roots:
         if r and os.path.exists(os.path.join(r, "include", "dav1d", "dav1d.h")):
             return r
     return None
+
+
+def bundled_mingw():
+    """(windows) The checkout's tools/llvm-mingw (mise run tools) as LONGSHOT_MINGW for every check, as the builder gives it
+    to the build (CONTRIBUTING.md: the variable, or that folder). Without it a check that builds with
+    toolchain.native_target() asks that folder's clang, found on PATH, for the MSVC target: "'algorithm' file not found".
+    LONGSHOT_MINGW set already wins; LONGSHOT_MSVC=1 (the Visual Studio route) and a folder without its clang leave it unset"""
+    if not WINDOWS or os.environ.get("LONGSHOT_MINGW") or os.environ.get("LONGSHOT_MSVC") == "1":
+        return
+    here = os.path.join(ROOT, "tools", "llvm-mingw")   # (mise run tools)
+    if os.path.isfile(os.path.join(here, "bin", "clang.exe")):
+        os.environ["LONGSHOT_MINGW"] = here
 
 
 def find_tools():
@@ -118,8 +158,12 @@ def find_tools():
         "vulkan_headers": header_dir("LONGSHOT_VULKAN_HEADERS", "vulkanheaders", os.path.join("vulkan", "vulkan.h")),
         "spirv_val": which("spirv-val"),
         "glslang": which("glslangValidator", "glslang"),
-        "dotnet": which("dotnet"),
+        "cc": os.environ.get("CC") or which("gcc", "clang"),
         "cxx": which(os.environ.get("CXX", ""), "clang++", "g++", "c++"),
+        "clang": which(os.environ.get("CLANG", ""), "clang", "clang-23"),
+        "cargo": which("cargo"),
+        "llvm_mc": os.environ.get("LLVM_MC") or which("llvm-mc"),
+        "cmake": which("cmake"),
     }
 
 
@@ -127,6 +171,7 @@ class Check:
     def __init__(self, name, run, why_skip=None):
         self.name, self.run, self.why_skip = name, run, why_skip
         self.status, self.secs, self.output = "skip", 0.0, ""
+        self.alone = False
 
 
 class DeclarationError(Exception):
@@ -139,7 +184,7 @@ def read_declarations(path, rel, tools):
     why}}, empty where the test declares nothing. A file that does not parse declares nothing and says why in
     "unparsed" (its check fails with that, on every OS, without running); a bad declaration raises DeclarationError naming
     the file and line."""
-    found = {"args": [], "modules": [], "skip": {}, "unparsed": None}
+    found = {"args": [], "modules": [], "skip": {}, "alone": False, "unparsed": None}
     with open(path, "rb") as f:
         source = f.read()
     try:
@@ -210,6 +255,11 @@ def read_declarations(path, rel, tools):
                                                                                     ", ".join(OSES)))
             found["skip"] = dict(v)
             continue
+        if name == "RUN_ALL_ALONE":
+            if v is not True:
+                raise bad(node, "RUN_ALL_ALONE must be True (or not set)")
+            found["alone"] = True
+            continue
         if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
             raise bad(node, "%s must be a list of strings" % name)
         if name == "RUN_ALL_ARGS":
@@ -246,14 +296,134 @@ def python_check(rel, decl, tools, timeout):
             args.append(a)
     # (a compiler named by the arguments, or the test's own default one, must be on PATH)
     for i, a in enumerate(args[:-1]):
-        if a in ("--cc", "--cxx") and not which(args[i + 1]):
-            missing.append(args[i + 1])
+        if a in ("--cc", "--cxx"):
+            try:
+                command = parse_compiler(args[i + 1]) if a == "--cc" else [args[i + 1]]
+            except ValueError:
+                missing.append("invalid compiler setting: " + args[i + 1])
+                continue
+            if not command or not which(command[0]):
+                missing.append(args[i + 1])
     missing += [m for m in decl["modules"] if importlib.util.find_spec(m) is None]
 
     def run():
-        return subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, rel)] + args, cwd=ROOT, timeout=timeout,
-                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+        boot = [BOOT] if cache_root() else []
+        return run_check([sys.executable, "-I", "-B"] + boot + [os.path.join(ROOT, rel)] + args, timeout)
     return run, missing
+
+
+# (Linux) A check's processes end with it: when it times out, and what it left running when it ends.
+# subprocess.run's timeout kills the check alone, and a child it was waiting for ran on with no end
+# (tests/test_recorder_sync.py's broken recorder hangs on purpose until the check's own 30 s timeout). Each check's
+# processes carry a token in their environment, which they keep when their parent ends or they leave the process
+# group, so they are found in /proc; the descendants of the check and of each of those are found by their parents too
+# (one started with another environment). The checks stay in the runner's process group, so Ctrl-C and a kill of the
+# group reach them as before. Elsewhere (Windows, macOS) a check runs as subprocess.run runs it.
+CHECKS_ENV = "LONGSHOT_RUN_ALL_CHECKS"   # (space-separated: a runner run by a check adds its own token)
+CHECK_IDS = itertools.count()
+# (one scan at a time: the runner's threads share one interpreter, and scans at once slow each other down many times over)
+SCAN_LOCK = threading.Lock()
+PROC = sys.platform.startswith("linux") and os.path.isdir("/proc")
+
+
+def run_check(cmd, timeout):
+    if not PROC:
+        return subprocess.run(cmd, cwd=ROOT, timeout=timeout, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              stdin=subprocess.DEVNULL)
+    token = "%d.%d" % (os.getpid(), next(CHECK_IDS))
+    env = dict(os.environ)
+    env[CHECKS_ENV] = (env.get(CHECKS_ENV, "") + " " + token).strip()
+    with subprocess.Popen(cmd, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          stdin=subprocess.DEVNULL) as p:
+        try:
+            out, _ = p.communicate(timeout=timeout)
+        except BaseException:   # (the timeout, with the output so far: not waited for again, as a child may hold it)
+            end_check(p.pid, token)
+            p.wait()
+            raise
+        end_check(None, token)
+        return subprocess.CompletedProcess(cmd, p.returncode, out)
+
+
+def check_processes(root, token):
+    """the live processes (not zombies) of the check: root, any process of ours with the token, and their descendants"""
+    with SCAN_LOCK:
+        return scan_processes(root, token)
+
+
+def scan_processes(root, token):
+    me, uid, parent, found = os.getpid(), os.getuid(), {}, set()
+    key, mine = CHECKS_ENV.encode() + b"=", token.encode()
+    for d in os.listdir("/proc"):
+        if not d.isdigit() or int(d) == me:
+            continue
+        pid = int(d)
+        try:
+            if os.stat("/proc/%d" % pid).st_uid != uid:   # (only our own: the rest cannot be the check's, nor be killed)
+                continue
+            with open("/proc/%d/stat" % pid, "rb") as f:
+                stat = f.read().rsplit(b")", 1)[1].split()
+            if stat[0] == b"Z":
+                continue
+            parent[pid] = int(stat[1])
+            with open("/proc/%d/environ" % pid, "rb") as f:
+                env = f.read().split(b"\0")
+            if any(e.startswith(key) and mine in e[len(key):].split() for e in env):
+                found.add(pid)
+        except (OSError, IndexError, ValueError):   # (ended while read, or not ours to read)
+            continue
+    if root in parent:
+        found.add(root)
+    grew = True
+    while grew:   # (a descendant started with another environment, by its parent)
+        more = {pid for pid, pp in parent.items() if pp in found and pid not in found}
+        found |= more
+        grew = bool(more)
+    return found
+
+
+def end_check(root, token):
+    """SIGKILL to each of the check's processes, again until none is left: one started while they were being ended is
+    found the next time, and a last look after the first empty one finds one whose environment read back empty in the
+    middle of an execve. Given up once five rounds in a row (about 0.2 s) end none (a process that cannot be killed, as one in
+    uninterruptible sleep). A PID is read and killed a moment apart: one reused in between could be hit, as with any
+    kill by PID"""
+    last, empty, stuck = None, 0, 0
+    for _ in range(100):
+        procs = check_processes(root, token)
+        if not procs:
+            empty += 1
+            if empty == 2:
+                return
+            time.sleep(0.01)
+            continue
+        empty = 0
+        stuck = stuck + 1 if last is not None and len(procs) >= len(last) else 0
+        if stuck == 5:
+            return
+        last = procs
+        for pid in procs:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        time.sleep(0.005)
+
+
+def cache_root():
+    """The compile cache's folder (tests/check_cache.py), or None: turned off (LONGSHOT_CHECK_CACHE=0), or not here"""
+    if check_cache is None or not os.path.isfile(BOOT):
+        return None
+    return check_cache.root()
+
+
+def cached(argv):
+    """A compiler's command line through the compile cache, when it is on"""
+    base = cache_root()
+    if not base:
+        return argv
+    return [sys.executable, "-I", "-B", check_cache.__file__, "--cache", base,
+            "--stats", os.environ.get("LONGSHOT_CHECK_CACHE_STATS", ""), "--"] + argv
 
 
 def cpp_checks(tools, timeout):
@@ -267,12 +437,10 @@ def cpp_checks(tools, timeout):
         def run():
             with tempfile.TemporaryDirectory() as tmp:
                 exe = os.path.join(tmp, "t.exe")
-                r = subprocess.run([cxx, "-std=c++20", *flags, os.path.join(ROOT, src), "-o", exe], cwd=ROOT,
-                                   timeout=timeout, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+                r = run_check(cached([cxx, "-std=c++20", *flags, os.path.join(ROOT, src), "-o", exe]), timeout)
                 if r.returncode:
                     return r
-                return subprocess.run([exe] + [a.replace("{tmp}", tmp) for a in args], cwd=ROOT, timeout=timeout,
-                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+                return run_check([exe] + [a.replace("{tmp}", tmp) for a in args], timeout)
         return run
     rect = "gpu/vk/tests/present_rect_test.cpp"
     out.append((rect, build_and_run(rect, ["-Wall", "-Wextra", "-Werror"], [])))
@@ -284,6 +452,61 @@ def cpp_checks(tools, timeout):
     ldsm = "gpu/vk/tests/ldsm_address_test.cpp"   # (LDSM's row addresses kept apart from its shuffles' registers)
     out.append((ldsm, build_and_run(ldsm, ["-O1", "-Wno-everything", "-I" + eden, "-I" + compat], [])))
     return out, ([] if cxx else ["a C++ compiler"])
+
+
+# (the shader recompiler's SPIR-V fixtures: each built with cmake against the SPIR-V headers, its modules emitted and
+# every one checked by spirv-val. --uniform-buffer-standard-layout: the back end's device has
+# uniformBufferStandardLayout, so constant buffers are u32 arrays of stride 4; native_suatom's modules have none)
+SPIRV_FIXTURES = (
+    ("tests/global_load_16", [["global_load_16_ir"], ["global_load_16_ir", "--cas-loops", {"RX_VK_FOLLOW_STORES": "1"}]], True),
+    ("tests/native_suatom", [["native_suatom"]], False),
+    ("tests/f2i_immediate", [["f2i_immediate"]], True),
+)
+
+
+def spirv_fixture_checks(tools, timeout):
+    """SPIRV_FIXTURES, a check each: (name, run) pairs, and what they need that is missing here"""
+    out = []
+
+    def fixture(rel, runs, std_layout):
+        def run():
+            with tempfile.TemporaryDirectory(prefix="spirv-fixture-") as tmp:
+                env = dict(os.environ, CC=tools["cc"] or "", CXX=tools["cxx"] or "")
+                build, logs = os.path.join(tmp, "build"), []
+                headers = os.path.dirname(tools["spirv_headers"].rstrip("/\\"))   # (the folder above include/)
+                for cmd in ([tools["cmake"], "-S", os.path.join(ROOT, rel), "-B", build, "-DREPO_ROOT=" + ROOT,
+                             "-DSPIRV_HEADERS_ROOT=" + headers],
+                            [tools["cmake"], "--build", build, "--parallel", str(os.cpu_count() or 2)]):
+                    r = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+                    logs.append(r.stdout)
+                    if r.returncode:
+                        return Result(r.returncode, b"".join(logs))
+                modules = os.path.join(build, "modules")
+                for argv in runs:
+                    extra = dict(env, **argv[-1]) if isinstance(argv[-1], dict) else env
+                    argv = [a for a in argv if not isinstance(a, dict)]
+                    r = subprocess.run([os.path.join(build, argv[0]), *argv[1:], modules], env=extra,
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+                    logs.append(r.stdout)
+                    if r.returncode:
+                        return Result(r.returncode, b"".join(logs))
+                spv = sorted(f for f in os.listdir(modules) if f.endswith(".spv")) if os.path.isdir(modules) else []
+                if not spv:
+                    return Result(1, b"".join(logs) + b"no .spv module emitted\n")
+                for f in spv:
+                    cmd = [tools["spirv_val"], "--target-env", "vulkan1.3"]
+                    cmd += ["--uniform-buffer-standard-layout"] if std_layout else []
+                    r = subprocess.run(cmd + [os.path.join(modules, f)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       timeout=timeout)
+                    if r.returncode:
+                        return Result(r.returncode, b"".join(logs) + ("spirv-val %s:\n" % f).encode() + r.stdout)
+                return Result(0, b"".join(logs) + ("%d modules valid\n" % len(spv)).encode())
+        return run
+    for rel, runs, std_layout in SPIRV_FIXTURES:
+        out.append((rel, fixture(rel, runs, std_layout)))
+    missing = [what for what, key in (("cmake", "cmake"), ("a C++ compiler", "cxx"), ("a C compiler", "cc"),
+                                      ("spirv-val", "spirv_val"), ("the SPIR-V headers", "spirv_headers")) if not tools[key]]
+    return out, missing
 
 
 def load_times(path=TIMES):
@@ -343,13 +566,13 @@ class Result:
 
 # (--changed, the dev-loop proposal's D1) the checks that read what changed: most tests name the files they cut code from or run,
 # by path or by name, so a test whose text names a changed file is picked. A change to this runner, or to a shared .py of tests/
-# that is not a test, picks every check. Before a pull request the whole run is still the one that counts (docs/workflow.md)
-LONGSHOT_REMOTE = "git.magicbean.dev/magicbeandev/longshot"   # (scripts/forge.py's HOST and REPO, as add_remote matches them)
+# that is not a test, picks every check. Before a pull request the whole run is still the one that counts (docs/dev/developing.md#from-claim-to-merge)
+LONGSHOT_REMOTE = "git.magicbean.dev/magicbeandev/longshot"   # (forge.py's HOST and REPO, as add_remote matches them)
 
 
 def default_base():
-    """--changed's base when none is named: main on the remote that points at Longshot (scripts/forge.py adds one as forge
-    unless one already does: CONTRIBUTING.md's git rebase forge/main), else origin/main"""
+    """--changed's base when none is named: main on the remote that points at Longshot (forge.py, from MagicBeanDev/Tooling,
+    adds one as forge unless one already does: Tooling's docs/forge.md: git rebase forge/main), else origin/main"""
     r = subprocess.run(["git", "-C", ROOT, "remote", "-v"], capture_output=True, text=True)
     for line in (r.stdout if r.returncode == 0 else "").splitlines():
         parts = line.split()
@@ -413,6 +636,18 @@ def compile_all():
     return Result(1 if bad else 0, text.encode())
 
 
+ERROR_WORDS = re.compile(r"error|fail|mismatch|traceback|assert|timeout|not found|refused", re.I)
+
+
+def first_error(output):
+    """A failed check's first line that says what went wrong (an error, a failure, an assertion), else its last line"""
+    lines = [l.strip() for l in output.splitlines() if l.strip()]
+    for l in lines:
+        if ERROR_WORDS.search(l) and not l.startswith(("PASS", "ok ", "Ran ")):
+            return l
+    return lines[-1] if lines else "(no output)"
+
+
 def write_junit(path, checks, wall):
     """The run's checks as JUnit XML (one testcase each, named and filed by its path; a failure carries its output, a
     skip its reason), for a CI that shows test results from it"""
@@ -442,7 +677,7 @@ def unicode_output():
     "replace" decode). Into a pipe (CI's log, an agent's tool, `| more`) Windows' Python writes the ANSI code page,
     cp1252, which has none of them: the run stopped with a UnicodeEncodeError at the first such failure, before the
     table, the summary and --write-times. A pipe gets UTF-8, as -X utf8 would give it; a console keeps its own encoding.
-    Either way a character it cannot show is replaced instead of ending the run (as scripts/team_chat.py does)."""
+    Either way a character it cannot show is replaced instead of ending the run (as Tooling's scripts/team_chat.py does)."""
     for stream in (sys.stdout, sys.stderr):
         if not hasattr(stream, "reconfigure"):   # (a StringIO)
             continue
@@ -452,8 +687,18 @@ def unicode_output():
             stream.reconfigure(encoding="utf-8", errors="replace")
 
 
+def in_container(args):
+    """--container: the same run in a container with CI's tools, its exit status"""
+    if not sys.platform.startswith("linux"):
+        print("tests/run_all.py: --container is for Linux", file=sys.stderr)
+        return 2
+    return subprocess.run([os.path.join(ROOT, "scripts", "linux", "checks.sh")] + [a for a in args if a != "--container"]).returncode
+
+
 def main():
     unicode_output()
+    if "--container" in sys.argv[1:]:
+        return in_container(sys.argv[1:])
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("names", nargs="*")
     p.add_argument("--jobs", type=int, default=os.cpu_count() or 2)
@@ -466,6 +711,8 @@ def main():
     p.add_argument("--list", action="store_true",
                    help="print the name of each check a run would start, one a line, and run none")
     p.add_argument("--junit", metavar="FILE", help="also write the results as JUnit XML to FILE")
+    p.add_argument("--container", action="store_true",
+                   help="(Linux) in a container with CI's tools: Podman or Docker, its image built first (scripts/linux/checks.sh)")
     p.add_argument("--exact", action="store_true",
                    help="a name must be a check's whole path, and with names given and none matching, run nothing")
     p.add_argument("--changed", nargs="?", const="", metavar="BASE",
@@ -477,10 +724,11 @@ def main():
     if a.changed is not None and (a.names or a.write_times):
         p.error("--changed picks the checks itself: no names, no --write-times")
     times = load_times()
+    bundled_mingw()
     tools = find_tools()
 
     checks = []
-    tests = sorted(d + "/" + f for d in ("tests", "nx2") for f in os.listdir(os.path.join(ROOT, d))
+    tests = sorted("tests/" + f for f in os.listdir(os.path.join(ROOT, "tests"))
                    if f.startswith("test_") and f.endswith(".py"))
     stale = stale_tables()
     if stale:
@@ -518,6 +766,7 @@ def main():
         reason = decls[rel]["skip"].get(OS)
         run, missing = python_check(rel, decls[rel], tools, a.timeout)
         c = Check(rel, run)
+        c.alone = decls[rel]["alone"]
         if decls[rel]["unparsed"]:   # (no skip to read: the same failure on every OS, not run)
             c.run = lambda why=decls[rel]["unparsed"]: Result(1, (why + "\n").encode())
         elif reason and not a.no_skip and not picked(rel):
@@ -533,6 +782,20 @@ def main():
     for name, run in cpp:
         c = Check(name, run)
         if missing:
+            c.why_skip = "not found here: " + ", ".join(missing)
+            if a.strict:
+                c.why_skip = None
+                c.run = lambda m=missing: Result(1, ("not found: %s (--strict)\n" % ", ".join(m)).encode())
+        checks.append(c)
+    fixtures, missing = spirv_fixture_checks(tools, a.timeout)
+    if not everything and not any(c.startswith(("gpu/", "tests/global_load_16/", "tests/native_suatom/",
+                                                "tests/f2i_immediate/")) for c in changed):
+        fixtures = []   # (--changed: they build the shader recompiler and their own folder)
+    for name, run in fixtures:
+        c = Check(name, run)
+        if WINDOWS and not a.no_skip and not picked(name):
+            c.why_skip = "built with cmake and checked by spirv-val: checked on Linux"
+        elif missing:
             c.why_skip = "not found here: " + ", ".join(missing)
             if a.strict:
                 c.why_skip = None
@@ -556,6 +819,12 @@ def main():
                 print(c.name)
         return 0
     rank = {name: i for i, name in enumerate(by_time([c.name for c in checks], times))}
+    stats = None
+    if cache_root():
+        check_cache.prune()
+        fd, stats = tempfile.mkstemp(prefix="check-cache-", suffix=".txt")
+        os.close(fd)
+        os.environ["LONGSHOT_CHECK_CACHE_STATS"] = stats   # (the checks' compiles each add a line: hit, miss or pass)
 
     def one(c):
         t = time.time()
@@ -577,10 +846,17 @@ def main():
     t0 = time.time()
     print("%d checks, %d skipped, %d at once (%s%s)" % (len(to_run), len(checks) - len(to_run), a.jobs, OS, part),
           flush=True)
+    # (RUN_ALL_ALONE: a check that measures time or CPU, run one at a time after the others, on an idle machine)
     with concurrent.futures.ThreadPoolExecutor(max(1, a.jobs)) as ex:
-        for c in concurrent.futures.as_completed([ex.submit(one, c) for c in to_run]):
+        for c in concurrent.futures.as_completed([ex.submit(one, c) for c in to_run if not c.alone]):
             c = c.result()
             print("%-7s %6.1fs  %s" % (c.status, c.secs, c.name), flush=True)
+    alone = [c for c in to_run if c.alone]
+    if alone:
+        print("%d checks alone, one at a time: %s" % (len(alone), ", ".join(c.name for c in alone)), flush=True)
+    for c in alone:
+        one(c)
+        print("%-7s %6.1fs  %s  (alone)" % (c.status, c.secs, c.name), flush=True)
     wall = time.time() - t0
 
     failed = [c for c in to_run if c.status != "pass"]
@@ -600,18 +876,34 @@ def main():
     for c in order:
         print("%-8s %8s  %s%s" % (c.status, "" if c.why_skip else "%.1fs" % c.secs, c.name,
                                   "  (%s)" % c.why_skip if c.why_skip else ""))
+    if stats:
+        try:
+            with open(stats, encoding="ascii", errors="replace") as f:
+                words = f.read().split()
+            os.remove(stats)
+        except OSError:
+            words = []
+        print("compile cache: %d hits, %d misses, %d passed through (%s)" % (
+            words.count("hit"), words.count("miss"), words.count("pass"), cache_root()))
     print(head, flush=True)
 
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         mark = {"pass": "pass", "FAIL": "**FAIL**", "TIMEOUT": "**TIMEOUT**", "skip": "skip"}
-        lines = ["### Tests (%s): %s" % (OS, head), "", "| Result | Time | Check | Note |", "|---|---:|---|---|"]
+        lines = ["### Tests (%s): %s" % (OS, head), ""]
+        if failed:
+            lines += ["Failed:", ""]
+            for c in failed:
+                lines.append("- **%s** `%s`: `%s`" % (c.status, c.name, first_error(c.output).replace("`", "'")[:200]))
+            lines.append("")
+        lines += ["<details><summary>Every check</summary>", "", "| Result | Time | Check | Note |", "|---|---:|---|---|"]
         for c in order:
             note = c.why_skip or ""
             if c.status in ("FAIL", "TIMEOUT"):
                 last = [l for l in c.output.strip().splitlines() if l.strip()][-1:] or [""]
                 note = "`%s`" % last[0].replace("|", "\\|").replace("`", "'")[:160]
             lines.append("| %s | %s | `%s` | %s |" % (mark[c.status], "" if c.why_skip else "%.1f s" % c.secs, c.name, note))
+        lines += ["", "</details>"]
         with open(summary, "a", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n\n")
     if a.junit:

@@ -48,11 +48,14 @@ def source_contract():
     writer = block((ROOT / "host/hos_crash_record.c").read_text(encoding="utf-8"), "int hos_crash_record_write(")
     assert "hos_log(" not in writer and "hos_crash_record_log_notes(" not in writer
     renderer = (ROOT / "gpu/vk/vk_replay.cpp").read_text(encoding="utf-8")
-    replay = block(renderer, "[[noreturn]] void replay_fatal(")
+    replay = block(renderer, "[[noreturn]] void replay_fatal(const char* why) {")   # (the definition, not its declaration)
     assert replay.index('logf("vk: FATAL:') < replay.index("std::_Exit(3)")
     assert 'strstr(buf, "VK_ERROR_DEVICE_LOST") ? "device lost"' in threads
     logger = block(threads, "static void hos_vlog(")
-    assert logger.index("hos_crash_record_fatal(") < logger.index("snprintf(line,")
+    assert logger.index("hos_crash_record_fatal(") < logger.index("snprintf(raw,")
+    # (the line without the player's user name before anything has it: host/log_redact.h)
+    assert logger.index("snprintf(raw,") < logger.index("hos_log_redact(line, sizeof line, raw);") < logger.index("log_queue(line)")
+    assert "hos_log_redact(clean, sizeof clean, buf);" in fatal
     for marker in ("void hos_log(", "void hos_log_at("):
         wrapper = block(threads, marker)
         assert "hos_vlog(" in wrapper and "hos_crash_record_fatal(" not in wrapper
@@ -84,18 +87,20 @@ def source_contract():
     # start generating unclean records. Declarations and comments are not calls.
     expected = {
         "control.c": ["ExitProcess(0);"],
-        "display.c": ["ExitProcess(1);"],
-        "hos_main.c": ["ExitProcess(result);"],
+        "display.c": ["ExitProcess(1);", "ExitProcess(1);"],  # a window that failed to start; the renderer did not start (#2102)
+        # handed over to the builder, and the game thread's end
+        "hos_main.c": ["ExitProcess(0);", "ExitProcess(result);"],
         "hos_relaunch.c": ["ExitProcess(0);"],
         "hos_svc.c": ["ExitProcess(0);"],
         "hos_thread.c": ["ExitProcess(3);"],  # fatal: record, not a clean end
-        "posix/display_sdl.c": ["ExitProcess(1);"],
+        "posix/display_sdl.c": ["ExitProcess(1);", "ExitProcess(1);"],  # the renderer did not start (#2102); no window
         "windows_stop.c": ["TerminateProcess(GetCurrentProcess(), 0);",
                            "TerminateProcess(GetCurrentProcess(), STOP_TIMEOUT_EXIT);"],
         "posix/win32_posix.c": ["_exit((int)code);", "ExitProcess(code);"],  # platform implementations
     }
     observed = {}
-    for path in (ROOT / "host").rglob("*.c"):
+    for path in list((ROOT / "host").rglob("*.c")) + list((ROOT / "game").rglob("*.c")):   # (game/: none expected)
+        rel = (path.relative_to(ROOT / "host") if path.is_relative_to(ROOT / "host") else path.relative_to(ROOT)).as_posix()
         text = path.read_text(encoding="utf-8")
         text = re.sub(r"/\*.*?\*/|//[^\n]*", "", text, flags=re.S)
         calls = []
@@ -104,17 +109,26 @@ def source_contract():
             if re.search(r"\bvoid\s*$", prefix):
                 continue
             calls.append(match.group())
-            rel = path.relative_to(ROOT / "host").as_posix()
             exempt = rel == "hos_thread.c" or rel == "posix/win32_posix.c" or (
                 rel == "windows_stop.c" and match.group() == "TerminateProcess(GetCurrentProcess(), STOP_TIMEOUT_EXIT);")
             if not exempt:
                 clean = "hos_close_finish();" if rel in ("control.c", "hos_relaunch.c", "windows_stop.c") else "hos_crash_clean_end();"
                 assert clean in text[max(0, match.start() - 180):match.start()], rel
         if calls:
-            observed[path.relative_to(ROOT / "host").as_posix()] = calls
+            observed[rel] = calls
     assert observed == expected, (observed, expected)
     assert not (ROOT / "host/hos_update.c").exists(), "the removed in-game updater must not return"
-    print("PASS: every remaining host process exit classified; normal exits mark, fatal exits do not")
+    # no start is refused with a code of its own: the builder makes and tries the profile's folders before it starts the
+    # game (build_driver::play::prepare_profile), and an unusable save folder is a plain fatal error of the game's
+    main_src = (ROOT / "host/hos_main.c").read_text(encoding="utf-8")
+    for gone in ("refuse_start", "HOS_EXIT_REFUSED", "start refused:"):
+        assert gone not in main_src, f"{gone} must not return: exit 3 and its line are the crash crate's no more"
+    assert re.search(r"if \(!hos_save_dir_choose\(\)\) \{\n\s+hos_log\(\"fatal: the save folder can't be used", main_src), \
+        "an unusable save folder is a plain fatal error"
+    facts = (ROOT / "builder/crates/crash/src/facts.rs").read_text(encoding="utf-8")
+    assert "start refused" not in facts and "REFUSED" not in facts and "REBUILD" not in facts, \
+        "the builder's crash crate has no exit code of its own to key on: a normal exit is no crash"
+    print("PASS: every remaining host and game process exit classified; normal exits mark, fatal exits do not")
     return glue, threads, main
 
 

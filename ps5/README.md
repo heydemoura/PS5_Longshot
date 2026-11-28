@@ -89,12 +89,16 @@ For players there is the builder (`ps5/builder/README.md`). A developer's whole 
 
 ```
 export PS5_VULKAN=<a built PS5_Vulkan at 7f492b4c> PS5_MIHAWKGEN=<PS5_MihawkGen>
-LONGSHOT_LIFT_JOBS=1 OOT_WORK=$PWD/work/lift python -I nx2/lift.py --standalone --write --exefs <exefs> --work $PWD/work/lift
-python -I ps5/build.py --jobs N
+cargo build --release -p longshot-builder                       # upstream's builder: it reads the game and translates it
+bash ps5/tools/build-rust.sh                                    # the game's Rust for the console (emulated TLS)
+B=target/release/longshot-builder W=$PWD/work/lift
+$B image --game <game.nup | dump folder> --work $W --out $PWD/work/pc-out --root .
+$B dev lift --work $W --repo . --exefs $W/exefs --memory-base 0x1000000000 --dirty-pages 16777216 --jobs N
+OOT_WORK=$W python -I ps5/build.py --jobs N
 ```
 
-The lift holds about 6 GB and more as it writes (it was stopped for want of memory with less than ~10 GB free); each
-compile of a lifted chunk about 1.4 GB. The compile took 40 minutes at 6 jobs.
+The two lift options are the console's guest window (64 GiB at 0x1000000000, a page marks' table for it): `ps5/build.py`
+`LIFT_OPTIONS`. The lift writes about 500 units of LLVM IR, 6 GB of text; the largest takes about 1.9 GB to compile.
 
 Install and run (the control payload `ps5vkctl` on the console, port 9111):
 

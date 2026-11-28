@@ -62,6 +62,7 @@ static const struct {
     {2560, 1440, 0, 768, NULL, 768},
     {3840, 2160, 0, 768, NULL, 1728},
     {5120, 2880, 0, 305, NULL, 900},
+    {7680, 2160, 0, 305, NULL, 900},   /* (32:9 native: above 4K's pixels, the same 900 MiB cap) */
     {7680, 4320, 0, 305, NULL, 900},
     {5120, 2880, 0, 305, "1220", 1220},
 };
@@ -90,7 +91,7 @@ int main(void) {
         source.write_text(fixture)
         subprocess.run([compiler, "-std=c11", "-O2", str(source), "-o", str(binary)], check=True)
         subprocess.run([str(binary)], check=True, timeout=5)
-    print("PASS: 512 MiB floor, 4K/ultrawide growth and explicit overrides, 900 MiB above 4K's pixels (17 cases)")
+    print("PASS: 512 MiB floor, 4K/ultrawide growth and explicit overrides, 900 MiB above 4K's pixels (18 cases)")
 
 
 if __name__ == "__main__":

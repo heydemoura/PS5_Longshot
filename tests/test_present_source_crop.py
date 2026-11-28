@@ -29,8 +29,17 @@ def main():
     fg = (a.source / "gpu/vk/vk_framegen.cpp").read_text(encoding="utf-8")
     structs = fg[fg.index("struct Img {"):fg.index("int64_t now_ns()")]
     functions = "\n".join([block(replay, "void blit_crop_to_rect("), block(replay, "void blit_crop("),
-                           block(fg, "bool framegen_record("), block(fg, "VkImage framegen_hdr(")])
+                           block(fg, "void fixed_dues("), block(fg, "ClockPlace fixed_clock("),
+                           block(fg, "int64_t pace_lead("), block(fg, "int64_t fixed_hand_due("),
+                           block(fg, "bool framegen_record("),
+                           block(fg, "VkImage framegen_hdr(")])
     template = (ROOT / "tests/present_source_crop_test.cpp").read_text(encoding="utf-8")
+    hdr = block(fg, "VkImage framegen_hdr(")
+    # (the Colour vision correction row's mode, #1832: its default is in vk_framegen.h, not the definition; Off here)
+    if "int colour_vision" in hdr[:hdr.index("{")]:
+        call = "framegen_hdr(nullptr, 1, sw, sh, crop, 1920, 1080, false)"
+        assert call in template
+        template = template.replace(call, call[:-1] + ", 0)")
     fixture = template.replace("/* ACTUAL_STATE */", structs).replace("/* ACTUAL_FUNCTIONS */", functions)
     with tempfile.TemporaryDirectory(prefix="present-source-crop-") as temp:
         cpp, exe = Path(temp) / "fixture.cpp", Path(temp) / "fixture.exe"

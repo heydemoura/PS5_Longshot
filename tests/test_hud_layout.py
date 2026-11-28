@@ -1,15 +1,17 @@
-"""The HUD is laid out for the picture's shape, never stretched (host/hos_wide_ui.c hos_wide_ui_tick, nx2/oot_wide.py HUD).
+"""The HUD is laid out for the picture's shape, never stretched (game/hos_wide_ui.c hos_wide_ui_tick, the hook site wide.hud).
 
 At its 16:9 size (scaled with the picture's height, as at 16:9) its side panes move out to a wider screen's sides and in to
 a narrower one's; past 12:5 (a 32:9 screen) they stop at 12:5's sides, and at 48:9 (three screens) they stay on the middle
 one. Narrower than 3:2 (4:3, 5:4) the HUD is drawn smaller, by the ratio over 3:2, and what sits at the top or bottom moves
 out to the screen's top or bottom. The HUD's layouts are known by their root layout's name; every other layout is a menu's,
 kept at its 16:9 shape and not moved: in the middle 16:9 of a wider screen, and on a narrower one drawn smaller from its
-root pane to fit the width. The map page (the minimap's layout showing it) is drawn as a menu's; the text box's choices
-are held where the game puts them at the HUD's size, and its button guide is the HUD's. At 16:9 nothing changes. The UI
-projection's site scales every screen not kept whole.
+root pane to fit the width. The map page (the minimap's layout showing it) is drawn as a menu's; the text box and its
+choices are held where the game puts them at the HUD's size, but for the choices' column, at the canvas's right edge: on a
+screen where the HUD's canvas is wider than the screen (16:10 and narrower) it moves in to the screen's right side, so the
+choices stay on it (Longshot #1050). The text box's button guide is the HUD's. At 16:9 nothing changes. The UI projection's
+site scales every screen not kept whole.
 
-python -I -B tests/test_hud_layout.py [--cc gcc]
+python -I -B tests/test_hud_layout.py [--cc clang] [--cargo cargo]
 """
 import argparse
 import subprocess
@@ -17,12 +19,12 @@ import sys
 import tempfile
 from pathlib import Path
 
-RUN_ALL_ARGS = ["--cc", "gcc"]
+RUN_ALL_ARGS = ["--cc", "{clang}", "--cargo", "{cargo}"]
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "nx2"))
 sys.path.insert(0, str(ROOT / "tests"))
-import oot_wide  # noqa: E402
+from widesites import hook  # noqa: E402
+import sitehooks  # noqa: E402
 from test_wide_ui import FIXTURE_HEAD  # noqa: E402
 
 FIXTURE_MAIN = r'''
@@ -66,9 +68,45 @@ static void place(uint64_t p, uint64_t parent, float x, float y) {
     px = getf(p + 0x4c), py = getf(p + 0x50);
 }
 static uint64_t sroot, hearts, rupees, buttons, minimap, banner, mroot, mleft, froot, fpane, ficon;
-static uint64_t maproot, mapicons, mapframe, droot, dchoice, lroot, lguide;
+static uint64_t mapicons, mapframe, droot, dchoice, dcol, dbox, lroot, lguide;
+static int update_count;
+static float drawn_minimap_scale, map_group_scale, live_key_scale, boss_key_scale, pause_key_scale;
+static float map_group_x, live_key_x;
+static uint64_t maproot, map_group, live_key, boss_key, pause_key;
+#define MAP_SCREEN (BASE + 0x11000)
+#define MAP_PROJECTION (MAP_SCREEN + 0x1b8 + 8)
+static void draw_map(Ctx *ctx) {
+    CHECK(ctx->x[0] == MAP_SCREEN);
+    update_count++;
+    drawn_minimap_scale = getf(MAP_PROJECTION);
+    putf(map_group + 0x28, 1.0f), putf(map_group + 0x38, 1.0f);
+    putf(live_key + 0x28, 1.0f), putf(live_key + 0x38, 1.0f);
+    putf(boss_key + 0x28, 1.0f), putf(boss_key + 0x38, 1.0f);
+    putf(pause_key + 0x28, 1.0f), putf(pause_key + 0x38, 1.0f);
+    place(maproot, 0, 0, 0);
+    place(mapicons, maproot, 0, 0);
+    place(map_group, maproot, 100.0f, 100.0f);
+    map_group_scale = getf(map_group + 0x28);
+    map_group_x = px;
+    place(live_key, maproot, 140.0f, 100.0f);
+    live_key_scale = getf(live_key + 0x28);
+    live_key_x = px;
+    place(boss_key, mapicons, 160.0f, 100.0f);
+    boss_key_scale = getf(boss_key + 0x28);
+    place(pause_key, mapicons, 200.0f, 100.0f);
+    pause_key_scale = getf(pause_key + 0x28);
+}
+static float drawn_hud_projection[4];
+static void draw_screen(Ctx *ctx) {
+    CHECK(ctx->x[0] == MAP_SCREEN);
+    update_count++;
+    drawn_hud_projection[0] = getf(MAP_PROJECTION);
+    drawn_hud_projection[1] = getf(MAP_PROJECTION + 20);
+    drawn_hud_projection[2] = getf(MAP_PROJECTION + 64);
+    drawn_hud_projection[3] = getf(MAP_PROJECTION + 84);
+}
 static float hx, hy, rx_, ry, bx, mx, my, nx, menux, mrx, mry, mrs, ix, iy;
-static float map_ix, maps, mapfx, ds, dcx, dcy, lgx, lgy;   /* (map_ix: the map's icons' group, at the origin on the map page) */
+static float map_ix, maps, mapfx, ds, dcx, dcy, dbtn, dbx, dby, lgx, lgy;   /* (map_ix: the map's icons' group, at the origin on the map page) */
 /* the pane's size as drawn (f_8154ac30: its width in v0, its height in v1) */
 static void drawn_size(uint64_t p, float *w, float *h) {
     *w = getf(p + 0x58), *h = getf(p + 0x5c);
@@ -91,9 +129,11 @@ static void frame(void) {
     putf(maproot + 0x28, 1.0f), putf(maproot + 0x38, 1.0f);   /* (MapMenu_00: the map page, or the HUD's minimap) */
     place(maproot, 0, 0, 0); maps = getf(maproot + 0x28);
     place(mapicons, maproot, map_ix, 0); place(mapframe, maproot, -1700, 0); mapfx = px;
-    putf(droot + 0x28, 1.0f), putf(droot + 0x38, 1.0f);   /* (the text box's choices) */
+    putf(droot + 0x28, 1.0f), putf(droot + 0x38, 1.0f);   /* (MessageDialog_00: the text box and its choices) */
     place(droot, 0, 0, 0); ds = getf(droot + 0x28);
-    place(dchoice, droot, 1500, -500); dcx = px, dcy = py;
+    place(dbox, droot, 0, -704); dbx = px, dby = py;        /* (the box, across the middle) */
+    place(dcol, droot, 1460, 0); dcx = px;                  /* (the choices' column: its boxes reach x 1930) */
+    place(dchoice, dcol, dcx, -500); dbtn = px, dcy = py;   /* (a choice, made from its column's transform as moved) */
     place(lroot, 0, 0, 0); place(lguide, lroot, 1600, -900); lgx = px, lgy = py;   /* (the text box's button guide) */
 }
 static void at(float ratio) {
@@ -119,7 +159,9 @@ int main(void) {
     mapicons = pane_at(MAP, 12, "N_MapIcon_00", 60, 60, 0);
     mapframe = pane_at(MAP, 13, "P_Frame_00", 400, 1500, 1);
     droot = pane_at(DIALOG, 14, "RootPane", 0, 0, 0);
-    dchoice = pane_at(DIALOG, 15, "N_BtnIn_00", 300, 100, 1);
+    dchoice = pane_at(DIALOG, 15, "Pa_Btn_00", 940, 226, 1);
+    dcol = pane_at(DIALOG, 18, "N_BtnNum_00", 90, 120, 0);
+    dbox = pane_at(DIALOG, 19, "P_MessageBase_00", 2200, 600, 1);
     lroot = pane_at(GUIDE, 16, "RootPane", 0, 0, 0);
     lguide = pane_at(GUIDE, 17, "A_GuideAll_00", 300, 80, 1);
     const float G = 16.0f / 9.0f;
@@ -135,9 +177,10 @@ int main(void) {
     CHECK(near(hx, -1500 - e) && near(rx_, -1600 - e) && near(bx, 1600 + e) && near(mx, 1500 + e));
     CHECK(hy == 880 && ry == -900 && my == -760 && nx == 0);   /* (up and down as at 16:9) */
     CHECK(menux == -1700);
-    /* (the map page: a menu's, not moved; the text box's choices held where the game puts them; its button guide out with
-       the minimap) */
-    CHECK(mapfx == -1700 && maps == 1.0f && dcx == 1500 && ds == 1.0f && near(lgx, 1600 + e) && lgy == -900);
+    /* (the map page: a menu's, not moved; the text box and its choices held where the game puts them, beside each other; its
+       button guide out with the minimap) */
+    CHECK(mapfx == -1700 && maps == 1.0f && dcx == 1460 && dbtn == 1460 && dbx == 0 && ds == 1.0f && near(lgx, 1600 + e) &&
+          lgy == -900);
     /* (the loading fade, its layout in the middle 16:9 as the centred Ultrawide menus modes draw it: its pane over the whole
        picture, its icon as it is, Longshot #82) */
     drawn_size(fpane, &fw, &fh), drawn_size(ficon, &iw, &ih);
@@ -173,6 +216,11 @@ int main(void) {
     CHECK(near(mrs, r / G) && near(mrx, 100 * r / G) && near(mry, 40 * r / G));
     /* (drawn: the menu's whole width in the screen's) */
     CHECK(near(3840.0f * mrs * hos_ui_qx, 3840.0f));
+    /* (the text box held at the HUD's size in the middle; its choices' column in to the screen's right side, its boxes with
+       it and not moved again, as far from the screen's edge as at 16:9 (the canvas's half width there, 1920 / hos_ui_qx).
+       Left where the game puts it, its boxes' right 200 units were off the screen, Longshot #1050) */
+    CHECK(ds == 1.0f && dbx == 0 && dby == -704 && near(dcx, 1460 + e) && near(dbtn, dcx) && dcy == -500);
+    CHECK(near(1920.0f / hos_ui_qx - (dbtn + 470.0f), 1920.0f - (1460.0f + 470.0f)));
 
     at(1.5f);   /* 3:2: still the 16:9 size */
     CHECK(near(hos_ui_qy, 1.0f));
@@ -187,7 +235,8 @@ int main(void) {
     CHECK(nx == 0);
     /* (the map page fitted to the width with the rest of the pause menu, never moved; the text box's choices at the HUD's
        size, as the box, where the game puts them; its button guide in the corner, as the minimap) */
-    CHECK(near(maps, r / G / k) && mapfx == -1700 && ds == 1.0f && dcx == 1500 && dcy == -500);
+    CHECK(near(maps, r / G / k) && mapfx == -1700 && ds == 1.0f && dbx == 0 && dby == -704 && dcy == -500);
+    CHECK(near(dcx, 1460 + ex) && near(dbtn, dcx) && near(1920.0f / hos_ui_qx - (dbtn + 470.0f), 1920.0f - (1460.0f + 470.0f)));
     CHECK(near(lgx, 1600 + ex) && near(lgy, -900 - ey));
     /* drawn: the hearts' place on the screen, in canvas units of the 16:9 size, at the same distance from the top left corner
        as at 16:9 (the screen's half sizes: 1920 * r / (k * G) across, 1080 / k up) */
@@ -206,6 +255,10 @@ int main(void) {
             at(shapes[s]);
             CHECK((ix + 80.0f) * hos_ui_qx <= 1920.5f && (-iy + 80.0f) * hos_ui_qy <= 1080.5f);
             if (shapes[s] > G) CHECK(ix == 1650 && ix + 80.0f <= 1920.0f);   /* (wider: in the middle 16:9, never beside it) */
+            /* (the text box's choices no further past the screen's right edge than at 16:9, the game's own 10 units; on a
+               wider screen beside the box, where the game puts them) */
+            CHECK(dbtn + 470.0f - 1920.0f / hos_ui_qx <= 10.05f && dbx == 0);
+            if (shapes[s] > G) CHECK(dcx == 1460 && dbtn == 1460);
         }
         at(4.0f / 3.0f);
     }
@@ -218,8 +271,134 @@ int main(void) {
 
     at(0.0f);   /* back to 16:9: the game's own */
     CHECK(hx == -1500 && hy == 880 && mx == 1500 && menux == -1700 && mrs == 1.0f && mrx == 100);
+    CHECK(dcx == 1460 && dbtn == 1460 && dbx == 0);
     drawn_size(fpane, &fw, &fh);
     CHECK(fw == 3840.0f && fh == 2160.0f);
+    /* A real health group moves live, keeps the rest of the layout, and resets at 16:9. */
+    put64(NAMES + 8, text("Pa_HeartGauge_00"));
+    fixture_hud_layout = 2;
+    fixture_hud_health = (10 + 16) | ((-10 + 16) << 6) | (100 << 12);
+    at(0.0f);
+    CHECK(near(hx, -1116.0f) && near(hy, 664.0f));
+    CHECK(rx_ == -1600.0f && dbox && near(dcy, -500.0f));
+    fixture_hud_health = HOS_HUD_DEFAULT_PLACEMENT;
+    at(0.0f);
+    CHECK(hx == -1500.0f && hy == 880.0f);
+
+    /* The shared screen's gameplay bit gates both the custom transform and the live shortcut. */
+    put64(MAP_SCREEN, 0x84c08300ULL);
+    putf(MAP_PROJECTION, 0.001f), putf(MAP_PROJECTION + 64, 0.001f);
+    putf(MAP_PROJECTION + 20, 0.002f), putf(MAP_PROJECTION + 84, -0.002f);
+    put32(MAP_SCREEN + 0x2350, 1);
+    c.x[0] = MAP_SCREEN;
+    map_group = pane_at(MAP, 20, "N_InOut_00", 60, 80, 0);
+    live_key = pane_at(MAP, 21, "Pa_KeySmall_00", 60, 80, 0);
+    boss_key = pane_at(MAP, 22, "Pa_BossKey_00", 60, 80, 0);
+    pause_key = pane_at(MAP, 23, "Pa_KeySmallBtn_00", 60, 80, 0);
+    fixture_hud_map = (16 | (16 << 6) | (120 << 12));
+    hos_wide_ui_tick();
+    hos_gameplay_hud_screen(&c, draw_map);
+    CHECK(update_count == 1 && drawn_minimap_scale == 0.001f && near(map_group_scale, 1.2f));
+    CHECK(near(live_key_scale, 1.2f) && near(live_key_x - map_group_x, 48.0f));
+    CHECK(boss_key_scale == 1.0f && pause_key_scale == 1.0f);
+    hos_gameplay_hud_toggle();
+    hos_gameplay_hud_screen(&c, draw_map);
+    CHECK(update_count == 2 && drawn_minimap_scale == 0.0f && getf(MAP_PROJECTION) == 0.001f);
+    put32(MAP_SCREEN + 0x2350, 0);
+    hos_gameplay_hud_screen(&c, draw_map);
+    CHECK(update_count == 3 && drawn_minimap_scale == 0.001f && map_group_scale == 1.0f);
+    CHECK(live_key_scale == 1.0f && boss_key_scale == 1.0f && pause_key_scale == 1.0f);
+    hos_gameplay_hud_toggle();
+
+    /* In a dungeon the icon origin can match the pause page. Use the live screen state,
+       and move the minimap and key siblings by exactly the same physical-width correction. */
+    fixture_hud_layout = 0;
+    fixture_hud_map = HOS_HUD_DEFAULT_PLACEMENT;
+    hos_wide_ratio = 3440.0f / 1440.0f;
+    put32(MAP_SCREEN + 0x2350, 1);
+    hos_wide_ui_tick();
+    hos_gameplay_hud_screen(&c, draw_map);
+    hos_wide_ui_tick();
+    hos_gameplay_hud_screen(&c, draw_map);
+    CHECK(near(map_group_x, 760.0f) && near(live_key_x, 800.0f));
+
+    /* The same pane addresses can become the full map on the next draw. */
+    put32(MAP_SCREEN + 0x2350, 0);
+    hos_gameplay_hud_screen(&c, draw_map);
+    CHECK(near(map_group_x, 100.0f) && near(live_key_x, 140.0f));
+    CHECK(boss_key_scale == 1.0f && pause_key_scale == 1.0f);
+
+    fixture_hud_layout = 1;
+    hos_wide_ui_tick();
+    put32(MAP_SCREEN + 0x2350, 1);
+    hos_gameplay_hud_screen(&c, draw_map);
+    CHECK(near(map_group_x, 100.0f) && near(live_key_x, 140.0f));
+
+    fixture_hud_layout = 2;
+    fixture_hud_map = 6 | (16 << 6) | (100 << 12);
+    hos_wide_ui_tick();
+    hos_gameplay_hud_screen(&c, draw_map);
+    CHECK(near(map_group_x, 244.0f) && near(live_key_x, 284.0f));
+    fixture_hud_layout = 0;
+    hos_wide_ratio = 1.6f;
+    hos_wide_ui_tick();
+    hos_gameplay_hud_screen(&c, draw_map);
+    CHECK(near(map_group_x, -92.0f) && near(live_key_x, -52.0f));
+
+    /* Reuse the former full-map root's address before the next planner tick. */
+    put32(MAP_SCREEN + 0x2350, 0);
+    hos_gameplay_hud_screen(&c, draw_map);
+    const uint64_t reused_root = pane_at(STATUS, 11, "RootPane", 0, 0, 0);
+    const uint64_t reused_gauge = pane_at(STATUS, 24, "Pa_HeartGauge_00", 120, 120, 1);
+    CHECK(reused_root == maproot);
+    place(reused_root, 0, 0, 0);
+    CHECK(near(getf(reused_root + 0x28), 1.0f));
+    place(reused_gauge, reused_root, -1500.0f, 880.0f);
+    hos_wide_ui_tick();
+    place(reused_root, 0, 0, 0);
+    place(reused_gauge, reused_root, -1500.0f, 880.0f);
+    CHECK(near(px, -1308.0f));
+
+    maproot = pane_at(MAP, 11, "RootPane", 0, 0, 0);
+    hos_wide_ui_force = 0;
+    put32(MAP_SCREEN + 0x2350, 1);
+    hos_gameplay_hud_screen(&c, draw_map);
+    CHECK(hos_wide_ui_force >= 3);
+    hos_wide_ui_force = 0;
+    hos_gameplay_hud_screen(&c, draw_map);
+    CHECK(hos_wide_ui_force == 0);
+    put32(MAP_SCREEN + 0x2350, 0);
+    hos_gameplay_hud_screen(&c, draw_map);
+    CHECK(hos_wide_ui_force >= 3);
+    at(0.0f);
+
+    /* Health, items, action prompts, control guides, horse and dive gauges retain their updates. */
+    const uint64_t gameplay[] = {0x84c0b710ULL, 0x84c05a50ULL, 0x84c02d48ULL,
+                                 0x84c05318ULL, 0x84c07400ULL, 0x84c0afe0ULL};
+    for (unsigned i = 0; i < sizeof gameplay / sizeof gameplay[0]; i++) {
+        put64(MAP_SCREEN, gameplay[i]);
+        const int before = update_count;
+        hos_gameplay_hud_screen(&c, draw_screen);
+        CHECK(drawn_hud_projection[0] == 0.001f && drawn_hud_projection[3] == -0.002f);
+        hos_gameplay_hud_toggle();
+        hos_gameplay_hud_screen(&c, draw_screen);
+        for (unsigned row = 0; row < 4; row++) CHECK(drawn_hud_projection[row] == 0.0f);
+        CHECK(getf(MAP_PROJECTION) == 0.001f && getf(MAP_PROJECTION + 20) == 0.002f &&
+              getf(MAP_PROJECTION + 64) == 0.001f && getf(MAP_PROJECTION + 84) == -0.002f);
+        hos_gameplay_hud_toggle();
+        hos_gameplay_hud_screen(&c, draw_screen);
+        CHECK(update_count == before + 3 && drawn_hud_projection[0] == 0.001f && drawn_hud_projection[3] == -0.002f);
+    }
+    hos_gameplay_hud_toggle();
+    put64(MAP_SCREEN, 0x84c042e8ULL);  /* BalloonMessage */
+    hos_gameplay_hud_screen(&c, draw_screen);
+    CHECK(drawn_hud_projection[0] == 0.001f && drawn_hud_projection[3] == -0.002f);
+    put64(MAP_SCREEN, gameplay[0]);
+    putf(MAP_PROJECTION + 84, 1.0f);  /* an unrecognised pair */
+    hos_gameplay_hud_screen(&c, draw_screen);
+    CHECK(drawn_hud_projection[0] == 0.001f && drawn_hud_projection[3] == 1.0f);
+    hos_gameplay_hud_toggle();
+
     printf("PASS: the HUD keeps its 16:9 size at each shape, at the screen's edges; the menus keep 16:9\n");
     return 0;
 }
@@ -257,7 +436,6 @@ int main(void) {
     hos_wide_keep_mask = 0xf;   /* (Full width: kept whole, the game's) */
     run(LOADING, a, b);
     CHECK(a[0] == m00 && b[1] == m11);
-    hos_wide_keep_mask = 0x5;
     printf("PASS: the UI projection's site scales every screen not kept whole across and up, and 16:9 not at all\n");
     return 0;
 }
@@ -269,12 +447,17 @@ def check(cond, what):
         raise SystemExit("FAIL: " + what)
 
 
+# (env_value_off, the switches' rule, before the code cut out of the sources: gpu/vk/compat/longshot_env.h)
+ENV_ON_H = str(ROOT / "gpu" / "vk" / "compat" / "longshot_env.h")
+
+
 def build_run(cc, src, tag):
     with tempfile.TemporaryDirectory(prefix="hud-layout-") as tmp:
         c = Path(tmp) / (tag + ".c")
-        exe = Path(tmp) / tag
+        exe = Path(tmp) / (tag + (".exe" if sys.platform == "win32" else ""))
         c.write_text(src, encoding="utf-8")
-        built = subprocess.run([cc, "-std=c11", "-O1", "-Wall", "-Wno-unused-function", "-o", str(exe), str(c), "-lm"],
+        built = subprocess.run([cc, "-std=c11", "-O1", "-include", ENV_ON_H, "-Wall", "-Wno-unused-function", "-o", str(exe), str(c),
+                                *sitehooks.objects(tmp, src), "-lm"],
                                capture_output=True, text=True)
         check(built.returncode == 0, tag + " did not compile:\n" + built.stdout + built.stderr)
         run = subprocess.run([str(exe)], capture_output=True, text=True)
@@ -284,14 +467,14 @@ def build_run(cc, src, tag):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--cc", default="gcc")
+    p.add_argument("--cc", default="clang")
+    p.add_argument("--cargo")
     a = p.parse_args()
+    sitehooks.use(a.cc, a.cargo)
 
-    host = (ROOT / "host" / "hos_wide_ui.c").read_text(encoding="utf-8")
+    host = (ROOT / "game" / "hos_wide_ui.c").read_text(encoding="utf-8")
     backend = (ROOT / "host" / "rx_backend.c").read_text(encoding="utf-8")
     check("hos_wide_keep_mask &= ~2u;" in backend, "the menus could be kept whole, stretched, on a screen narrower than 16:9")
-    check(any(site == oot_wide.HUD for _, _, site in oot_wide.SITES),
-          "the UI projection's site is not installed")
 
     body = "".join(line for line in host.splitlines(keepends=True) if not line.startswith("#include"))
     decl = "extern volatile float hos_wide_ratio;\n"
@@ -299,11 +482,11 @@ def main():
     body = body.replace(decl, "", 1)
     build_run(a.cc, FIXTURE_HEAD + body + FIXTURE_MAIN, "plan")
 
-    head = FIXTURE_HEAD.replace("volatile float hos_wide_squeeze, hos_wide_ratio;", "volatile float hos_wide_squeeze;")
-    site = (SITE_MAIN.replace("SITE", oot_wide.HUD).replace("FADES", "0x%xULL" % oot_wide.KEEP_VTABLES[2])
-            .replace("LOADING", "0x%xULL" % oot_wide.KEEP_VTABLES[3]))
-    # (the site's own extern declarations, here defined above it)
-    build_run(a.cc, head + site, "site")
+    # (the UI projection's site, wide.hud, as the lift lowers it (tests/sitehooks.py): its callback from game/oot_wide_sites.c, the kept screens'
+    # vtables its address names)
+    defs, line = hook("wide.hud")
+    site = (SITE_MAIN.replace("SITE", line).replace("FADES", "WIDE_KEEP_EVENT_FADE").replace("LOADING", "WIDE_KEEP_LOADING_FADE"))
+    build_run(a.cc, FIXTURE_HEAD + "#define A64_NOESC\n" + defs + site, "site")
 
 
 if __name__ == "__main__":

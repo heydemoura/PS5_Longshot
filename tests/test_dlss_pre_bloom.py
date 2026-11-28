@@ -1,0 +1,135 @@
+"""NVIDIA DLAA before the game's bloom and tone map (gpu/vk/pre_bloom.h, vk_temporal.cpp temporal_pre_bloom): where in a
+frame it runs. The place is learned from the frame before: the first draw that reads the scene's colour after the frame's last
+draw into it, by its program and its place among the frame's readers. The C++ part plays the Market frame's passes (a frame
+dump of main, DLAA at 5120x2160: the game's copies of the scene, more draws into it, the bloom's first draw, the scene mapping
+draw) and the cases around them: never at a copy the scene is drawn into after, a late draw teaching nothing, another area's
+passes, a frame without bloom, once a frame, the list's end. The Python part checks that the renderer uses it as described:
+vk_draw.cpp gives every draw to temporal_pre_bloom after its descriptors and before its pass, the chain learns at the gameplay
+upscale and copies there after DLAA ran before the bloom, DLSS makes its feature for HDR colour then, and the switch has its
+row. No game, GPU or NVIDIA SDK required.
+
+python -I -B tests/test_dlss_pre_bloom.py [--cxx g++]
+"""
+import argparse
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # (tests/srccut.py: python -I leaves this folder off the path)
+from srccut import between, block   # noqa: E402
+from menu_model_fixture import menu_text   # noqa: E402
+
+RUN_ALL_ARGS = ["--cxx", "{cxx}"]
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def check_sources():
+    vk = ROOT / "gpu" / "vk"
+    chain = (vk / "vk_temporal.cpp").read_text(encoding="utf-8")
+    draw = (vk / "vk_draw.cpp").read_text(encoding="utf-8")
+    dlss = (vk / "vk_dlss.cpp").read_text(encoding="utf-8")
+    switches = (vk / "switches.def").read_text(encoding="utf-8")
+
+    # (every draw, after its descriptors listed what it samples and before its pass: the hook ends the open pass itself)
+    hook = "const bool pre_recorded = temporal_pre_bloom(cmd, p.key, gfx_sampled(), at.color, at.n);"
+    assert draw.count(hook) == 1, "vk_draw.cpp: draw() gives each draw to temporal_pre_bloom once"
+    assert draw.index("if (!same_desc) gfx_sampled() = draw_sampled();") < draw.index(hook) < \
+        draw.index("writes = draw_hazards(cmd, p, s, at"), "draw(): the hook after the descriptors, before the pass"
+    # (#1672: DLAA's passes and its actor motion's draws bind a pipeline, an upright viewport and descriptors of their own:
+    # the draw forgets what it thought bound and binds all of its own again, as after the network's stand-in)
+    after = draw[draw.index(hook):]
+    assert after.index("if (pre_recorded) cb.reset();") < after.index("writes = draw_hazards(cmd, p, s, at"), \
+        "draw(): the bound state reset after DLAA's commands, before the draw sets its own"
+    assert "if (!same_desc || pre_recorded) {" in after, "draw(): its descriptors pushed again after DLAA's commands"
+
+    pre = block(chain, "bool temporal_pre_bloom(VkCommandBuffer cmd")
+    assert "s.pre.scene_draw()" in pre and "s.pre.sampler(key, s.pre_trigger)" in pre, "temporal_pre_bloom: the frame's list"
+    assert pre.index("s.pre.sampler(") < pre.index("end_pass(cmd);") < pre.index("draw_engine(cmd, s, mode, cam, key, true,"), \
+        "temporal_pre_bloom: the pass ended before DLAA's compute"
+    assert "full_barrier(cmd);" in pre[pre.index("draw_engine("):], "temporal_pre_bloom: the draw waits for DLAA's picture"
+    assert "s.pre.ran = false" in pre, "temporal_pre_bloom: a failed run leaves the frame to the network"
+    assert "return s.pre.ran = false, true;" in pre and "    return true;\n" in pre, \
+        "temporal_pre_bloom: true once it recorded commands, DLAA drawn or not"
+    # (the scene before its tone map is linear: taken as it is, written back as it is, by a feature made for HDR colour)
+    engine = block(chain, "bool draw_engine(VkCommandBuffer cmd")
+    assert "pre ? s.prep_lin" in engine, "draw_engine: the scene's linear colour taken as it is"
+    assert "if (pre && (!engine.e->hdr || !engine.e->hdr()))" in engine, "draw_engine: only a feature made for HDR colour"
+    assert "s.pre_last != pre" in engine, "draw_engine: a change of place starts a new history"
+    # (a change of place restarts the engine's history, not the motion: the engine's frame before is read ahead of the
+    # changes that zero it, kept by the change of place alone, and the motion and the actors' poses pair with it.
+    # tests/temporal_history_test.cpp checks the decision itself)
+    drawn = "const uint64_t drawn = s.last_frame;"
+    assert drawn in engine and engine.index(drawn) < engine.index("if (s.psycho_last != psycho"), \
+        "draw_engine: the engine's frame before is read after a change has zeroed it"
+    assert "if (s.pre_last != pre) s.pre_last = pre, s.last_frame = 0, moved = drawn;" in engine, \
+        "draw_engine: a change of place loses the engine's frame before for the motion"
+    assert "if (ready == 2) s.engines_made++, s.last_frame = 0, moved = 0;" in engine, \
+        "draw_engine: a feature made just now keeps the motion of another"
+    assert "actor_motion(cmd, cam, previous, rw, rh, dview, motion, seen)" in engine, \
+        "draw_engine: the actors' poses do not pair with the frame the motion is from"
+    # (a change of place says in the log whether its motion was kept, the actors drawn over it, and whether FSR 3.1's frame
+    # interpolation took it: the frame where the kept motion is used, seen in a game run)
+    placed = "const bool placed = s.pre_last != pre;"
+    assert placed in engine and engine.index(placed) < engine.index("if (s.pre_last != pre) s.pre_last = pre,"), \
+        "draw_engine: the change of place noted before it is applied"
+    took = "const bool fsr_took = motion && fsr_wanted && fsr3_inputs::take_motion(cmd, f.motion.image, rw, rh);"
+    assert took in engine, "draw_engine: whether FSR 3.1's frame interpolation took this frame's motion"
+    told = "if (placed) place_told(name_of(mode), pre, now, ready == 2, moved, motion, actors, fsr_wanted, fsr_took);"
+    assert told in engine and engine.index(took) < engine.index(told), "draw_engine: a change of place logged"
+    told_fn = block(chain, "void place_told(const char* name, bool pre")
+    for part in ["a new feature", "the motion kept from frame", "actors drawn over it", "no frame before within 2",
+                 "no reprojection", "FSR 3.1's frame interpolation %s", "took it", "did not take it", "not on"]:
+        assert part in told_fn, "place_told: the line says " + repr(part)
+    assert "changes++ < 20 || changes % 600 == 0" in told_fn, "place_told: bounded, as route_told"
+    assert "prep_lin_data{16384.0f, VK_FALSE}" in chain, "make_pipelines: prep_lin neither squares nor clamps at 1"
+
+    up = block(chain, "bool temporal_upscale(VkCommandBuffer cmd")
+    assert "pre_learn(s);" in up, "temporal_upscale: the frame teaches the next"
+    assert up.index("pre_learn(s);") < up.index("if (s.pre_drawn == now)") < up.index("stretch_record(cmd, in_view, out,") \
+        < up.index("return draw_engine(cmd, s, mode, cam, key, false,"), \
+        "temporal_upscale: after DLAA ran before the bloom the network's input is copied, else the engine runs there"
+
+    note = block(chain, "void temporal_note_scene_draw(const Texture*")
+    assert "pre_bloom_wanted(temporal_mode())" in note and "s.out_w.load(" in note, \
+        "temporal_note_scene_draw: only DLAA, the scene at the output's size"
+
+    prepare = between(dlss, "int prepare(VkCommandBuffer cmd", "bool start()")
+    assert "present_native_pq.load(std::memory_order_relaxed) || temporal_hdr_input()" in prepare, \
+        "vk_dlss.cpp prepare: an HDR feature for the scene's linear colour"
+
+    assert "SW(RX_VK_DLSS_PRE_BLOOM, player, bool," in switches, "switches.def: RX_VK_DLSS_PRE_BLOOM's row"
+    wanted = block(chain, "bool pre_bloom_wanted(int mode)")
+    assert "opts.dlss_pre_bloom != 0" in wanted, "pre_bloom_wanted: the DLAA before the bloom row (off by default)"
+    # (vk_menu.cpp and its modules, their rows as table lines, #1633: the upscaler rows are gpu/vk/menu/upscaler.cpp's)
+    menu = menu_text(ROOT)
+    module = (vk / "menu" / "upscaler.cpp").read_text(encoding="utf-8")
+    assert '{TAB_GRAPHICS, "DLAA before the bloom", &opts.dlss_pre_bloom, 0, 1, 1, tx_onoff,' in menu, "vk_menu.cpp: the row"
+    assert menu.index('"DLSS model", &opts.dlss_model') < menu.index('"DLAA before the bloom", &opts.dlss_pre_bloom') < \
+        menu.index('"Render resolution", &opts.resolution'), "the row under DLSS model, with the upscaler rows"
+    # (the row's own shown() and locked(), which row_shown and row_fixed ask of a module's row)
+    assert "ur::pre_bloom_shown(dlss_why() == DLSS_OK, upscaler())" in module, "the row's shown()"
+    assert "ur::pre_bloom_fixed(upscaler(), pre_bloom_env())" in module, "the row's locked()"
+    assert "rows[i].setting->shown()" in block(menu, "bool row_shown(int i)") and \
+        "module_locked(value)" in block(menu, "bool row_fixed(const int* value)"), "row_shown and row_fixed ask a module's row"
+    assert 'if (r.value == &opts.dlss_pre_bloom) return "dlss_pre_bloom";' in menu, "ini_key: dlss_pre_bloom"
+    assert 'getenv("RX_VK_DLSS_PRE_BLOOM"); e && *e) env_override(&opts.dlss_pre_bloom, !env_value_off(e));' in menu, \
+        "RX_VK_DLSS_PRE_BLOOM over the row for a run"
+    assert "mode == ur::DLAA" in wanted, "pre_bloom_wanted: DLAA only"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cxx", default="g++")
+    args = parser.parse_args()
+    check_sources()
+    with tempfile.TemporaryDirectory(prefix="dlss-pre-bloom-") as tmp:
+        exe = Path(tmp) / "dlss-pre-bloom"
+        subprocess.run([args.cxx, "-std=c++20", "-Wall", "-Wextra", "-Werror", str(ROOT / "tests" / "test_dlss_pre_bloom.cpp"),
+                        "-o", str(exe)], check=True)
+        subprocess.run([str(exe)], check=True)
+
+
+if __name__ == "__main__":
+    main()

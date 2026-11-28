@@ -18,8 +18,14 @@ const char *hos_sdl_error(void);
 void hos_sdl_identity(const char *name, const char *app_id);
 
 /* ---- the window: centred, resizable, at the display's pixel density, for Vulkan ---- */
-void *hos_sdl_window(const char *title, int width, int height);
+void *hos_sdl_window(const char *title, int width, int height, int hidden);
+int hos_sdl_show_window(void *window);
 void hos_sdl_fullscreen(void *window, int on);   /* (the desktop's mode, borderless) */
+struct MkwVkMonitor;
+int hos_sdl_monitor_list(void *window, struct MkwVkMonitor *out, uint32_t *tokens, int cap);
+uint32_t hos_sdl_window_display(void *window); /* UINT32_MAX when unknown; SDL2 index zero is valid */
+int hos_sdl_fullscreen_target(void *window, int on, uint32_t token);
+int hos_sdl_is_fullscreen(void *window);
 void hos_sdl_relative_mouse(void *window, int on);
 int hos_sdl_desktop_size(int *width, int *height);
 int hos_sdl_refresh_mhz(void *window);   /* the refresh rate of the window's display in mHz, 0 when not known (the main thread) */
@@ -34,6 +40,9 @@ void hos_sdl_icon(void *window, const char *png);   /* (SDL 3.4's PNG loader: no
    events, an input method's window; SDL2 has it on from the start, SDL3 off), the clipboard's text (UTF-8, NULL when none;
    given back with hos_sdl_free) */
 void hos_sdl_text_input(void *window, int on);
+/* (longshot) the cursor over the game's window shown or hidden (SDL3's SDL_ShowCursor and SDL_HideCursor, SDL2's
+   SDL_ShowCursor(1 or 0); nothing in an SDL without them). Main thread */
+void hos_sdl_cursor(int shown);
 char *hos_sdl_clipboard(void);
 void hos_sdl_free(void *p);
 
@@ -57,9 +66,18 @@ typedef struct {
 int hos_sdl_wait_event(HosSdlEvent *e, int timeout_ms);   /* 1 when there was one */
 int hos_sdl_poll_event(HosSdlEvent *e);
 
-/* ---- sound: the default output, pull() asked for len more bytes as it runs low (s16: 16-bit samples, else float) ---- */
-int hos_sdl_audio_open(int freq, int channels, int s16, void (*pull)(void *user, uint8_t *out, int len), void *user);
-int hos_sdl_audio_channels(void);   /* the default output's channels (6 for 5.1); 2 when SDL cannot say */
+/* Playback tokens are process-local, never saved or reused for another endpoint. UINT32_MAX means Default.
+   Saved identities are backend-qualified names; ambiguous duplicate names are not offered. Discovery opens no stream. */
+int hos_sdl_output_count(void);
+int hos_sdl_output_info(int index, char *id, int id_capacity, char *name, int name_capacity);
+int hos_sdl_output_resolve(const char *id);
+int hos_sdl_output_channels(int index);   /* (longshot) the index'th device's channels, after hos_sdl_output_count; 0 unknown */
+int hos_sdl_pad_audio_endpoint(void *pad); /* token for this pad's four-channel endpoint, or -1 */
+void *hos_sdl_audio_open(unsigned device, int freq, int channels, int s16, int frames,
+                         void (*pull)(void *user, uint8_t *out, int len), void *user);
+void hos_sdl_audio_close(void *audio);   /* stops callbacks before freeing their state */
+int hos_sdl_audio_alive(void *audio);   /* bounded polling for a removed named endpoint/stopped SDL2 device */
+int hos_sdl_audio_channels(void);   /* selected/default output's channels; 2 when SDL cannot say */
 
 /* ---- (longshot) microphones: SDL3's recording devices or SDL2's capture devices, for the game's input streams
    (host/nn_audio_in.c). The device's sound comes out converted to the format asked for (SDL resamples and mixes the
@@ -90,6 +108,7 @@ void hos_sdl_pad_rumble(void *pad, uint16_t low, uint16_t high, uint32_t ms);
    SDL_GameControllerSendEffect): 1 when SDL took it */
 int hos_sdl_pad_type(void *pad);
 int hos_sdl_pad_has_effect(void);
+int hos_sdl_pad_virtual(int32_t id, int open_index);
 int hos_sdl_pad_effect(void *pad, const void *data, int size);
 /* motion sensors (SDL_SENSOR_ACCEL m/s^2, SDL_SENSOR_GYRO rad/s, three values each): 0 when the pad or the SDL has none */
 enum { HOS_SDL_SENSOR_ACCEL = 1, HOS_SDL_SENSOR_GYRO = 2 };
@@ -100,4 +119,15 @@ int hos_sdl_pad_sensor(void *pad, int type, float *data, int n);   /* 1 when rea
    calls); a pad's USB vendor (0 unknown); its Steam Input handle (0 for a real pad) */
 int hos_sdl_knows_steam_pads(void);
 uint16_t hos_sdl_pad_vendor(void *pad);
+uint16_t hos_sdl_pad_product(void *pad);   /* (its USB product id, 0 unknown: the Steam Deck's built-in controls and vibration.h's Steam Controller (2026)) */
 uint64_t hos_sdl_pad_steam_handle(void *pad);
+/* (longshot) vibration (host/pad_sdl.c, host/rumble_renhdrum.c): a pad's transport (1 wireless, 0 wired, -1 when SDL
+   cannot say); an Xbox pad's trigger motors (1 sent); a pad's device path ("" unknown) and a second handle on it */
+int hos_sdl_pad_wireless(void *pad);
+int hos_sdl_pad_rumble_triggers(void *pad, uint16_t left, uint16_t right, uint32_t ms);
+const char *hos_sdl_pad_path(void *pad);
+int hos_sdl_hid_can(void);
+void *hos_sdl_hid_open(const char *path);
+int hos_sdl_hid_write(void *hid, const void *data, int size);   /* the bytes written, -1 on failure */
+void hos_sdl_hid_close(void *hid);
+int hos_sdl_pad_headphones(void *pad);   /* (longshot) a DualSense's jack: 1 headphones in, 0 out, -1 when it cannot say */

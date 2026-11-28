@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 
 namespace mkwvk::upscaler_rows {
 
@@ -28,6 +29,8 @@ inline unsigned fsr4_bits(bool fsr4_ok) { return fsr4_ok ? bit(FSR4) | bit(FSR4_
 /// Intel XeSS's two, the same way (xess_ok: xess_why() == XESS_OK)
 inline unsigned xess_bits(bool xess_ok) { return xess_ok ? bit(XESS) | bit(XESS_AA) : 0u; }
 inline bool is_dlss(int upscaler) { return upscaler == DLSS || upscaler == DLAA; }
+// NR's inputs are validated for DLSS/DLAA and the shared FSR paths. XeSS is excluded until validated.
+inline bool supports_nr(int upscaler) { return is_dlss(upscaler) || upscaler == FSR3 || upscaler == FSR4 || upscaler == FSR4_AA; }
 inline bool is_fsr4(int upscaler) { return upscaler == FSR4 || upscaler == FSR4_AA; }
 inline bool is_xess(int upscaler) { return upscaler == XESS || upscaler == XESS_AA; }
 /// The engines that take Native PsychoV35's RGBA16F scene unless RX_VK_PSYCHOV35_DLSS=0 (vk_temporal.cpp temporal_scene_format):
@@ -230,47 +233,138 @@ inline void step_render(int upscaler, int v, int dir, int* up, int* res) {
 /// DLAA and FSR 4's native AA are their engines' Native)
 inline bool render_fixed(int upscaler) { return full_scale(upscaler) && native_of(engine(upscaler)) < 0; }
 
+// ---- Option C: Dynamic resolution toggle + monotonic ascending fixed Render resolution slider ----
+/// Sentinel stop ID representing an engine's Native full-scale mode (DLAA / FSR 4 Native AA / XeSS Native AA) on the
+/// Render resolution slider. Distinct from 1 (100% numeric) so saved 100% under DLSS still snaps to 92% as before.
+constexpr int kNativeStop = -1;
+constexpr int kGameFixedSteps[] = {4, 3, 2, 1};                            // (50, 67, 75, 100 %)
+constexpr int kOffFixedSteps[] = {6, 4, 3, 2, 1};                          // (33, 50, 67, 75, 100 %)
+constexpr int kFsr3FixedSteps[] = {6, 4, 5, 3, 2, 8, 9, 1};                // (33, 50, 58, 67, 75, 83, 92, 100 %)
+constexpr int kNativeFixedSteps[] = {6, 4, 5, 3, 2, 8, 9, kNativeStop};    // (33, 50, 58, 67, 75, 83, 92 %, Native)
+
+/// Ascending fixed stops for the Render resolution slider (lowest % -> highest %, never containing 0 Auto).
+inline const int* fixed_steps(int upscaler, int& n) {
+    const int e = engine(upscaler);
+    if (native_of(e) >= 0) return n = (int)(sizeof kNativeFixedSteps / sizeof kNativeFixedSteps[0]), kNativeFixedSteps;
+    if (e == FSR3) return n = (int)(sizeof kFsr3FixedSteps / sizeof kFsr3FixedSteps[0]), kFsr3FixedSteps;
+    if (e == OFF) return n = (int)(sizeof kOffFixedSteps / sizeof kOffFixedSteps[0]), kOffFixedSteps;
+    return n = (int)(sizeof kGameFixedSteps / sizeof kGameFixedSteps[0]), kGameFixedSteps;
+}
+/// Whether Dynamic resolution (Auto scaling) is currently active: opts.resolution == 0 and not in a full-scale Native mode.
+inline bool dynamic_resolution_on(int upscaler, int res) { return !full_scale(upscaler) && percent(res) == 0; }
+/// Toggle Dynamic resolution on/off while preserving 100% longshot_options.ini compatibility (resolution=0 <-> On).
+/// Remembers last_fixed (defaulting to Quality 67% = 3) across On/Off toggles, and leaves Native mode when enabling dynamic.
+inline int toggle_dynamic_resolution(int upscaler, int res, bool enable, int* last_fixed, int* out_up) {
+    const int e = engine(upscaler);
+    if (out_up) *out_up = e;
+    if (enable) {
+        if (last_fixed) {
+            if (full_scale(upscaler) && native_of(e) >= 0) *last_fixed = kNativeStop;
+            else if (percent(res)) *last_fixed = res;
+        }
+        return 0;
+    }
+    if (last_fixed && *last_fixed == kNativeStop && native_of(e) >= 0) {
+        if (out_up) *out_up = native_of(e);
+        return res;
+    }
+    const int pick = (last_fixed && percent(*last_fixed)) ? *last_fixed : 3;
+    const int snapped = snap_render(e, pick);
+    return percent(snapped) ? snapped : 3;
+}
+/// Current fixed slider stop ID for (upscaler, res): kNativeStop when full-scale Native, else snapped numeric stop (fallback 3).
+inline int active_fixed_stop(int upscaler, int res) {
+    if (full_scale(upscaler) && native_of(engine(upscaler)) >= 0) return kNativeStop;
+    const int sv = snap_render(upscaler, res);
+    return percent(sv) ? sv : 3;
+}
+/// Index of stop_v inside fixed_steps(upscaler), or 0 if not found.
+inline int fixed_stop_index(int upscaler, int stop_v) {
+    int n = 0;
+    const int* s = fixed_steps(upscaler, n);
+    for (int i = 0; i < n; i++)
+        if (s[i] == stop_v) return i;
+    return 0;
+}
+/// Apply a target fixed stop ID from fixed_steps(upscaler) to (out_up, out_res).
+/// Entering Native preserves current_res (the player's saved numeric scale) just like step_render.
+inline void apply_fixed_stop(int upscaler, int current_res, int target_stop, int* out_up, int* out_res) {
+    const int e = engine(upscaler), nat = native_of(e);
+    if (nat >= 0 && target_stop == kNativeStop) {
+        *out_up = nat;
+        *out_res = current_res;
+        return;
+    }
+    *out_up = e;
+    *out_res = target_stop;
+}
+/// Monotonic Left (-1) / Right (+1) step along fixed_steps(upscaler), clamped at ends (never wraps to Auto).
+inline void step_fixed_render(int upscaler, int current_res, int dir, int* out_up, int* out_res) {
+    int n = 0;
+    const int* s = fixed_steps(upscaler, n);
+    const int cur = fixed_stop_index(upscaler, active_fixed_stop(upscaler, current_res));
+    const int next = std::clamp(cur + (dir > 0 ? 1 : dir < 0 ? -1 : 0), 0, n - 1);
+    apply_fixed_stop(upscaler, current_res, s[next], out_up, out_res);
+}
+
 /// The texture LOD bias the upscalers add to the game's world materials (the samplers it biases below 0: -0.5 everywhere, for
 /// its network's 3/4 share, about log2(0.75)). share: the Render resolution's in 1/10000 of the output, 0 at Auto (the
-/// game's dynamic size, 3/4 of the output in play). offset: DLSS's extra step, below.
-///  - DLSS and DLAA: NVIDIA's guide (DLSS Programming Guide 3.5): the game's bias at native size + log2(render / output)
-///    - 1.0, so DLSS's network gets the texture detail of the output's size and a little more, which it resolves over its
-///    frames. The game's materials are tuned to -0.5 at 3/4, about 0 at native size, so on top of its -0.5 that is
-///    log2(share / 0.75) + offset, offset -1 by default (RX_VK_DLSS_LOD_OFFSET): Quality (67 %) -1.17, Performance -1.58,
-///    DLAA -0.58, Auto -1. Without the -1 DLSS was given the render size's own texture detail (Quality -0.17, DLAA and Auto
-///    nothing), the soft textures it then upscaled
-///  - FSR 3.1, FSR 4 and XeSS: log2(share / 0.75) below 75 % (the mips the output's size wants), 0 at Auto and above. XeSS's
-///    guide asks for log2(render / output) on top of the game's bias at native size, the same here: the game's -0.5 at 3/4
-///  - the game's own, Off, FSR 4's and XeSS's native AA: 0
+/// game's dynamic size, 3/4 of the output in play). offset: the extra step below (-1 by default, RX_VK_DLSS_LOD_OFFSET).
+///  - DLSS, DLAA, FSR 3.1, FSR 4 and FSR 4's native AA: NVIDIA's guide (DLSS Programming Guide 3.5) and AMD's FSR 3.1 / FSR 4
+///    specification both ask for the game's bias at native size + log2(render / output) - 1.0, so the temporal upscaler gets
+///    the texture detail of the output's size and a little more, which it resolves over its frames. The game's materials are
+///    tuned to -0.5 at 3/4, about 0 at native size, so on top of its -0.5 that is log2(share / 0.75) + offset, offset -1 by
+///    default (RX_VK_DLSS_LOD_OFFSET): Quality (67 %) -1.17, Performance -1.58, Native AA / 100 % -0.58, Auto -1. Without the
+///    -1 the upscaler was given the render size's own texture detail (Quality -0.17, Native AA and Auto nothing)
+///  - XeSS: log2(share / 0.75) below 75 % (the mips the output's size wants), 0 at Auto and above. XeSS's guide asks for
+///    log2(render / output) on top of the game's bias at native size, the same here: the game's -0.5 at 3/4
+///  - the game's own, Off and XeSS's native AA: 0
 inline float upscale_lod_bias_for(int upscaler, int share, float offset) {
-    if (is_dlss(upscaler)) {
-        const float r = upscaler == DLAA ? 1.0f : share > 0 ? (float)share / 10000.0f : 0.75f;
+    if (is_dlss(upscaler) || is_fsr4(upscaler) || upscaler == FSR3) {
+        const float r = full_scale(upscaler) ? 1.0f : share > 0 ? (float)share / 10000.0f : 0.75f;
         return std::min(0.0f, std::log2(r / 0.75f) + offset);
     }
     if (!scales_by_mode(upscaler) || share <= 0) return 0.0f;
     return std::min(0.0f, std::log2((float)share / 7500.0f));
 }
 
+/// The FSR 4 model row (opts.fsr4_model, saved as fsr4_model): 0 Auto (AMD's own pick for this GPU), 1 Lite (the faster
+/// INT8 network, ffxProvider_FSR4Lite_Int8). The row is shown only where FSR 4 runs and the loaded library has a Lite
+/// provider with the hook installed; it has nothing to choose while the Upscaler is not FSR 4, or RX_VK_FSR4_MODEL is set
+enum { FSR4_MODEL_AUTO = 0, FSR4_MODEL_LITE = 1, kFsr4Models = 2 };
+inline bool fsr4_model_shown(bool fsr4_ok, bool lite_available) { return fsr4_ok && lite_available; }
+inline bool fsr4_model_fixed(int upscaler, bool env_set) { return !is_fsr4(upscaler) || env_set; }
+
 /// The DLSS model row (opts.dlss_model, saved as dlss_model): which of NVIDIA's networks DLSS and DLAA draw with, by its
-/// preset (NVSDK_NGX_DLSS_Hint_Render_Preset_*). 0 the transformer, preset K (the default here, the one tested); 1 the second
-/// generation transformer, preset M (NVIDIA's own pick for Performance); 2 the same generation as tuned for Ultra
-/// Performance, preset L; 3 NVIDIA's default, preset 0 (the runtime picks per mode, and a runtime update can change it)
-enum { MODEL_K = 0, MODEL_M = 1, MODEL_L = 2, MODEL_DEFAULT = 3, kModels = 4 };
-inline unsigned model_preset(int model) {
+/// preset (NVSDK_NGX_DLSS_Hint_Render_Preset_*). 0 the transformer, preset K (the default here, the one tested), or on a
+/// card with less than 7 GB of video memory the CNN, preset E (cnn_for_vram); 1 the second generation transformer, preset M
+/// (NVIDIA's own pick for Performance); 2 the same generation as tuned for Ultra Performance, preset L; 3 NVIDIA's default,
+/// preset 0 (the runtime picks per mode, and a runtime update can change it)
+enum { MODEL_K = 0, MODEL_M = 1, MODEL_L = 2, MODEL_DEFAULT = 3, MODEL_E = 4, MODEL_F = 5, kModels = 6 };
+/// Preset E, NVIDIA's last CNN model (vk_dlss.cpp checks the number against the SDK's)
+constexpr unsigned kPresetE = 5;
+/// The K row draws with preset E on a card with less than 7 GB of video memory (vram: device_vram_bytes(), 0 when not known:
+/// K), the same rule for DLSS (vk_dlss.cpp wanted_preset) and the row's text: less video memory and GPU time than K (an RTX
+/// 3050 6 GB at Performance, 1080p: 1.55 ms less GPU time and 27 MB less of NGX's memory, the same picture)
+inline bool cnn_for_vram(int model, uint64_t vram) { return model == MODEL_K && vram && vram < (7ull << 30); }
+inline unsigned model_preset(int model, uint64_t vram = 0) {
+    if (cnn_for_vram(model, vram)) return kPresetE;
     switch (model) {
     case MODEL_M: return 13;
     case MODEL_L: return 12;
     case MODEL_DEFAULT: return 0;
+    case MODEL_E: return 5;
+    case MODEL_F: return 6;
     default: return 11;   // (K, also for a value past the row)
     }
 }
 /// The preset DLSS is asked for: RX_VK_DLSS_PRESET over the row (env: its value, or nullptr), a letter (A = 1 ... Z = 26,
-/// either case) or 0 for NVIDIA's default; anything else leaves the row's
+/// either case) or 0 for NVIDIA's default; anything else leaves the row's (vram: as model_preset's)
 inline bool preset_env(const char* env) {
     return env && ((*env >= 'A' && *env <= 'Z') || (*env >= 'a' && *env <= 'z') || (env[0] == '0' && !env[1]));
 }
-inline unsigned dlss_preset(int model, const char* env) {
-    if (!preset_env(env)) return model_preset(model);
+inline unsigned dlss_preset(int model, const char* env, uint64_t vram = 0) {
+    if (!preset_env(env)) return model_preset(model, vram);
     if (*env == '0') return 0;
     return (unsigned)(*env >= 'a' ? *env - 'a' + 1 : *env - 'A' + 1);
 }
@@ -290,11 +384,17 @@ inline bool upscaler_fixed(unsigned available) { return (available & ~bit(GAME))
 /// everywhere (the menu's mask has it), so the menu always shows the row
 inline bool upscaler_shown(unsigned available) { return !upscaler_fixed(available); }
 inline bool resolution_fixed(int upscaler) { return full_scale(upscaler); }
-/// The DLSS model row: shown only where DLSS runs (dlss_ok: dlss_why() == DLSS_OK; a build without DLSS, or a GPU or
-/// driver it cannot run on, hides it), with nothing to choose while the game's own upscales
-inline bool model_shown(bool dlss_ok) { return dlss_ok; }
+/// The DLSS model row: shown only with NVIDIA DLSS chosen (DLSS or DLAA) where it runs (dlss_ok: dlss_why() == DLSS_OK; a
+/// build without DLSS, or a GPU or driver it cannot run on, hides it), as the model picks nothing for another upscaler
+inline bool model_shown(bool dlss_ok, int upscaler) { return dlss_ok && is_dlss(upscaler); }
 /// (env_set: RX_VK_DLSS_PRESET names a preset, which wins over the row for this run)
 inline bool model_fixed(int upscaler, bool env_set) { return !is_dlss(upscaler) || env_set; }
+/// (longshot) The DLAA before the bloom row (opts.dlss_pre_bloom): shown with NVIDIA DLSS chosen where it runs (DLSS or
+/// DLAA), and changeable with DLAA alone: in DLSS's other modes the scene, the bloom and the tone map are drawn smaller than
+/// the output DLSS draws, so its picture cannot go back into the scene (vk_temporal.cpp temporal_pre_bloom)
+inline bool pre_bloom_shown(bool dlss_ok, int upscaler) { return dlss_ok && is_dlss(upscaler); }
+/// (env_set: RX_VK_DLSS_PRE_BLOOM is set, and wins over the row for this run)
+inline bool pre_bloom_fixed(int upscaler, bool env_set) { return upscaler != DLAA || env_set; }
 /// The Window scaling filter does something only when the window's size is not the game's picture's (the Output resolution);
 /// a size not known yet (0) counts as different
 inline bool filter_needed(unsigned picture_w, unsigned picture_h, unsigned window_w, unsigned window_h) {

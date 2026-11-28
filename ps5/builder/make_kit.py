@@ -5,8 +5,10 @@
 Run after `ps5/build.py --kit` (or a whole build) of this checkout: work/ps5 holds the objects. No game is needed: the
 kit's objects are the ones no game file goes into (ps5/builder/build_kit.sh does all of it from a fresh clone). The kit holds the
 objects of the runtime, the Vulkan back end, Dear ImGui, libopus and PS5_MihawkGen compiled for the console; RADV, FFmpeg,
-dav1d and zstd as libraries; the payload SDK's headers and libraries; the link's scripts and flags; the lifter's sources
-(nx2, host, third_party/a64-kit) and the title folder's own files. Nothing in it comes from a game: ps5/builder/pipeline.py
+dav1d and zstd as libraries, and the game's Rust (longshot-rs, built for the console: ps5/tools/build-rust.sh); the payload
+SDK's headers and libraries; the link's scripts and flags; what the translation reads of the repository (host, game) with
+its runtime (builder/rt), and the title folder's own files. The translator itself, upstream's longshot-builder built for the
+PC the kit is used on, goes in tools/bin (LONGSHOT_BUILDER names it; else builder's own target/release). Nothing in it comes from a game: ps5/builder/pipeline.py
 adds the game's part on the player's PC. What each part is and its licence: the kit's NOTICE.md.
 """
 import argparse
@@ -46,8 +48,8 @@ def main():
     b = load_build()
     kit = os.path.abspath(a.out)
     work = b.OUT
-    rt64 = os.path.join(work, "rt64")
-    jobs = b.jobs_for(rt64, os.path.join(work, "gen"))
+    b.kit_dirs()   # (as build.py --kit compiled them: against the lift's runtime alone, no game)
+    jobs = b.jobs_for(os.path.join(work, "gen"))
     objects = sorted(j[1] for j in jobs if not os.path.basename(j[1]).startswith("game_"))
     missing = [o for o in objects if not os.path.exists(o) or not os.path.exists(o + ".key")]
     if missing:
@@ -90,6 +92,17 @@ def main():
     for n in ("libavcodec.a", "libswscale.a", "libavutil.a", "libdav1d.a"):
         copy(os.path.join(b.FFMPEG, "lib", n), os.path.join(kit, "lib", n))
     copy(os.path.join(b.DEPS, "zstd", "lib", "libzstd.a"), os.path.join(kit, "lib", "libzstd.a"))
+    if not os.path.exists(b.RUST_LIB):
+        sys.exit("make_kit: the game's Rust for the console is not built (ps5/tools/build-rust.sh): %s" % b.RUST_LIB)
+    copy(b.RUST_LIB, os.path.join(kit, "lib", "liblongshot_rs.a"))
+    # (the lift's runtime as the kit's objects were compiled against it: pipeline.py checks a player's lift wrote the same)
+    for f in os.listdir(b.RT):
+        copy(os.path.join(b.RT, f), os.path.join(kit, "rt", f))
+    builder = os.environ.get("LONGSHOT_BUILDER") or next(
+        (x for x in (os.path.join(ROOT, "target", "release", "longshot-builder"),
+                     os.path.join(ROOT, "builder", "target", "release", "longshot-builder")) if os.path.exists(x)), None)
+    if builder:   # (for this PC's system: package.py puts each system's own in its package)
+        copy(builder, os.path.join(kit, "tools", "bin", "longshot-builder"))
     shutil.copytree(os.path.join(sdk, "target"), os.path.join(kit, "sdk", "target"), symlinks=False)
 
     # ---- the link: PS5_Vulkan's recipe, read from its own script, its paths made the kit's ----
@@ -134,21 +147,28 @@ printf '%s\0' "${radv_link_inputs[@]}"
 
     # ---- the game's compile flags, as ps5/build.py has them ----
     game = next(j for j in jobs if os.path.basename(j[1]) == "game_a64_rt.o")
-    game_places = [(rt64, "{rt64}"), (b.GEN, "{gen}"), (os.path.join(b.kit.KIT, "rt"), "{kit}/src/third_party/a64-kit/rt"),
-                   (os.path.join(ROOT, "nx2", "rt"), "{kit}/src/nx2/rt")]
+    # (b.GEN holds gen/rt too; host/ and game/ are the kit's copies)
+    game_places = [(b.GEN, "{gen}"), (b.HOST.rstrip(os.sep), "{kit}/src/host"), (b.GAME, "{kit}/src/game")]
 
     def game_placed(arg):
         for real, name in game_places:
             arg = arg.replace(real, name)
-        if "/home/" in arg:
+        if "/home/" in arg or ROOT in arg:
             sys.exit("make_kit: a compile flag still names this PC: " + arg)
         return arg
 
-    # ---- the lifter and what it reads ----
-    for rel in tracked("nx2", "host", "third_party/a64-kit", "assets/longshot.png", "assets/pipeline_states", "LICENSE"):
-        if rel.startswith("nx2/test_") or "/tests/" in rel:
+    # ---- what the translation reads of the repository (dev lift --repo: host/ and game/), and the lists' sources ----
+    for rel in tracked("host", "game", "builder/rt", "assets/longshot.png", "assets/pipeline_states", "LICENSE"):
+        if "/tests/" in rel:
             continue
         copy(os.path.join(ROOT, rel), os.path.join(kit, "src", rel))
+
+    # (longshot-builder takes src/ for its tools' root only if it sees these folders ("is not Longshot's tools" otherwise); the
+    # console's build reads nothing in the two that are the PC renderer's and its libraries', so they are here empty)
+    for d in (os.path.join("gpu", "vk"), "third_party"):
+        os.makedirs(os.path.join(kit, "src", d), exist_ok=True)
+        with open(os.path.join(kit, "src", d, "README.md"), "w") as f:
+            f.write("Empty in the PS5 kit: the console's renderer is compiled already (obj/), and the translation reads host/ and game/.\n")
 
     # ---- the title folder's own files ----
     for n in os.listdir(os.path.join(ROOT, "ps5", "sce_sys")):
@@ -170,7 +190,11 @@ printf '%s\0' "${radv_link_inputs[@]}"
                          "-isystem", "{kit}/sdk/target/include/c++/v1", "-isystem", "{kit}/sdk/target/include",
                          "-fno-stack-protector", "-fno-plt", "-femulated-tls", "-fdenormal-fp-math=ieee"],
         "game_flags": [game_placed(x) for x in game[2]],
-        "game_files": ["a64_table.c", "a64_hooks.c", "a64_suyu.c", "a64_stubs.c", "hos_image.c", "nvn2_exports.c"],
+        "game_files": b.GAME_FILES,
+        # (the lifted units, LLVM IR; the hot ones with hot_opt in place of -O1; the lift's options for the console)
+        "ir_flags": b.IR_FLAGS,
+        "hot_opt": b.HOT_OPT,
+        "lift_options": b.LIFT_OPTIONS,
         "objects": kept,
         "link": flags,
     }
@@ -193,7 +217,8 @@ Built from PS5_Longshot %s. No part of it comes from a game.
 | lib/libzstd.a | zstd | BSD-3-Clause |
 | lib/libclang_rt.builtins-x86_64.a | LLVM compiler-rt | Apache-2.0 with LLVM exceptions |
 | sdk/, link/, obj/app_crt.o, title/sce_module/libc.prx | ps5-payload-sdk and PS5_Vulkan's platform layer | GPL-3.0 |
-| src/ | Longshot's lifter (nx2), runtime sources (host) and a64-kit | GPL-3.0 |
+| lib/liblongshot_rs.a | Longshot's game code in Rust (game/crates) with Rust's standard library | GPL-3.0 (Rust's: MIT or Apache-2.0) |
+| src/, rt/, tools/bin/longshot-builder | Longshot's runtime sources (host, game), the translation's runtime (builder/rt) and its builder | GPL-3.0 |
 
 The sources are in the PS5_Longshot repository at the revision above and in the projects named.
 """ % (info["revisions"]["PS5_Longshot"][:12], info["revisions"]["PS5_MihawkGen"][:12], info["revisions"]["PS5_Vulkan"][:12]))

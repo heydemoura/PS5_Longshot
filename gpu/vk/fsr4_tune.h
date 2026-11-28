@@ -1,17 +1,22 @@
 // AMD FSR 4's passes, tuned as the library hands them to the driver (vk_fsr4.cpp): plain functions over SPIR-V, no Vulkan
 // calls, so tests/test_fsr4_tune.py builds and runs them as they are.
 //
-// Measured 2026-11-12 on an RX 6700 XT, Adrenalin 26.10.1, Windows 11 (FSR 4.1.2, 720p -> 1440p, all of its passes 8.97 ms),
-// each change checked bit for bit against AMD's own output on that driver. None of them reorders the arithmetic, but with the
-// weights constants in the code another driver (or RADV) may fold them differently: elsewhere the same maths, not
-// necessarily the same bits:
+// Measured on an RX 6700 XT, Adrenalin 26.10.1, Windows 11 (FSR 4.1.2, 720p -> 1440p, raw AMD 9.01 ms SDR / 8.11 ms HDR),
+// each change checked against AMD's own output on that driver (passes 1, 2, 4, 5, 10, 12 and HDR postpass bit-exact; SDR
+// postpass 99.99996% bit-exact, 6/14.7M half-floats within 2 ULP from an additional FMA contraction across its unrolled 2x2
+// quad). With the weights constants in the code another driver (or RADV) may fold them differently: elsewhere the same maths,
+// not necessarily the same bits:
 //  - wave64 for the network's layers (entry points "..._passN"): they ask for 32 lanes, and their loops' scalar work is then
-//    paid once per 32 pixels instead of 64: 8.97 -> 6.85 ms. The prepass and postpass stay at 32 (slower at 64).
+//    paid once per 32 pixels instead of 64: 8.97 -> 6.85 ms. The prepass and postpass stay at 32 (no gain at 64).
 //  - weights out of per-thread arrays: the postpass and the layers copy constant weight tables (2.8 KB; 576 and 128 words,
 //    again at every iteration) into Function arrays and read them at loop-dependent places, which the driver keeps in
-//    scratch memory. Read from a tail appended to the library's storage buffer instead (arrays_to_buffer): 6.85 -> 4.48 ms.
-//  - the layers with weight tables that stay small unrolled whole (spirv_unroll.h, vk_fsr4.cpp): the weights become
-//    constants in the code. Passes 1, 2 and 12, 0.45 -> 0.27 ms each: 4.04 ms in all.
+//    scratch memory. Read from a tail appended to the library's storage buffer instead (arrays_to_buffer): 6.85 -> 4.50 ms.
+//  - on FSR 4.1.2, every pass with constant weight tables unrolled and folded (spirv_unroll.h, vk_fsr4.cpp; another version
+//    keeps the previous unroller, spirv_unroll_legacy.h, for the network's layers only): the constant tables fold into
+//    immediate constants and the local Function scratch arrays forward away, shrinking every pass to 27-45k words (<60 MB;
+//    0.15-0.35 s cold compile each standalone, 0.33-0.69 s in-game). Passes 1, 2, 12 (~0.40 -> 0.27 ms), passes 4, 5, 10
+//    (~0.24 -> 0.15 ms) and the postpass (0.94 -> 0.64 ms SDR, 0.98 -> 0.50 ms HDR): 3.52 ms SDR / 3.33 ms HDR standalone
+//    (in-game Hyrule Field: 4.54 -> 3.70 ms).
 #pragma once
 
 #include <cstdint>

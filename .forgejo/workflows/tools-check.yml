@@ -1,0 +1,114 @@
+# The build tools' archives (tools.lock), checked on any branch: started by hand (Actions > Check tools > Run workflow)
+# on a pull request's branch to see its pins make the same archive twice before it merges. Nothing is uploaded here: the
+# archives are made and uploaded from main by MagicBeanAdmin/Release's longshot-tools.yml, on its own runners
+# (docs/dev/reference/releases.md, "Bumping a tool").
+#
+# builder/tools/make.sh --check, in Ubuntu 22.04 (builder/tools/Dockerfile's packages): each tool named made from its
+# pins by its recipe, then made again from nothing but the downloads, and refused unless the two archives are the same
+# bytes; one whose version tools.lock names already must be that line's archive. No secrets: anyone with write access
+# may dispatch a branch's recipes, so they run on a check runner.
+name: Check tools
+on:
+  workflow_dispatch:
+    inputs:
+      tools:
+        description: the tools to make, <system>/<name> separated by spaces (linux-x64/sdl2 windows-x64/cpm ...), or all
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tools-check-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  make:
+    name: The tools, made twice
+    runs-on: ubuntu-24.04
+    container: ubuntu:22.04
+    # (llvm and the Windows cpm, each twice, are the long ones: about an hour together)
+    timeout-minutes: 240
+    steps:
+      - name: Package installs without fsync
+        run: echo force-unsafe-io > /etc/dpkg/dpkg.cfg.d/force-unsafe-io
+      # (builder/tools/Dockerfile's packages, the same list)
+      - name: System packages
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          retry_packages() {
+            for try in 1 2 3; do
+              if "$@"; then return 0; else package_status=$?; fi
+              if [ "$try" = 3 ]; then return "$package_status"; fi
+              echo "::notice::the package install failed ($package_status): trying again in 20 s ($try of 3)"
+              sleep 20
+            done
+          }
+          base_packages() {
+            apt-get update &&
+              apt-get install -y --no-install-recommends software-properties-common gpg-agent
+          }
+          toolchain_packages() {
+            # (the PPA from ppa.launchpad.net, as builder/tools/Dockerfile: ppa.launchpadcontent.net, add-apt-repository's
+            # choice, answered 503 for hours on 2026-11-23 while the former served the same archive; apt checks the
+            # archive's signature with the key enrollment added)
+            timeout --kill-after=5s 180s add-apt-repository -y --no-update ppa:ubuntu-toolchain-r/test &&
+              sed -i 's|https://ppa\.launchpadcontent\.net/|http://ppa.launchpad.net/|g' /etc/apt/sources.list.d/*.list &&
+              apt-get update &&
+              apt-get install -y --no-install-recommends g++-13 libstdc++-13-dev &&
+              apt-get install -y --no-install-recommends git ca-certificates curl xz-utils zstd file unzip python3 \
+              build-essential gcc-12 g++-12 libstdc++-12-dev nasm meson ninja-build cmake pkg-config \
+              libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxss-dev libxfixes-dev libxinerama-dev \
+              libxkbcommon-dev libwayland-dev wayland-protocols libdecor-0-dev libegl-dev libgles-dev libdrm-dev libgbm-dev \
+              libpulse-dev libasound2-dev libpipewire-0.3-dev libudev-dev libdbus-1-dev zlib1g-dev
+          }
+          retry_packages base_packages
+          retry_packages toolchain_packages
+      # (Node for the actions: ubuntu:22.04 has none; the release's Linux build pins the same)
+      - name: Node for the actions
+        env:
+          NODE_VER: v24.22.3
+          NODE_SHA256: 4f2b175a6d53a5c617a80dba2676238a0688cef28c6da4eba35c7d844e66fcfb
+        run: |
+          node_tar="$RUNNER_TEMP/node.tar.xz"
+          curl -fL --retry 5 --retry-all-errors --retry-delay 5 --proto '=https' -o "$node_tar" \
+            "https://nodejs.org/dist/$NODE_VER/node-$NODE_VER-linux-x64.tar.xz"
+          echo "$NODE_SHA256  $node_tar" | sha256sum -c --quiet -
+          tar -xJf "$node_tar" -C /usr/local --strip-components=1 "node-$NODE_VER-linux-x64/bin/node"
+          rm -f "$node_tar"
+      - name: Check out the commit
+        uses: https://github.com/actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      # (the builder whose `dev tools make` packs every archive, mise.toml's Rust: scripts/ci_rust.sh. It needs none of
+      # the tools to be built)
+      # (its own step: the PATH ci_rust.sh hands on through $GITHUB_PATH reaches the steps after it only)
+      - name: Rust (mise.toml's)
+        run: scripts/ci_rust.sh
+      - name: longshot-builder for the tools
+        run: |
+          cargo build --locked -q -p longshot-builder
+          echo "LONGSHOT_BUILD=$PWD/target/debug/longshot-builder" >> "$GITHUB_ENV"
+      - name: Make them, twice
+        env:
+          WANTED: ${{ inputs.tools }}
+        run: |
+          # (the input is words of <system>/<name> or all: make.sh refuses any other)
+          [[ $WANTED =~ ^[a-z0-9/\ -]+$ ]] || { echo "::error::tools: <system>/<name> ... or all, not \"$WANTED\""; exit 2; }
+          read -ra wanted <<< "$WANTED"
+          builder/tools/make.sh --out made --check "${wanted[@]}"
+          ls -lR made
+      - name: Upload tools-made
+        uses: https://data.forgejo.org/forgejo/upload-artifact@16871d9e8cfcf27ff31822cac382bbb5450f1e1e   # v4 (4.3.1 with the GHES check off; Forgejo's: GitHub's v4 and later refuse a server that is not github.com)
+        with:
+          name: tools-made
+          path: made/
+          if-no-files-found: error

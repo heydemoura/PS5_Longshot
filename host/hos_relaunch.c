@@ -3,8 +3,8 @@
    the very end of that, instead of only exiting, the game is started again:
      Linux: the process becomes the game again (execve) with the arguments and the environment it started with
      (/proc/self/cmdline and /proc/self/environ: longshot_env.txt's lines are read again, not kept), so whatever waits
-     for it (the launcher, a stream, a test) still has it. The game is bin/longshot on disk, never run from inside the
-     AppImage (longshot-launch starts it with the AppImage's variables taken away), so /proc/self/exe is the game;
+     for it (the launcher, a stream, a test) still has it. The game is the game folder's longshot on disk (bin/longshot
+     in a folder an older builder made), never run from inside a packed program, so /proc/self/exe is the game;
      argv[0] on the PATH if that is gone (the folder built again meanwhile).
      Windows: a new process of this executable (GetModuleFileNameW) with this one's command line (GetCommandLineW), in
      the same folder, with the environment this one started with (kept by hos_relaunch_keep_env before longshot_env.txt
@@ -12,6 +12,7 @@
      and the standard handles it was started with when it was given a stderr (a run's log.txt), inherited alone;
      then this one exits. */
 #include "hos.h"
+#include "../game/game.h"   /* (the game's hook this file calls: its last log lines) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -137,6 +138,15 @@ static void relaunch(void) {
 
 extern char **environ;
 
+static int start_err_given = 1;   /* (whether the game was started with a stderr: hos_relaunch_keep_env) */
+
+void hos_relaunch_keep_env(void) {
+    /* (the environment is read again from /proc/self/environ; kept here, before hos_main.c opens longshot_log.txt as stderr
+       for a game given none, by the same test as hos_main.c's, is whether it was given one) */
+    const HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+    start_err_given = err && err != INVALID_HANDLE_VALUE && GetFileType(err) != FILE_TYPE_UNKNOWN;
+}
+
 static void relaunch(void) {
     HosRelaunch r;
     if (!hos_relaunch_command("/proc/self/cmdline", "/proc/self/environ", &r)) {
@@ -155,9 +165,18 @@ static void relaunch(void) {
         closedir(d);
     }
     fflush(NULL);
+    /* (a game given no stderr has its own log there, which execve would keep: the new run would take it for a stderr it was
+       given, and neither move it to .1 nor name it for the crash window. It is given none again; its log back if the exec fails) */
+    int log_err = -1;
+    if (!start_err_given) {
+        const int none = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        if (none >= 0 && (log_err = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 0)) >= 0) dup2(none, STDERR_FILENO);
+        if (none >= 0) close(none);
+    }
     execve("/proc/self/exe", r.argv, r.envp);
     environ = r.envp;   /* (execvp searches the PATH of the environment it is given: the one the game started with) */
     execvp(r.argv[0], r.argv);
+    if (log_err >= 0) dup2(log_err, STDERR_FILENO), close(log_err);
     hos_log("restart: the game could not be started again: it only exits");
     hos_log_flush();
 }
@@ -166,7 +185,17 @@ static void relaunch(void) {
 /* Shared tail after rx_close_asked returned. No process exit or restart here: the Windows stop worker must
    keep its watchdog alive until all explicit close work and the log flush have returned. */
 void hos_close_finish(void) {
-    hos_log("stop: close work done (the game's saves are not waited for)");
+    void hos_input_movie_close(void);   /* (input_movie.c: an input recording's last run, and a playback's count) */
+    hos_input_movie_close();
+    void hos_pad_speaker_shutdown(void);   /* (longshot) host/pad_speaker.c: the DualSense's sound goes back to its jack */
+    hos_pad_speaker_shutdown();
+    void hos_fs_wait_writes(void);   /* (nn_fs.c: a file the game is writing, up to 3 s) */
+    hos_fs_wait_writes();
+    void hos_sdl_vibration_shutdown(void);
+    hos_sdl_vibration_shutdown();
+    hos_log("stop: close work done (a file the game was writing waited for, at most 3 s)");
+    hos_ab_end();   /* (longshot) HOS_AB: the sides' sums in the log (host/hos_ab.c) */
+    game_close_log();   /* (longshot) the game's last log lines (game/game.h): the cloth's HOS_CLOTH_DECLINES counts */
     hos_log_flush();
     void hos_crash_clean_end(void);
     hos_crash_clean_end();
