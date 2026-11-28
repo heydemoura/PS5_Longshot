@@ -30,6 +30,7 @@
 #include <unordered_set>
 
 #include "vk_temporal.h"
+#include "vk_dlssg.h"   // (NVIDIA DLSS Frame Generation through Streamline)
 #include "vk_fsr3_inputs.h"   // (the camera jitter while AMD FSR 3.1 upscales)
 #include "status_line.h"
 #include "vk_reflex.h"
@@ -150,6 +151,16 @@ VkResult submit_or_retry(const VkSubmitInfo2& si, VkFence fence) {
         static std::atomic<int> told{0};
         if (told.fetch_add(1, std::memory_order_relaxed) < 16)
             logf("vk: the refused submit %s on try %d", res == VK_SUCCESS ? "was taken" : "was refused again, dropped", tries);
+    }
+    // (longshot) Qualcomm's Adreno driver on Windows answers every submit after Windows has reset a hung GPU (a TDR) with
+    // VK_ERROR_INITIALIZATION_FAILED, a result vkQueueSubmit2 may not give, never VK_ERROR_DEVICE_LOST: device_lost() did not
+    // run, nothing finished on the GPU any more and none of it counted as sent, so the hang watch saw nothing owed, and the
+    // game froze with no report. Nothing sent after it runs: it is a lost device (the caller logs the failure first)
+    if (res == VK_ERROR_INITIALIZATION_FAILED) {
+        logf("vk: submit failed (%d): taken as a lost device (Qualcomm's driver answers so after Windows resets a hung GPU)",
+             (int)res);
+        device_lost("the GPU stopped and Windows reset it (a TDR): the driver refuses every submit since "
+                    "(VK_ERROR_INITIALIZATION_FAILED), and nothing sent to it runs any more");
     }
     return res;
 }
@@ -2210,8 +2221,8 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
         }
         case NOP_DRAW_MESH: {
             const auto d = payload<nvn_p_draw_mesh>(a, avail);
-            static int logged_mesh;
-            if (logged_mesh++ < 8)
+            static int logged_mesh;   // (counted only while it logs, as mesh_program_locked's)
+            if (logged_mesh < 8 && ++logged_mesh)
                 logf("vk: mesh draw kind %d: %d %d %d, indirect %#llx count %#llx max %d stride %d", d.kind, d.x, d.y,
                      d.z, (unsigned long long)d.indirect, (unsigned long long)d.count_addr, d.max, d.stride);
             DrawArgs da;
@@ -2405,13 +2416,24 @@ void early_split(VkCommandBuffer& cmd) {
 }
 
 /// The replay cannot go on: logged, the host's queued log written out (as hos_fatal does: a device lost's report is many
-/// lines, and the queue went with the process), written to stderr and the process ended (exit code 3)
+/// lines, and the queue went with the process), written to stderr and the process ended (exit code 3). Under NVIDIA
+/// Streamline's loader (vk_dlssg.h dlssg_loaded) ended before the DLLs' detach: there its DLSS-G plugin tears its frame
+/// generation down with its threads gone, and in the game an access violation was logged as a crash after the FATAL
+/// line and the process ended with a crash's exit code (dlssg_shutdown, the window's close, takes locks and waits: not
+/// for a fatal end, from any thread). The detach also ran this DLL's atexit, the performance summary's last
+/// (perf_report.cpp at_exit): written here first
 [[noreturn]] void replay_fatal(const char* why) {
     // The host's crash/freeze records read this prefix (host/hos_report_prefixes.h); keep it stable.
     logf("vk: FATAL: %s", why);
     if (host && host->log_flush) host->log_flush();
     std::fprintf(stderr, "vk: FATAL: %s\n", why);
     std::fflush(stderr);
+#ifdef _WIN32
+    if (dlssg_loaded()) {
+        perf_report_final(-1);
+        TerminateProcess(GetCurrentProcess(), 3);
+    }
+#endif
     std::_Exit(3);
 }
 /// A command buffer of the submission from h (its start, or where it stopped at a wait), recorded on this thread.
@@ -4539,6 +4561,8 @@ uint64_t vk_retirement_value() {
     replay_fatal(lost);
 }
 
+void fatal_end(const char* why) { replay_fatal(why); }
+
 /// (longshot) A GPU hang the driver never reports as a lost device. RTX 4070 Ti, NVIDIA 595.99.02, Linux, Hyrule Castle: the
 /// kernel's Xid 109 (CTX SWITCH TIMEOUT) ended the game's GPU context, the timeline stopped 4 short of what was sent, and
 /// from then on every wait came back VK_TIMEOUT or never came back, none VK_ERROR_DEVICE_LOST: device_lost() did not run,
@@ -5163,6 +5187,18 @@ void frame_info(int64_t* replayed, int64_t* draws, int* width, int* height) {
 }
 
 uint64_t present_value = 0;   // (the present job's value, handed out as it came; 0: the next one)
+// (longshot) The present job's times: when the game's thread presented the frame (bh_now's clock; 0: not known), and how
+// long that thread then waited for the renderer. Set before each do_present, on its thread, which takes them once: for
+// frame generation's timeline (framegen_record) and, through present_shown_at below, for the hold of DLSS Frame
+// Generation through Streamline (vk_dlssg.cpp dlssg_hold)
+int64_t present_game_at = 0;  // (the present job's game_at, frame generation's timeline; 0: not known)
+int64_t present_game_wait = 0;  // (its game_wait: how long the game's thread was held in that present)
+// (longshot) The present do_present makes on this thread, for the hold in present_image_with_trial: its job's time and
+// wait as do_present took them; 0 outside do_present, so a present made anywhere else (present_image) is never held
+thread_local int64_t present_shown_at = 0, present_shown_wait = 0;
+struct PresentShownScope {   // (do_present's: present_shown_* cleared on each of its returns)
+    ~PresentShownScope() { present_shown_at = present_shown_wait = 0; }
+};
 struct PendingShot {
     bool on = false;
     uint64_t value = 0;
@@ -5400,12 +5436,15 @@ static bool acknowledge_output_trial_frame(OutputTrialFrame frame) {
     return true;
 }
 
-void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view, bool source_srgb, bool allow_scale, OutputTrialSource trial);
+void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view,
+                              bool source_srgb, bool allow_scale, OutputTrialSource trial,
+                              VkFormat framegen_format = VK_FORMAT_UNDEFINED);
 
 void do_present(const nvn_tex* t, const int crop[4], uint64_t native_generation = 0) {
     OutputTrialSource trial;
     trial.native_generation = native_generation;
     trial.generation = output_trial_generation.load(std::memory_order_acquire);
+    const PresentShownScope shown_scope;   // (present_shown_*: this present's alone)
 #ifdef TRACY_ENABLE
     HT_SCOPE("do_present");
 #endif
@@ -5442,6 +5481,12 @@ void do_present(const nvn_tex* t, const int crop[4], uint64_t native_generation 
         PROF(PROF_PRESENT);
         const uint64_t value = present_value ? present_value : ++q_values;
         present_value = 0;
+        const int64_t game_at = present_game_at;
+        present_game_at = 0;
+        const int64_t game_wait = present_game_wait;
+        present_game_wait = 0;
+        present_shown_at = game_at;
+        present_shown_wait = game_wait;
         rec_value_now = value;
         ub_first_of_recording = ub_updates.size();
         Recording& r = begin_recording(value);
@@ -5508,7 +5553,7 @@ void do_present(const nvn_tex* t, const int crop[4], uint64_t native_generation 
         const bool fg_after = !preview && framegen_on() && tex && !fg_inline;
         interpolated = !preview && framegen_on() && tex && fg_inline &&
                        framegen_record(r.cmd, texture_view(tex, t, nullptr, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample), sw,
-                                       sh, crop, present_native_pq.load(std::memory_order_relaxed));
+                                       sh, crop, present_native_pq.load(std::memory_order_relaxed), game_at, game_wait);
         texture_frame(completed());
         full_barrier(r.cmd);
         presents++;
@@ -5662,7 +5707,7 @@ void do_present(const nvn_tex* t, const int crop[4], uint64_t native_generation 
             // (its slot is free again once the next submit's value is reached: that one comes after it)
             Recording& g = begin_recording(value + 1);
             interpolated = framegen_record(g.cmd, texture_view(tex, t, nullptr, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample),
-                                           sw, sh, crop, present_native_pq.load(std::memory_order_relaxed));
+                                           sw, sh, crop, present_native_pq.load(std::memory_order_relaxed), game_at, game_wait);
             submit_recording(g, false);
         }
         // (frame generation at Off or Auto, where DLSS-G is not asked: its feature, if made, let go, vk_dlss.cpp)
@@ -5903,7 +5948,7 @@ void do_present(const nvn_tex* t, const int crop[4], uint64_t native_generation 
 
 bool output_preview_request(uint32_t width, uint32_t height) {
     std::lock_guard settings(menu_mu);
-    if (opts.hdr || opts.reflex || opts.dlss || framegen_on()) return false;
+    if (opts.hdr || opts.reflex || temporal_row() || framegen_on()) return false;
     if (!host->output_preview_request || !output_preview_path.load(std::memory_order_acquire)) return false;
     std::lock_guard lk(output_trial_mu);
     if (output_trial.request.generation || TrialClock::now() < output_preview_queued_until) return false;
@@ -6176,9 +6221,386 @@ namespace {
 static bool acquire_ahead_wanted();   // (acquire ahead: every driver, RX_VK_ACQUIRE_AHEAD; after present_image)
 static void acquire_ahead(VkSwapchainKHR sc, uint64_t generation);
 bool present_thread_on();
-void present_hand_off(uint32_t index, VkFence done, uint64_t reflex_id, OutputTrialFrame trial);
+void present_hand_off(uint32_t index, VkFence done, uint64_t reflex_id, uint64_t antilag_id, OutputTrialFrame trial);
 void present_finish(VkResult res, bool on_presenter);
 std::atomic<bool> presenter_surface_lost{false};   // (the presenter thread's present: VK_ERROR_SURFACE_LOST_KHR, for present_image)
+
+// (longshot, RX_VK_PRESENT_PROBE=<file>: diag) Where a present's time goes on the GPU. Each present of present_out has a
+// timestamp submitted alone on its queue right before it and another right after it, each with a fence of its own, and its
+// image's copy a timestamp at its end. A thread of the probe's own waits for the two fences and writes one CSV line a present:
+// the clock (QueryPerformanceCounter's ticks on Windows, as RX_VK_FG_LATENCY_LOG's; the steady clock's ns elsewhere) at each
+// probe's submit, at the present's call and return, and when each fence was seen signalled; whether the copy's fence was
+// signalled at the call and at the return; and the three GPU timestamps in ns of the GPU's own clock (a fence is seen no sooner
+// than its timestamp: the reader takes the clocks' offset from them). For the game frame's wait at its present with frame
+// generation (docs/dev/reference/architecture.md#frame-generations-presents). Only present_commit's presents are probed (a
+// fixed multiplier's sets presented ahead, present_ahead_wanted): present_image's go to the presenter thread (present_hand_off)
+// before present_out gets to its probe. The probe is made at the first copy presented ahead (probe_copy_stamp), so the first
+// set's copies have their timestamps; none presented ahead, none made, no file. The file's first line, after a `#`, says the
+// columns are brackets and observations, not waits, and that -1 is a timestamp the probe does not have.
+// A copy's query is handed to it reset from the CPU (vkResetQueryPool), so it reads unavailable until that copy has run:
+// a timestamp the reader finds is that copy's, on whichever queue the present goes (on the presents' own, nothing orders
+// the probe's fences after the copy). The query is then its image's until its present's line takes it, then the line's
+// until the reader has read it; never reset nor written before. One whose copy is not seen run (its timestamp not written
+// in 2 s, its line's fences not seen, or its image copied again before its present) is set aside for the run, never handed
+// out again: that copy may still write it. None free (kProbeCopies held or set aside): the copy goes without, its line's
+// gpu_copy_ns -1, said once in the log. The reader waits up to 2 s for a copy's timestamp to be written, and writes -1 if
+// it is not. A device that cannot reset queries from the CPU (hostQueryReset) has its copies stamped only where the
+// presents are on the replay's queue, which runs the probe's first submit after the copy; on the presents' own, none (said
+// once).
+// The reader writes the file out every 64 lines, and once no line has come for 250 ms. At the window's close
+// (present_probe_close, from mkwvk_close_asked) no probe is made nor present probed any more, and the reader writes the
+// lines queued, flushes and closes the file and ends; the log counts the lines written and not. A line's fences and copy
+// are waited for 2 s at most, and from the close only until 500 ms after it (the waits in steps of 50 ms), so the close
+// is held 500 ms at most past a line whose fence never signals; fences signalled are still seen after that
+constexpr int kProbeSlots = 32, kProbeCopies = 64;
+struct ProbeLine {
+    int slot = 0, queue = 0, copy_query = -1, copy_at_call = -1, copy_at_return = -1;
+    uint32_t index = 0;
+    uint64_t reflex_frame = 0;
+    int64_t before_submit = 0, call = 0, ret = 0, after_submit = 0;
+    int game = -1;      // (1 its set's game frame, 0 a made one; -1 not known)
+    uint64_t set = 0;   // (its set: the display thread's count of the sets it took)
+};
+struct PresentProbe {
+    bool tried = false;
+    FILE* file = nullptr;   // (none: off, or not made. The reader's to write, flush and close)
+    uint32_t family = 0;    // (the queue family its command buffers are for: the presents' queue as the device was made)
+    VkQueryPool pool = VK_NULL_HANDLE;   // (2 a slot, before and after; then kProbeCopies for the copies)
+    VkCommandPool cmd_pool = VK_NULL_HANDLE;
+    VkCommandBuffer before[kProbeSlots]{}, after[kProbeSlots]{};
+    VkFence fb[kProbeSlots]{}, fa[kProbeSlots]{};
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<ProbeLine> lines;   // (mu)
+    std::vector<int> free;         // (mu)
+    std::vector<int> copies_free;  // (mu: the copies' queries no image nor line holds)
+    std::vector<int> copy_query;   // (present_image_mu: each swapchain image's last copy's query, -1 none; the image's until
+                                   // its present's line takes it)
+    std::atomic<uint64_t> copies_unstamped{0};   // (copies that went without: no query free)
+    std::atomic<uint64_t> copies_set_aside{0};   // (queries whose copy was not seen run: never handed out again)
+    bool stamp_copies = true;   // (present_image_mu: false on the presents' own queue without hostQueryReset)
+    std::atomic<bool> off{false};   // (closed, or a submit of its refused: no present probed nor copy stamped from then on)
+    bool stopping = false;          // (mu: closed; the reader writes the lines queued and ends)
+    std::atomic<int64_t> drain_until{0};   // (closed: the steady clock's ns past which the reader waits for nothing)
+    std::thread* reader = nullptr;  // (mu: deleted only once joined, at the close: a reader still running as the process ends
+                                    // is never destroyed joinable)
+    uint64_t written = 0, unwritten = 0;   // (the reader's: lines written, and given up, their fences not seen)
+    VkFence copy_fence = VK_NULL_HANDLE;   // (present_image_mu: the presented image's copy, while present_out runs)
+    int game = -1;      // (present_image_mu: present_commit's frame, while present_out runs: ProbeLine's)
+    uint64_t set = 0;   // (present_image_mu: the same)
+};
+PresentProbe probe;
+bool probe_on() {
+    static const bool on = [] { const char* e = getenv("RX_VK_PRESENT_PROBE"); return e && *e; }();
+    return on;
+}
+int64_t probe_clock() {
+#ifdef _WIN32
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    return q.QuadPart;
+#else
+    return gtl_now();
+#endif
+}
+void probe_main() {
+#ifdef _WIN32
+    SetThreadDescription(GetCurrentThread(), L"mkw_vk present probe");
+#endif
+    const double period = dev.props.limits.timestampPeriod;
+    const auto ready = [] { return !probe.lines.empty() || probe.stopping; };
+    int unflushed = 0;
+    for (;;) {
+        ProbeLine l;
+        {
+            std::unique_lock lk(probe.mu);
+            if (unflushed && !probe.cv.wait_for(lk, std::chrono::milliseconds(250), ready)) {   // (none for 250 ms: written out)
+                lk.unlock();
+                std::fflush(probe.file);
+                unflushed = 0;
+                lk.lock();
+            }
+            probe.cv.wait(lk, ready);
+            if (probe.lines.empty()) break;   // (closed, every line queued written)
+            l = probe.lines.front();
+            probe.lines.pop_front();
+        }
+        const auto line_until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        const auto until = [line_until] {   // (2 s a line; once closed, the drain's end if sooner)
+            const int64_t d = probe.drain_until.load();
+            const auto drain = std::chrono::steady_clock::time_point(
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::nanoseconds(d)));
+            return d && drain < line_until ? drain : line_until;
+        };
+        const auto seen = [&until](VkFence f) {
+            for (;;) {   // (in steps of 50 ms at most, so a close cuts a wait short; past the end, signalled or not at once)
+                const int64_t left = std::chrono::duration_cast<std::chrono::nanoseconds>(until() - std::chrono::steady_clock::now()).count();
+                const uint64_t ns = left > 0 ? (uint64_t)std::min<int64_t>(left, 50000000) : 0;
+                const VkResult r = (::vkx::vkWaitForFences)(dev.device, 1, &f, VK_TRUE, ns);
+                if (r == VK_SUCCESS) return probe_clock();
+                if (r != VK_TIMEOUT || !ns) return int64_t(-1);
+            }
+        };
+        const int64_t before_seen = seen(probe.fb[l.slot]);
+        const int64_t after_seen = seen(probe.fa[l.slot]);
+        if (before_seen < 0 || after_seen < 0) {   // (not signalled in time, or the device lost: the slot is not used again)
+            probe.unwritten++;
+            if (l.copy_query >= 0) probe.copies_set_aside++;   // (nor its copy's query: that copy not seen run)
+            continue;
+        }
+        uint64_t t[2] = {0, 0};
+        long long before_ns = -1, after_ns = -1;   // (none: not given by the driver)
+        if ((::vkx::vkGetQueryPoolResults)(dev.device, probe.pool, 2 * l.slot, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+            before_ns = (long long)(t[0] * period), after_ns = (long long)(t[1] * period);
+        long long copy_ns = -1;   // (none: no query free for the copy, or its timestamp not written in 2 s)
+        bool copy_run = false;    // (its copy seen run: its query free for another)
+        if (l.copy_query >= 0) {
+            for (;;) {   // (its value, and whether it is written yet)
+                uint64_t c[2] = {0, 0};
+                const VkResult r = (::vkx::vkGetQueryPoolResults)(dev.device, probe.pool, 2 * kProbeSlots + l.copy_query, 1, sizeof c,
+                                                                  c, sizeof c, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+                if (r >= 0 && c[1]) copy_ns = (long long)(c[0] * period), copy_run = true;
+                if (r < 0 || c[1] || std::chrono::steady_clock::now() >= until()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        std::fprintf(probe.file, "%d,%u,%llu,%d,%d,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%d,%llu\n", l.queue, l.index,
+                     (unsigned long long)l.reflex_frame, l.copy_at_call, l.copy_at_return, (long long)l.before_submit, (long long)l.call,
+                     (long long)l.ret, (long long)l.after_submit, (long long)before_seen, (long long)after_seen,
+                     copy_ns, before_ns, after_ns, l.game, (unsigned long long)l.set);
+        probe.written++;
+        if (++unflushed == 64) std::fflush(probe.file), unflushed = 0;
+        VkFence both[2] = {probe.fb[l.slot], probe.fa[l.slot]};
+        (::vkx::vkResetFences)(dev.device, 2, both);
+        std::lock_guard lk(probe.mu);
+        probe.free.push_back(l.slot);
+        if (l.copy_query >= 0 && copy_run) probe.copies_free.push_back(l.copy_query);   // (read: free for another copy)
+        else if (l.copy_query >= 0) probe.copies_set_aside++;   // (its copy not seen run: it may still write it)
+    }
+    std::fclose(probe.file);   // (flushed first)
+}
+/// The queue family of present_out's presents: the presents' own queue's, else the replay's
+uint32_t probe_family() { return dev.present_queue_supported ? dev.present_family : dev.queue_family; }
+/// Whether present_out's present on a queue of `family` is probed: the probe made at the first ask, the first copy presented
+/// ahead's (present_image_mu held). None once closed
+bool probe_ready(uint32_t family) {
+    if (!probe_on() || probe.off) return false;
+    if (!probe.tried) {
+        probe.tried = true;
+        uint32_t n = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(dev.physical, &n, nullptr);
+        std::vector<VkQueueFamilyProperties> fams(n);
+        vkGetPhysicalDeviceQueueFamilyProperties(dev.physical, &n, fams.data());
+        if (family >= n || dev.queue_family >= n || !fams[family].timestampValidBits || !fams[dev.queue_family].timestampValidBits) {
+            logf("vk: present probe: no timestamps on the presents' queue family %u: off", family);
+            return false;
+        }
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = 2 * kProbeSlots + kProbeCopies;
+        VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pi.queueFamilyIndex = family;
+        if (vkCreateQueryPool(dev.device, &qi, nullptr, &probe.pool) != VK_SUCCESS ||
+            vkCreateCommandPool(dev.device, &pi, nullptr, &probe.cmd_pool) != VK_SUCCESS) {
+            logf("vk: present probe: its query pool or command pool not made: off");
+            return false;
+        }
+        VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ai.commandPool = probe.cmd_pool;
+        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ai.commandBufferCount = 1;
+        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        for (int s = 0; s < kProbeSlots; s++) {
+            for (int k = 0; k < 2; k++) {   // (each a reset of its query and a timestamp once all before it is done)
+                VkCommandBuffer& cb = k ? probe.after[s] : probe.before[s];
+                if (vkAllocateCommandBuffers(dev.device, &ai, &cb) != VK_SUCCESS) {
+                    logf("vk: present probe: its command buffer %d not made: off", 2 * s + k);
+                    return false;
+                }
+                VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                (::vkx::vkBeginCommandBuffer)(cb, &bi);
+                (::vkx::vkCmdResetQueryPool)(cb, probe.pool, 2 * s + k, 1);
+                (::vkx::vkCmdWriteTimestamp2)(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, probe.pool, 2 * s + k);
+                (::vkx::vkEndCommandBuffer)(cb);
+            }
+            if (vkCreateFence(dev.device, &fi, nullptr, &probe.fb[s]) != VK_SUCCESS ||
+                vkCreateFence(dev.device, &fi, nullptr, &probe.fa[s]) != VK_SUCCESS) {
+                logf("vk: present probe: its fences for slot %d not made: off", s);
+                return false;
+            }
+            probe.free.push_back(s);
+        }
+        for (int q = kProbeCopies; q-- > 0;) probe.copies_free.push_back(q);
+        const char* path = getenv("RX_VK_PRESENT_PROBE");
+        FILE* f = std::fopen(path, "w");
+        if (!f) {
+            logf("vk: present probe: %s not opened: off", path);
+            return false;
+        }
+        std::fputs("# RX_VK_PRESENT_PROBE: one line a present of present_commit. The columns are brackets and observations, not "
+                   "waits: before_submit, call, return and after_submit are the PC's clock around the CPU's calls; copy_done_at_* "
+                   "whether the copy's fence was signalled then (1, 0; -1 none); before_seen and after_seen when the probe's own "
+                   "thread saw its fences; gpu_*_ns the GPU's own clock, -1 none (not given by the driver; gpu_copy_ns also no "
+                   "query free for the copy, its timestamp not written in 2 s, or no copy stamped: the log says why); game 1 for its set's game frame, 0 a made one; set its "
+                   "set, the display thread's count. A present's waits are RX_VK_FRAME_TRACE's slot_wait_ms, gpu_behind_ms and "
+                   "shown_ms\n", f);
+        std::fputs("queue,index,reflex_frame,copy_done_at_call,copy_done_at_return,before_submit,call,return,after_submit,"
+                   "before_seen,after_seen,gpu_copy_ns,gpu_before_ns,gpu_after_ns,game,set\n", f);
+        probe.file = f;
+        probe.family = family;
+        int64_t hz = 1000000000;
+#ifdef _WIN32
+        LARGE_INTEGER q;
+        QueryPerformanceFrequency(&q);
+        hz = q.QuadPart;
+#endif
+        logf("vk: present probe: %s, presents on the %s queue (family %u), clock %lld Hz", path,
+             dev.present_queue_supported ? "presents' own" : "replay's", family, (long long)hz);
+        probe.stamp_copies = dev.host_query_reset || !dev.present_queue_supported;
+        if (!probe.stamp_copies)
+            logf("vk: present probe: no copy timestamps: the presents' own queue does not wait for the copies, and this device "
+                 "cannot reset queries from the CPU (hostQueryReset): gpu_copy_ns -1");
+        std::lock_guard lk(probe.mu);
+        if (probe.stopping) {   // (closed while it was being made: no reader, no file)
+            std::fclose(probe.file);
+            probe.file = nullptr;
+            return false;
+        }
+        probe.reader = new std::thread(probe_main);
+    }
+    return probe.file && family == probe.family;
+}
+/// The copy's timestamp, at the end of the copy into swapchain image `index` when it is presented ahead (present_image_mu held):
+/// the probe made at the first, before its set's presents. In a query no image nor line holds, reset from the CPU first; none
+/// free, the copy goes without (said once). A copy not presented ahead has none: its present goes to the presenter thread, not
+/// probed
+void probe_copy_stamp(VkCommandBuffer cmd, uint32_t index, bool ahead) {
+    if (!ahead || !probe_ready(probe_family()) || !probe.stamp_copies) return;
+    if (probe.copy_query.size() <= index) probe.copy_query.resize(index + 1, -1);
+    int& q = probe.copy_query[index];
+    if (q >= 0) q = -1, probe.copies_set_aside++;   // (the image copied again before its present: that copy maybe not run yet)
+    {
+        std::lock_guard lk(probe.mu);
+        if (!probe.copies_free.empty()) q = probe.copies_free.back(), probe.copies_free.pop_back();
+    }
+    if (q < 0) {
+        if (probe.copies_unstamped++ == 0)
+            logf("vk: present probe: no copy timestamp free (%d, each held from its copy until its line is read): a copy without "
+                 "one, its line's gpu_copy_ns -1", kProbeCopies);
+        return;
+    }
+    if (dev.host_query_reset)   // (unavailable until this copy runs; its last copy seen run, so nothing pending on it)
+        (::vkx::vkResetQueryPool)(dev.device, probe.pool, 2 * kProbeSlots + q, 1);
+    vkCmdResetQueryPool(cmd, probe.pool, 2 * kProbeSlots + q, 1);
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, probe.pool, 2 * kProbeSlots + q);
+}
+/// The present of present_out on `queue` between its two probes (its queue's lock held), or alone with no slot free
+VkResult probe_present(VkQueue queue, const VkPresentInfoKHR& pi, uint32_t index, uint64_t reflex_frame) {
+    int slot = -1;
+    {
+        std::lock_guard lk(probe.mu);
+        if (!probe.free.empty()) slot = probe.free.back(), probe.free.pop_back();
+    }
+    if (slot < 0) return vkQueuePresentKHR(queue, &pi);
+    const auto submit = [&](VkCommandBuffer cmd, VkFence f) {
+        VkCommandBufferSubmitInfo cb{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+        cb.commandBuffer = cmd;
+        VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+        si.commandBufferInfoCount = 1;
+        si.pCommandBufferInfos = &cb;
+        const VkResult r = vkQueueSubmit2(queue, 1, &si, f);
+        if (r == VK_ERROR_DEVICE_LOST) device_lost();
+        return r;
+    };
+    const auto refused = [](const char* which, VkResult r) {   // (off from now on; the present made all the same)
+        probe.off = true;
+        logf("vk: present probe: its timestamp %s the present not submitted (VkResult %d): off", which, (int)r);
+    };
+    const VkFence copy = probe.copy_fence;
+    const auto copy_done = [&] { return copy ? (::vkx::vkWaitForFences)(dev.device, 1, &copy, VK_TRUE, 0) == VK_SUCCESS : -1; };
+    ProbeLine l;
+    l.slot = slot;
+    l.queue = queue == dev.queue ? 0 : 1;
+    l.index = index;
+    l.reflex_frame = reflex_frame;
+    l.game = probe.game;
+    l.set = probe.set;
+    l.copy_query = index < probe.copy_query.size() ? probe.copy_query[index] : -1;
+    l.before_submit = probe_clock();
+    if (const VkResult r = submit(probe.before[slot], probe.fb[slot]); r != VK_SUCCESS) {
+        refused("before", r);
+        {
+            std::lock_guard lk(probe.mu);
+            probe.free.push_back(slot);   // (nothing submitted: its fences unsignalled, free again)
+        }
+        return vkQueuePresentKHR(queue, &pi);
+    }
+    l.copy_at_call = copy_done();
+    l.call = probe_clock();
+    const VkResult res = vkQueuePresentKHR(queue, &pi);
+    l.ret = probe_clock();
+    l.copy_at_return = copy_done();
+    l.after_submit = probe_clock();
+    if (const VkResult r = submit(probe.after[slot], probe.fa[slot]); r != VK_SUCCESS) {
+        refused("after", r);   // (no line: its after fence never signals, so the slot is not used again)
+        return res;
+    }
+    if (l.copy_query >= 0) probe.copy_query[index] = -1;   // (the line's now, until the reader has read it)
+    {
+        std::lock_guard lk(probe.mu);
+        if (!probe.stopping) probe.lines.push_back(l);   // (closed meanwhile: not written)
+    }
+    probe.cv.notify_one();
+    return res;
+}
+/// Whether present_out's presents are probed, in the log: a line when that changes, 5 s after the line before at the soonest,
+/// with the presents of each kind since then. Only present_commit's are (a fixed multiplier's sets presented ahead);
+/// present_image's go to the presenter thread first (present_image_mu held)
+void probe_note(bool probed) {
+    if (!probe_on() || (probe.tried && !probe.file) || probe.off) return;   // (off, not made or closed: its own line said so)
+    static int last = -1;
+    static uint64_t count[2] = {};
+    static std::chrono::steady_clock::time_point line_at;
+    const auto now = std::chrono::steady_clock::now();
+    if (int(probed) != last && (last < 0 || now - line_at >= std::chrono::seconds(5))) {
+        char since[96] = "";
+        if (last >= 0)
+            std::snprintf(since, sizeof since, "; since the line before, %llu probed and %llu not", (unsigned long long)count[1],
+                          (unsigned long long)count[0]);
+        logf("vk: present probe: the presents %s%s", probed ? "probed (a fixed multiplier's sets presented ahead)"
+                                                            : "not probed (handed to the presenter thread: frame generation off, "
+                                                              "or its sets not presented ahead)", since);
+        last = probed, count[0] = count[1] = 0, line_at = now;
+    }
+    count[probed]++;
+}
+/// RX_VK_PRESENT_PROBE at the window's close: no present probed from now on, the lines queued written by the reader (the
+/// fences waited for 500 ms at most in all, probe.drain_until), the file flushed and closed, the reader joined, and the
+/// counts in the log. Nothing when the probe was not made, or once closed
+void probe_close() {
+    probe.off = true;   // (first: none made nor probed from now on, whether it was made or not)
+    std::thread* reader;
+    {
+        std::lock_guard lk(probe.mu);
+        const bool closed = probe.stopping;
+        probe.stopping = true;   // (also for a probe being made now: probe_ready then makes no reader)
+        if (!probe.reader || closed) return;
+        reader = probe.reader;
+    }
+    probe.drain_until = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            (std::chrono::steady_clock::now() + std::chrono::milliseconds(500)).time_since_epoch()).count();
+    probe.cv.notify_all();
+    reader->join();
+    {
+        std::lock_guard lk(probe.mu);
+        probe.reader = nullptr;   // (joined: deleted. probe_ready makes none after the close, stopping set above)
+    }
+    delete reader;
+    logf("vk: present probe: closed: %llu lines written, %llu not (their fences not seen in time); %llu copies without their "
+         "timestamp (no query free), %llu queries set aside (their copy not seen run)", (unsigned long long)probe.written,
+         (unsigned long long)probe.unwritten, (unsigned long long)probe.copies_unstamped.load(),
+         (unsigned long long)probe.copies_set_aside.load());
+}
 }  // namespace
 // doc: docs/dev/reference/architecture.md#frame-generations-presents (rule 4: a frame slot per frame of both sets)
 /// (longshot) The frame slots present_image uses while frame generation runs, for the sets a swapchain is made for
@@ -6366,12 +6788,14 @@ static VkSemaphore take_retired_acquire() {
     return semaphore;
 }
 
-void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view, bool source_srgb, bool allow_scale) {
-    present_image_with_trial(src, sw, sh, crop, view, source_srgb, allow_scale, {});
+void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view, bool source_srgb,
+                   bool allow_scale, VkFormat framegen_format) {
+    present_image_with_trial(src, sw, sh, crop, view, source_srgb, allow_scale, {}, framegen_format);
 }
 
 namespace {
-void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view, bool source_srgb, bool allow_scale, OutputTrialSource trial) {
+void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view,
+                              bool source_srgb, bool allow_scale, OutputTrialSource trial, VkFormat framegen_format) {
 #ifdef TRACY_ENABLE
     HT_SCOPE("present_image");
 #endif
@@ -6430,7 +6854,7 @@ void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int c
     {
         std::lock_guard lk(menu_mu);
         preview_path = async_on() && dev.swapchain && dev.present_wait && dev.swap_mode == VK_PRESENT_MODE_FIFO_KHR &&
-                       !dev.hdr && !opts.hdr && !opts.reflex && !opts.dlss && !framegen_on() && !present_defer_into;
+                       !dev.hdr && !opts.hdr && !opts.reflex && !temporal_row() && !framegen_on() && !present_defer_into;
         output_preview_path.store(preview_path, std::memory_order_release);
         {
             std::unique_ptr<OutputTrialBacking> released;
@@ -6584,6 +7008,8 @@ void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int c
     image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     const PresentAspect aspect{src && host && host->aspect_ratio ? host->aspect_ratio() : 0.0f};
     const PresentRect rect = present_rect(sw, sh, crop, dev.swap_extent.width, dev.swap_extent.height, aspect);
+    // (longshot: where the game's picture is in the image, for DLSS Frame Generation through Streamline, vk_dlssg.cpp)
+    if (src) dlssg_backbuffer(rect.x, rect.y, rect.w, rect.h, dev.swap_extent.width, dev.swap_extent.height);
     [[maybe_unused]] uint32_t trace_route = 0; // direct; 1 scaled, 2 clear, 3 HDR conversion
     const bool has_bars = rect.x || rect.y || rect.w != dev.swap_extent.width || rect.h != dev.swap_extent.height;
     if (has_bars) {
@@ -6596,7 +7022,9 @@ void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int c
     // (Native HDR: scaled in 10 bits (framegen_scale's pq), and read by the HDR pass in every case, through the view in the
     // format the game presents (do_present): at 100% contrast it writes the game's PQ codes as they are. Never blitted from its
     // image: a blit converts from the image's own format, not the picture's)
-    const bool native_pq = present_native_pq.load(std::memory_order_relaxed);
+    const bool native_pq = framegen_format == VK_FORMAT_UNDEFINED
+        ? present_native_pq.load(std::memory_order_relaxed)
+        : framegen_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     const VkImage scaled = allow_scale && src && view ? framegen_scale(f.cmd, view, src, sw, sh, crop, rect.w, rect.h, native_pq) : VK_NULL_HANDLE;
     // (longshot) the Insert menu's HDR: the picture (scaled, or the game's own with its crop) to HDR10, copied in as the SDR one is
     const int colour = menu_colour_vision_mode();
@@ -6686,6 +7114,7 @@ void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int c
     menu_record(f.cmd, index, dev.swap_extent.width, dev.swap_extent.height, applied_colour ? colour : 0);   // (longshot) Dear ImGui's overlays, over all of it
     menu_rumble_tick();   // (longshot: the Rumble strength row's own rumble, vk_menu.cpp)
     image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    probe_copy_stamp(f.cmd, index, present_defer_into != nullptr);   // (RX_VK_PRESENT_PROBE: when the copy is done)
     // Allocate the trial backing before submitting this copy, so allocation cannot hold up its presenter hand-off.
     if (trial.generation && preview_path && present_thread_on())
         make_output_trial_frame(trial, dev.swapchain_generation, OutputPath::FifoShown);
@@ -6745,11 +7174,22 @@ void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int c
         present_defer_into->swapchain_generation = dev.swapchain_generation;
         return;
     }
+    // (longshot) DLSS Frame Generation through Streamline (vk_dlssg.cpp): a game frame's present held to an even time after
+    // the game's own, its copy submitted first and the queue's lock let go meanwhile (present_image_mu stays held, which
+    // dlssg_shutdown takes before the queue's); then frame generation on for this present or not. The time is do_present's
+    // (present_shown_at), and only on the render thread: without Threaded rendering the present is the game's own thread's,
+    // which the hold would put to sleep
+    if (async_on() && dlssg_active() && src && present_shown_at) {
+        qk.unlock();
+        dlssg_hold(present_shown_at, present_shown_wait);
+        qk.lock();
+    }
+    dlssg_before_present(src != VK_NULL_HANDLE);
     // (acquire ahead: the presenter thread asks for the next present's image right after it makes this one, a game frame's)
     present_acquire_ahead = src && acquire_ahead_wanted();
-    present_copy_done = f.done;
+    present_copy_done = probe.copy_fence = f.done;
     present_out(index, qk, trial, preview_path);
-    present_copy_done = VK_NULL_HANDLE;
+    present_copy_done = probe.copy_fence = VK_NULL_HANDLE;
     present_acquire_ahead = false;
 }
 
@@ -6817,6 +7257,9 @@ static void acquire_ahead(VkSwapchainKHR sc, uint64_t generation) {
 }
 } // namespace
 
+/// (vk_internal.h) RX_VK_PRESENT_PROBE's file written out and closed, at the window's close (mkwvk_close_asked)
+void present_probe_close() { probe_close(); }
+
 bool present_commit(const PendingPresent& p) {
     if (!p.used) return false;
     rec::Settled settled;   // (RX_VK_RECORDER_PARTS: its copy was submitted after the parts before it; the present needs none)
@@ -6826,7 +7269,11 @@ bool present_commit(const PendingPresent& p) {
     const uint64_t was = reflex_present_frame, al_was = antilag_present_frame;
     reflex_present_frame = p.reflex_frame;   // (NVIDIA Reflex: the frame this present shows, as at its copy)
     antilag_present_frame = p.antilag_frame;   // (AMD Anti-Lag 2: the same)
+    probe.copy_fence = p.done;   // (RX_VK_PRESENT_PROBE: its copy's state at the present)
+    probe.game = p.game ? 1 : 0, probe.set = p.set;   // (and its frame: the set's game frame or a made one, and its set)
     const bool shown = present_out(p.index, qk);
+    probe.copy_fence = VK_NULL_HANDLE;
+    probe.game = -1, probe.set = 0;
     reflex_present_frame = was, antilag_present_frame = al_was;
     return shown;
 }
@@ -6847,11 +7294,14 @@ static bool present_out(uint32_t index, std::unique_lock<decltype(dev.present_mu
         frame = make_output_trial_frame(trial, dev.swapchain_generation, fifo_shown ? OutputPath::FifoShown : OutputPath::Unavailable);
     }
     if (hand_off) {
+        probe_note(false);   // (RX_VK_PRESENT_PROBE: not probed, in the log)
         const uint64_t reflex_id = pi.pNext ? static_cast<const VkPresentIdKHR*>(pi.pNext)->pPresentIds[0] : 0;
         if (reflex_id) reflex_present_handed_off();
-        antilag_present();   // (AMD Anti-Lag 2: the frame's present stage)
+        // (AMD Anti-Lag 2: snapshot the frame index now before the next input stage advances it; presenter_loop fires PRESENT right before vkQueuePresentKHR; skip the lock when unavailable)
+        const uint64_t antilag_id = !antilag_available() ? 0
+            : antilag_present_frame == kAntiLagThisFrame ? antilag_frame() : antilag_present_frame;
         qk.unlock();
-        present_hand_off(index, present_copy_done, reflex_id, frame);
+        present_hand_off(index, present_copy_done, reflex_id, antilag_id, frame);
         return true;   // (taken as shown: only present_commit's presents, never handed over, read it)
     }
     if (present_thread_on()) {   // (one handed over before, made first: the presents in order; the queue's lock let go meanwhile)
@@ -6878,12 +7328,15 @@ static bool present_out(uint32_t index, std::unique_lock<decltype(dev.present_mu
     const auto copy_done = [&] { return (::vkx::vkWaitForFences)(dev.device, 1, &copy, VK_TRUE, 0) == VK_SUCCESS; };
     const bool copy_was_done = copy && copy_done();
     const int64_t present_t0 = fps_breakdown_on() ? fps_clock() : 0;
+    // (RX_VK_PRESENT_PROBE: with the probe's two timestamps around it)
+    const bool probed = probe_ready(probe_family());
+    probe_note(probed);
     if (dev.present_queue_supported) {
         qk.unlock();
         std::lock_guard pq(dev.present_queue_mu);
-        res = vkQueuePresentKHR(dev.present_queue, &pi);
+        res = probed ? probe_present(dev.present_queue, pi, index, reflex_present_frame) : vkQueuePresentKHR(dev.present_queue, &pi);
     } else {
-        res = vkQueuePresentKHR(dev.queue, &pi);
+        res = probed ? probe_present(dev.queue, pi, index, reflex_present_frame) : vkQueuePresentKHR(dev.queue, &pi);
     }
     if (present_t0) {
         const bool waited_gpu = copy && !copy_was_done && copy_done();
@@ -6950,6 +7403,7 @@ struct Presenter {
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkFence done = VK_NULL_HANDLE;   // (the copy's fence)
     uint64_t reflex_id = 0;          // (NVIDIA Reflex's present id for it, 0 none: present_out)
+    uint64_t antilag_id = 0;         // (AMD Anti-Lag 2's frame index for it, 0 none: present_out)
     uint64_t generation = 0;         // (dev.swapchain_generation of swapchain)
     bool ahead = false;              // (acquire ahead after it: present_image's present_acquire_ahead; a drain that gave up clears it)
     OutputTrialFrame trial;
@@ -6994,6 +7448,7 @@ void presenter_loop() {
         const VkSwapchainKHR sc = presenter.swapchain;
         const VkFence done = presenter.done;
         const uint64_t reflex_id = presenter.reflex_id;
+        const uint64_t antilag_id = presenter.antilag_id;
         const uint64_t generation = presenter.generation;
         const OutputTrialFrame trial = presenter.trial;
         lk.unlock();
@@ -7026,6 +7481,11 @@ void presenter_loop() {
             pi.swapchainCount = 1;
             pi.pSwapchains = &sc;
             pi.pImageIndices = &index;
+            if (antilag_id) {
+                antilag_present_frame = antilag_id;
+                antilag_present();
+                antilag_present_frame = kAntiLagThisFrame;
+            }
             {   // (on the queue the presents use (the replay's, or the Present queue row's), its lock held for the call only:
                 // the copy is done by now, so the call does not wait for the GPU (NVIDIA's driver on Linux would, ~4.5 ms, with
                 // the replay's submits held behind it). Lock order: the queue's, then presenter_queue_mu (the swapchain's)
@@ -7086,12 +7546,16 @@ bool present_thread_on() {
     // render thread from the present call wherever that call waits (NVIDIA's driver on Linux: ~4.5 ms for the copy) and costs
     // a thread's hand-off elsewhere. A second queue of its own would time-share the GPU with the replay: presents 2-4 ms
     // later; presenting on the presents' own queue after the copy's fence keeps that queue's lock for the call only)
+    // (longshot: not while Streamline's loader is the renderer's, vk_dlssg.cpp: its present hook and its latency markers
+    // are the render thread's, and its shutdown holds only the present and queue locks)
+    static const bool on = !dlssg_loaded();
     static bool told = false;
     if (!told) {
         told = true;
-        logf("vk: presenter thread: each present made on a thread of its own once its copy is done");
+        logf(on ? "vk: presenter thread: each present made on a thread of its own once its copy is done"
+                : "vk: presenter thread: off, Streamline's DLSS Frame Gen runs: each present made on the render thread");
     }
-    return true;
+    return on;
 }
 /// Waits, with presenter.mu held in lk, until the presenter has made the present it was handed (limit_ms: at most that long; false
 /// then). For the FPS counter's Breakdown, the wait is the GPU's until the presenter's wait for the copy ended, and the pacing's after it
@@ -7113,7 +7577,7 @@ bool presenter_wait_idle(std::unique_lock<std::mutex>& lk, int limit_ms = 0) {
     return true;
 }
 /// The present of image index, whose copy signals done, to the presenter thread (started at the first), once the one before is made
-void present_hand_off(uint32_t index, VkFence done, uint64_t reflex_id, OutputTrialFrame trial) {
+void present_hand_off(uint32_t index, VkFence done, uint64_t reflex_id, uint64_t antilag_id, OutputTrialFrame trial) {
 #ifdef TRACY_ENABLE
     HT_SCOPE("present_hand_off");
 #endif
@@ -7125,6 +7589,7 @@ void present_hand_off(uint32_t index, VkFence done, uint64_t reflex_id, OutputTr
     presenter_wait_idle(lk);   // (the frame before's present made: one out at most; the presenter's own waits are bounded)
     presenter.index = index, presenter.swapchain = dev.swapchain, presenter.done = done, presenter.busy = true;
     presenter.reflex_id = reflex_id;
+    presenter.antilag_id = antilag_id;
     presenter.generation = dev.swapchain_generation, presenter.ahead = present_acquire_ahead;
     presenter.trial = trial;
     presenter.copy_done_at = 0;
@@ -7258,6 +7723,9 @@ struct Job {
     nvn_prog prog;
     std::chrono::steady_clock::time_point queued;
     uint64_t cap_seq = 0;       // (RX_VK_MEM_CHECK: the number of the capture made with it, for its take to match; 0: none)
+    int64_t game_at = 0;        // (a present: when the game's thread presented it, bh_now: frame generation's timeline,
+                                // vk_dlssg.cpp dlssg_hold)
+    int64_t game_wait = 0;      // (and how long it was held there, until the job was in the queue: below its cap, long)
 };
 std::mutex q_mu;
 std::condition_variable q_cv, q_space, q_idle;
@@ -7664,6 +8132,8 @@ void replay_thread_main() {
         const int64_t t0 = bh_now();
         drain(0);
         present_value = held_present.value;
+        present_game_at = held_present.game_at;
+        present_game_wait = held_present.game_wait;
         fo_present.store(held_present.value, std::memory_order_release);   // (frame overlap: its recording ends the frame)
         do_present(held_present.has_tex ? &held_present.tex : nullptr, held_present.has_crop ? held_present.crop : nullptr,
                    held_present.output_generation);
@@ -7738,6 +8208,8 @@ void replay_thread_main() {
             }
             drain(0);
             present_value = j.value;
+            present_game_at = j.game_at;
+            present_game_wait = j.game_wait;
             fo_present.store(j.value, std::memory_order_release);   // (frame overlap: its recording ends the frame)
             do_present(j.has_tex ? &j.tex : nullptr, j.has_crop ? j.crop : nullptr, j.output_generation);
             bh_shown(j.queued);
@@ -7855,6 +8327,8 @@ void enqueue(Job&& j) {
             bh_st.room_ns += bh_now() - t0, bh_st.room_n++;
         }
         q_presents++;
+        // (the CPU's signal and the room here, frame generation's fixed_clock: the game below its cap or at it)
+        if (j.game_at) j.game_wait = bh_now() - j.game_at;
     }
     if (j.kind == JOB_SUBMIT || j.kind == JOB_PRESENT) j.value = ++q_values;
     if (j.kind == JOB_SUBMIT) gf_note_value(j.value);
@@ -8004,6 +8478,9 @@ void submit(const uint64_t* handles, int n) {
 }
 void present_tagged(const nvn_tex* t, const int crop[4], uint64_t generation) {
     fps_presented();   // (the FPS counter: the game's frame ends here, on its presenting thread)
+    // (frame generation's timeline: the game's own presents, before the CPU's signal and the replay put them off,
+    // vk_framegen.cpp fixed_clock)
+    const int64_t game_at = bh_now();
 #ifdef TRACY_ENABLE
     HT_SCOPE("rx present (game thread)");
 #endif
@@ -8013,6 +8490,7 @@ void present_tagged(const nvn_tex* t, const int crop[4], uint64_t generation) {
     if (!async_on()) {
         std::lock_guard order(sync_order_mu);
         ReplayPin pin;   // (the frame's last replays and the present on the replay's core)
+        present_game_at = game_at;
         if (sync_waits_on()) {
             drain(0);   // (the frame's work whole before it is shown)
             update_blocked();
@@ -8050,6 +8528,7 @@ void present_tagged(const nvn_tex* t, const int crop[4], uint64_t generation) {
     j.output_generation = generation;
     if (t) j.tex = *t, j.has_tex = true;
     if (crop) std::memcpy(j.crop, crop, sizeof j.crop), j.has_crop = true;
+    j.game_at = game_at;
     enqueue(std::move(j));
 }
 void texture_released_of(const nvn_tex* t) {

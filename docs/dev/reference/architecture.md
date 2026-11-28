@@ -58,8 +58,10 @@ about Ocarina of Time is in `game/` ([its README](../../../game/README.md)). The
 
 `tests/test_game_boundary.py` checks both sides. Each hook is a plain C function; a table of function pointers is used
 only where the host keeps one already (the control bridge's `HosControlGame`). The game's C is compiled with the
-host's flags into the same game binary, and the game's Rust is linked into it through `longshot-rs`, the one
-staticlib: two would each carry Rust's standard library. A player's build compiles no Rust: the release carries a
+host's flags into the same game binary; its C++ (`game/*.cpp`) too, with `-std=c++17 -fno-exceptions -fno-rtti`
+added, and since the C driver links the game it may use nothing of the C++ runtime (no `new`, `throw`, `typeid` or
+the standard library's compiled parts). The game's Rust is linked into it through `longshot-rs`, the one staticlib:
+two would each carry Rust's standard library. A player's build compiles no Rust: the release carries a
 `liblongshot_rs.a` of the tree's Rust sources for each platform (`builder/crates/build-compile/src/rust.rs`).
 
 ### From dump to game folder
@@ -306,6 +308,19 @@ is in. On Linux, the guest memory behind `imports` is shared memory, so it is no
 | `captures`, `capture spares`, `capture staging spares`, `capture table` | Submit-time copies of guest pages, plus spares kept for reuse |
 | `imports`, `retired imports`, `retired records` | Guest memory the driver has pinned for the GPU |
 
+Capture spares are bounded by twelve buffers and their existing byte allowance
+(at most 768 MB, 32 MB while Linux is reclaiming memory). A completed capture
+that fits the allowance replaces spares of the most represented size first,
+oldest-returned on a tie. The incoming buffer counts as a representative too,
+so it can replace its own class without flushing the only spare of another
+class. This lets the cached size mix follow a new area's submissions while
+retaining rare large loading spares through repeated small returns. Otherwise a pool
+of unsuitable sizes can reject every return of the new size and allocate it
+again on every submission. Prewarm workers' byte and slot reservations remain
+protected; a speculative prewarm never displaces a returned spare. Displaced
+buffers are destroyed outside the spare-pool mutex, using the usual asynchronous
+release path unless `RX_VK_CAP_FREE_ASYNC=0` is set.
+
 `unaccounted` is the driver's count less the VRAM sum. It is the memory the renderer did not allocate itself: the
 swapchain, the driver's pipelines and its own objects, memory the upscaler libraries allocate internally, two small
 buffers made outside the allocator, plus a few tens of MB of timing noise. It reads `n/a` without
@@ -496,10 +511,25 @@ frame rate. `tests/test_framegen_fixed_pace.py` runs the timing functions throug
    - Under immediate (V-Sync Off), a set presented as it arrives shows almost only the game's frame.
    - Spacing a set's frames evenly makes the motion stutter as much as the game's frame times vary.
    - Under FIFO, a frame goes at its time but no sooner than a refresh after the frame before (`fifo_slot`).
+   - The game's timeline is the game's thread's presents (`fixed_clock`, the time `present` in `vk_replay.cpp` was
+     called), not the render thread's hand-over of the frame. The hand-over comes after the main thread's signal and the
+     frame's replay, a few milliseconds later and several times less even, and the screen follows whichever the set's
+     times are taken from. So the presents give the intervals and the hand-over's lag after them, smoothed, the phase:
+     the GPU's delay (rule 3) then takes up only how much the lag varies, and stays under a game frame even when the lag
+     is near one. A set whose present is not known is put at its hand-over, the lag kept.
+   - That holds while the game runs at its cap. Below it, the game's thread waits in its present: for the main thread's
+     signal that the frame's data is written, then for room in the render thread's queue. Each present then comes the
+     game's own work after the present before let it go, and sets placed on them take in how both vary. `fixed_clock`
+     smooths how long the thread waited in its present (`game_wait`, from the present's time to its job in the queue,
+     taken in `enqueue`): over 1 ms the sets are at their hand-over, under 0.5 ms they go back on the presents. Without
+     the render thread (`RX_VK_ASYNC=0`) no wait is taken and the sets stay on the presents.
+     `RX_VK_FG_GAME_CLOCK=0` takes the times from the hand-over for an A/B.
    - `RX_VK_FG_TIMELINE=0` turns this off for an A/B.
 3. **The GPU's delay is fed back only from sets taken as they came** (`pace_delay`, and `as_came` in `display_main`).
    A set that was late for another reason (no free swapchain image, the display thread busy) would raise the delay by
    its own lateness. That pushes the next set's copies later still, and at 4x the delay grows to a whole game frame.
+   Nor from a set after a long game frame, on the game's timeline or in the hand-overs (`pace_feeds`): it came early or
+   late by that frame, not by the GPU.
 4. **A set presented ahead needs a frame slot for every frame of both sets in flight, plus two sets' spare swapchain
    images** (`present_slots_for` in `vk_replay.cpp`; `create_swapchain` in `vk_main.cpp`; `present_ahead_wanted`).
    - Each present waits for the copy last made in its slot. With fewer slots, a set's copies wait behind each other, or
@@ -522,6 +552,10 @@ frame rate. `tests/test_framegen_fixed_pace.py` runs the timing functions throug
      of its time. The frames left out are spread evenly over the set (6x with 3 shown: the 2nd, 4th and 6th), and their
      copies are never made.
    - At most all made frames but one are left out, so 2x keeps its made frame.
+   - A set on the game's presents whose game frame was due before the render thread handed it over (its lag past the
+     smoothed one by more than the set's lead and the GPU's delay, as with a present held in the replay) is measured
+     from where its hand-over puts that frame, as with `RX_VK_FG_GAME_CLOCK=0`. Its frames cannot be shown sooner, and
+     measured from a time already past it left all its made frames out but one.
    - The GPU's delay is still fed back against the set's first frame.
    - `RX_VK_FG_FIFO_CAP=1` (off) uses Reflex to cap the game at the multiplier's share of refresh − refresh²/3600.
      This suits G-SYNC and FreeSync displays only: on a fixed-refresh display it leaves refreshes without a new frame.

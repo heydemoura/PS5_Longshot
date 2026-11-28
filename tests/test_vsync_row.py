@@ -86,7 +86,12 @@ DlssWhy why = DLSS_OK;      // (whether DLSS runs on this device)
 struct Fg { std::atomic<bool> start_failed{false}; std::atomic<unsigned> most_known{0}; };
 Fg& fgs() { static Fg f; return f; }
 int menu_vsync() { return row; }
-bool fg_asked() { return asked; }
+// (NVIDIA Streamline making DLSS FG's frames, vk_dlssg.cpp: NGX's DLSS-G is not asked then, and no set is the renderer's)
+bool streamline = false;
+bool dlssg_active() { return streamline; }
+int dlssg_frames_most() { return streamline ? 1 : 0; }
+bool fg_chosen() { return asked; }
+bool fg_asked() { return fg_chosen() && !dlssg_active(); }
 bool dlss_fg_wanted() { return asked; }
 bool temporal = true;       // (a temporal Upscaler chosen: DLSS-G's inputs, vk_temporal.cpp)
 bool temporal_wanted() { return temporal; }
@@ -190,6 +195,17 @@ int main() {
         return std::fprintf(stderr, "FAIL: 4x without a temporal Upscaler runs at %dx, DLSS-G's swapchain %d\n", framegen_now(),
                             (int)swapchain_dlssg()), 1;
     temporal = true;
+    // (through NVIDIA Streamline: its loader makes the frames and shows them, so the swapchain is made as without frame
+    // generation, at any multiplier, and V-Sync Auto chooses as without it; the multiplier's row still stops at its most)
+    streamline = true, asked = true, row = 0;
+    for (int f : {2, 4, 8}) {
+        opts.framegen = f;
+        if (framegen_now() != 0 || swapchain_framegen() != 0 || swapchain_dlssg() || dlss_fg_most() != 1 ||
+            choose(all) != M || choose(no_mailbox) != (windows ? I : F))
+            return std::fprintf(stderr, "FAIL: %dx through Streamline: the renderer's own runs at %dx, DLSS-G's swapchain "
+                                "%d, V-Sync Auto chose mode %d\n", f, framegen_now(), (int)swapchain_dlssg(), (int)choose(all)), 1;
+    }
+    streamline = false;
     std::puts(windows ? "PASS: the present mode for each V-Sync choice (Windows)" : "PASS: the present mode for each V-Sync choice (Linux)");
 }
 """
@@ -218,7 +234,7 @@ def main():
         raise SystemExit("FAIL: create_swapchain reads RX_VK_FIFO / RX_VK_IMMEDIATE itself: menu_vsync does")
     need(swap, r"if \(vsync != 1\)", "V-Sync On does not keep FIFO")
     need(swap, r"want_immediate = vsync == 2", "V-Sync Off does not ask for immediate")
-    present = block(replay, "void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view, bool source_srgb, bool allow_scale, OutputTrialSource trial) {")
+    present = block(replay, "void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view,\n                              bool source_srgb, bool allow_scale, OutputTrialSource trial, VkFormat framegen_format) {")
     need(present, r"vsync_changed", "a V-Sync change does not make the swapchain again")
     need(present, r"vsync_now = [^;]*swapchain_dlssg\(\)", "DLSS-G starting or stopping to make the frames does not make the "
          "swapchain again (V-Sync Auto's mode follows it)")

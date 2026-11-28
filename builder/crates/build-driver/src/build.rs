@@ -136,8 +136,15 @@ pub fn compile_options(p: &Places, upscalers: &[Upscaler], ngx: Option<&Path>) -
     // (a player's build: no console window, the shaders prepared before the title)
     c.settings.release = true;
     c.settings.fsr = upscalers.contains(&Upscaler::Fsr4);
+    asked_sdks(&mut c.settings, upscalers)?;
+    Ok(c)
+}
+
+/// The NVIDIA SDKs the compile takes: DLSS's, which a build with DLSS must have, and a developer's Streamline SDK
+/// (`LONGSHOT_SL_SDK`, DLSS Frame Generation through Streamline) beside it; neither for a build without DLSS.
+fn asked_sdks(s: &mut build_compile::Settings, upscalers: &[Upscaler]) -> Result<()> {
     if upscalers.contains(&Upscaler::Dlss) {
-        if c.settings.ngx_sdk.is_none() {
+        if s.ngx_sdk.is_none() {
             return Err(Error::player(
                 "dlss_sdk_missing",
                 "NVIDIA DLSS needs NVIDIA's DLSS SDK: download it under NVIDIA's license and name its folder in \
@@ -145,10 +152,11 @@ pub fn compile_options(p: &Places, upscalers: &[Upscaler], ngx: Option<&Path>) -
             ));
         }
     } else {
-        // (a DLSS SDK the PC has set is not taken for a build that did not ask for DLSS)
-        c.settings.ngx_sdk = None;
+        // (a DLSS or Streamline SDK the PC has set is not taken for a build that did not ask for DLSS)
+        s.ngx_sdk = None;
+        s.sl_sdk = None;
     }
-    Ok(c)
+    Ok(())
 }
 
 /// The places of a one-stage command (`longshot-builder image | lift | compile`, `longshot-packager compile`): the tree
@@ -300,12 +308,12 @@ fn finished_files(
             files.push((src, game_dir.join(&n)));
         }
     }
-    files.push((p.work.image.join("image.bin"), p.out.join("image.bin")));
+    files.push((p.work.image.join("image.bin"), p.out.join("data/image.bin")));
     for (vendor, licence) in [("reshade_fx", "LICENSE.md"), ("stb_image", "LICENSE")] {
         for name in [licence, "PROVENANCE.md"] {
             let src = p.root.join("third_party").join(vendor).join(name);
             if src.is_file() {
-                files.push((src, p.out.join("licenses").join(vendor).join(name)));
+                files.push((src, p.out.join("data/licenses").join(vendor).join(name)));
             }
         }
     }
@@ -631,11 +639,16 @@ pub fn build(o: &BuildOptions, p: &Places, st: &Stages, r: &Reporter) -> Result<
     let finish = p.work.finish();
     let assets: Vec<PathBuf> = if finish.is_dir() { fsx::files_under(&finish)? } else { Vec::new() };
     for rel in &assets {
-        files.push((finish.join(rel), p.out.join(rel)));
+        files.push((finish.join(rel), p.out.join("data").join(rel)));
     }
     let mut remove: Vec<PathBuf> = folder::installed(&p.out)
         .into_iter()
-        .filter(|rel| crate::assets::MADE.iter().any(|m| rel == m || rel.starts_with(&format!("{m}/"))))
+        .filter(|rel| {
+            crate::assets::MADE.iter().any(|m| {
+                rel.strip_prefix("data/").unwrap_or(rel) == *m
+                    || rel.strip_prefix("data/").unwrap_or(rel).starts_with(&format!("{m}/"))
+            })
+        })
         .map(|rel| p.out.join(rel))
         .filter(|dst| !files.iter().any(|f| &f.1 == dst))
         .collect();
@@ -643,6 +656,21 @@ pub fn build(o: &BuildOptions, p: &Places, st: &Stages, r: &Reporter) -> Result<
     // was not built in; the player's own stay)
     for u in [Upscaler::Dlss, Upscaler::Fsr4, Upscaler::Xess].into_iter().filter(|u| !o.upscalers.contains(u)) {
         remove.extend(runtimes::game_folder_files(u, windows, &p.out));
+    }
+    // Only the manifest can authorize removing a loose file from a previous build.
+    for (_, dst) in &files {
+        if let Ok(rel) = dst.strip_prefix(p.out.join("data")) {
+            remove.push(p.out.join(rel));
+        }
+    }
+    remove.sort();
+    remove.dedup();
+    for name in ["data", "config", "diagnostics"] {
+        let dir = p.out.join(name);
+        if dir.symlink_metadata().is_ok_and(|m| !m.is_dir() || m.is_symlink()) {
+            return Err(Error::format(dir.display().to_string(), "expected an installation directory"));
+        }
+        std::fs::create_dir_all(&dir).at(&dir)?;
     }
     let n = folder::install(&p.out, &files, &fetched.pins, &remove)?;
     // (the swap went in: what the game folder has of the builder's that this build is not, out now, never before)
@@ -698,7 +726,7 @@ pub fn build(o: &BuildOptions, p: &Places, st: &Stages, r: &Reporter) -> Result<
     for (i, (what, result)) in made.into_iter().enumerate() {
         optional(i + 1, what, result);
     }
-    fsx::write_if_changed(&p.out.join("language.txt"), folder::language_text(language).as_bytes())?;
+    fsx::write_if_changed(&p.out.join("config/language.txt"), folder::language_text(language).as_bytes())?;
     if let Some(level) = o.compile_shaders {
         folder::write_compile_shaders(&p.out, level)?;
     }
@@ -840,7 +868,8 @@ pub fn index_only(game: &GameSource, out: &Path, st: &Stages, r: &Reporter) -> R
     r.stage(Stage::Read, "Indexing the game's romfs");
     std::fs::create_dir_all(out).at(out)?;
     if let GameSource::Nup(nup) = game
-        && let Some((len, toc)) = game_files::romfs::identity(&out.join(game_files::romfs::INDEX_FILE))
+        && let Some((len, toc)) =
+            game_files::romfs::identity(&build_core::game_layout::data(out).join(game_files::romfs::INDEX_FILE))
     {
         let n = game_files::nup::Nup::open(nup)?;
         if n.len != len || n.toc_sha256 != toc {
@@ -856,7 +885,7 @@ pub fn index_only(game: &GameSource, out: &Path, st: &Stages, r: &Reporter) -> R
         }
     }
     // (in place: a developer's command, or a game folder whose game is already built)
-    let placed = st.game.romfs(game, out, out, r)?;
+    let placed = st.game.romfs(game, out, &build_core::game_layout::data(out), r)?;
     // (only the index's own removals: nothing was installed, so an old builder's game in `bin/` stays playable)
     let gone = folder::index_removals(out, &placed.remove, placed.romfs_dir);
     if !gone.is_empty() {
@@ -922,12 +951,22 @@ pub fn compile_only(
     let mut c = compile_options(p, upscalers, None)?;
     c.settings.release = env("RX_RELEASE").as_deref() == Some("1");
     c.mode = mode.unwrap_or(build_compile::Mode::Game);
-    // (the units' texts the lift did not write, made again as the compile needs them)
-    let texts = stages::lift_texts(&alone_ask(&p.root, &p.work, &p.stores, p.jobs), None);
+    // (a compile of the lift's units: the hot split's switch as the lift was made with it)
+    if matches!(c.mode, build_compile::Mode::Game | build_compile::Mode::GameOnly) {
+        stages::check_hot_split(&p.work.gen_dir)?;
+    }
+    // (the units' texts the lift did not write, made again as the compile needs them; only where it compiles the
+    // lifted units, so that the lift's switches are not read, nor refused, for the renderer alone or a dry run)
+    let texts = match c.mode {
+        build_compile::Mode::Game | build_compile::Mode::GameOnly => {
+            stages::lift_texts(&alone_ask(&p.root, &p.work, &p.stores, p.jobs), None)?
+        }
+        build_compile::Mode::RendererOnly | build_compile::Mode::DryRun | build_compile::Mode::ThirdPartySet(_) => None,
+    };
     c.ir_text = texts.clone().map(|t| build_compile::IrSource(t as std::sync::Arc<dyn build_compile::IrText>));
     let outcome = st.compile.compile(&c, r);
     if let Some(t) = &texts {
-        let _ = t.0.finish();
+        t.note(r);
     }
     match outcome? {
         Outcome::Built(b) => Ok(b),
@@ -959,6 +998,24 @@ pub fn compile_only(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_nvidia_sdks_set_on_the_pc_are_taken_only_by_a_build_with_dlss() {
+        let vars = |ngx: bool| {
+            move |n: &str| match n {
+                "LONGSHOT_NGX_SDK" if ngx => Some("ngx".to_string()),
+                "LONGSHOT_SL_SDK" => Some("sl".to_string()),
+                _ => None,
+            }
+        };
+        let mut s = build_compile::Settings::from_lookup(vars(true));
+        asked_sdks(&mut s, &[Upscaler::Dlss, Upscaler::Fsr4]).unwrap();
+        assert_eq!((s.ngx_sdk.as_deref(), s.sl_sdk.as_deref()), (Some(Path::new("ngx")), Some(Path::new("sl"))));
+        asked_sdks(&mut s, &[Upscaler::Fsr4]).unwrap();
+        assert_eq!((s.ngx_sdk, s.sl_sdk), (None, None));
+        let mut s = build_compile::Settings::from_lookup(vars(false));
+        assert!(matches!(asked_sdks(&mut s, &[Upscaler::Dlss]), Err(Error::Player { code: "dlss_sdk_missing", .. })));
+    }
 
     #[test]
     fn a_link_forgets_the_objects_only_when_they_are_what_failed() {

@@ -209,6 +209,7 @@ VkFormat view_format_of(VkFormat image, bool astc_decoded, bool bc, int view_nvn
 /// (a depth target: its own). What texture_get and texture_view make of them, without the texture: the pipeline state list's
 /// targets are the game's NVN formats, and each GPU builds the pipelines its draws will ask for (vk_draw.cpp state_targets)
 VkFormat attachment_format(int tex_nvn, int view_nvn) {
+    view_nvn = scene_view_format(tex_nvn, view_nvn);
     const VkFormatInfo fi = vk_format(tex_nvn);
     if (fi.format == VK_FORMAT_UNDEFINED) return VK_FORMAT_UNDEFINED;
     int from = 0;
@@ -614,6 +615,8 @@ thread_local VkCommandBuffer last_barrier_cmd = VK_NULL_HANDLE;   // (the comman
 
 // ---- the recording's upload command buffer ----
 thread_local VkCommandBuffer up_cmd = VK_NULL_HANDLE;
+std::atomic<uint64_t> next_rec_id{1};
+thread_local uint64_t up_rec_id = 0;
 uint64_t rec_value = 0;
 thread_local bool up_used = false;
 thread_local uint64_t up_astc_texels = 0;
@@ -1764,6 +1767,114 @@ void texture_pipelines_warm() {
 }
 namespace {
 
+void emit_layout_barrier(VkCommandBuffer cmd, Texture* tex, VkImageLayout old_l, VkImageLayout new_l, bool discard) {
+    VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    switch (old_l) {
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+        b.srcStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+        b.srcAccessMask = discard ? 0 : VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        break;
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
+        b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        b.srcAccessMask = 0;
+        break;
+    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+        b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        b.srcAccessMask = 0;
+        break;
+    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+        b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        b.srcAccessMask = discard ? 0 : VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        break;
+    case VK_IMAGE_LAYOUT_UNDEFINED:
+        b.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+        b.srcAccessMask = 0;
+        break;
+    default:
+        b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        b.srcAccessMask = discard ? 0 : VK_ACCESS_2_MEMORY_WRITE_BIT;
+        break;
+    }
+    switch (new_l) {
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+        b.dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+        b.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        break;
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
+        b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        b.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+        break;
+    case VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL:
+        b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        b.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        break;
+    case VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL:
+        b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
+        b.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+        break;
+    default:
+        b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+        break;
+    }
+    b.oldLayout = discard ? VK_IMAGE_LAYOUT_UNDEFINED : old_l;
+    b.newLayout = new_l;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = tex->image;
+    b.subresourceRange = {tex->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.imageMemoryBarrierCount = 1;
+    di.pImageMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &di);
+}
+
+// Brackets layout transitions recorded onto r.upload (which runs before r.cmd on the GPU): if r.cmd already recorded
+// transitions for tex in this recording, transition from layout_before_cmd and restore layout_before_cmd on exit
+// while leaving tex->layout (r.cmd's tail layout) unchanged.
+struct UploadLayoutGuard {
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    Texture* tex = nullptr;
+    VkImageLayout restore = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout cur = VK_IMAGE_LAYOUT_UNDEFINED;
+    bool active = false;
+    bool entered = false;
+    UploadLayoutGuard() = default;
+    UploadLayoutGuard(VkCommandBuffer c, Texture* t, VkImageLayout want, bool discard) { begin(c, t, want, discard); }
+    void begin(VkCommandBuffer c, Texture* t, VkImageLayout want, bool discard) {
+        if (!is_depth_texture(t) || !t->image) return;
+        if (entered) {
+            if (active && cur != want) {
+                emit_layout_barrier(cmd, tex, cur, want, false);
+                cur = want;
+            } else if (!active && t->layout != want) {
+                emit_layout_barrier(c, t, t->layout, want, false);
+                t->layout = want;
+            }
+            return;
+        }
+        entered = true;
+        cmd = c, tex = t;
+        if (t->layout_cmd_rec != up_rec_id) {
+            if (t->layout != want || discard) {
+                emit_layout_barrier(c, t, t->layout, want, discard);
+                t->layout = want;
+            }
+            return;
+        }
+        active = true;
+        restore = t->layout_before_cmd;
+        cur = restore;
+        if (cur != want || discard) {
+            emit_layout_barrier(c, t, cur, want, discard);
+            cur = want;
+        }
+    }
+    ~UploadLayoutGuard() {
+        if (active && cur != restore)
+            emit_layout_barrier(cmd, tex, cur, restore, false);
+    }
+};
+
 /// The whole texture (every level and layer dirty overlaps) unswizzled on the GPU; false: not a texture for it
 bool upload_unswizzle_gpu(Texture& tex, uint64_t total, const Ranges* dirty) {
 #ifdef TRACY_ENABLE
@@ -2263,8 +2374,9 @@ bool upload_all_zero(Texture& tex, uint64_t total, const Ranges* dirty, bool wid
     checkpoint_mark(upload_cmd(), tex.gpu, 'u');
     const VkImageSubresourceRange range{tex.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
     if (tex.aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
+        UploadLayoutGuard lg(upload_cmd(), &tex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, true);
         const VkClearDepthStencilValue z{0.0f, 0};
-        vkCmdClearDepthStencilImage(upload_cmd(), tex.image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &range);
+        vkCmdClearDepthStencilImage(upload_cmd(), tex.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &range);
     } else {
         const VkClearColorValue z{};
         vkCmdClearColorImage(upload_cmd(), tex.image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &range);
@@ -2369,9 +2481,10 @@ bool upload_inner(Texture& tex, const Ranges* dirty) {
             }
             if (zero) {
                 checkpoint_mark(upload_cmd(), tex.gpu, 'u');
+                UploadLayoutGuard lg(upload_cmd(), &tex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, true);
                 const VkImageSubresourceRange range{tex.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
                 const VkClearDepthStencilValue z{0.0f, 0};
-                vkCmdClearDepthStencilImage(upload_cmd(), tex.image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &range);
+                vkCmdClearDepthStencilImage(upload_cmd(), tex.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &range);
                 const int64_t k = ++dz_n;
                 dz_bytes += (int64_t)total;
                 if (k <= 4 || k % 200 == 0)
@@ -2389,6 +2502,7 @@ bool upload_inner(Texture& tex, const Ranges* dirty) {
     std::vector<VkBufferImageCopy> copies;
     std::vector<uint8_t> scratch, lin;
     VkBuffer buffer = VK_NULL_HANDLE;
+    UploadLayoutGuard up_guard;
     uint64_t astc_bad_blocks = 0;   // (illegal ASTC blocks decoded here, over every level and layer)
     for (uint32_t level = 0; level < tex.levels; level++) {
         const LevelGeo g = level_geo(tex, level);
@@ -2438,7 +2552,10 @@ bool upload_inner(Texture& tex, const Ranges* dirty) {
                 if (buffer && st.buffer != buffer && !copies.empty()) {   // (a new arena: copy what the last one holds)
                     texture_resident_flush(&tex);
                     checkpoint_mark(upload_cmd(), tex.gpu, 'u');
-                    vkCmdCopyBufferToImage(upload_cmd(), buffer, tex.image, VK_IMAGE_LAYOUT_GENERAL,
+                    const VkImageLayout up_layout =
+                        is_depth_texture(&tex) ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+                    up_guard.begin(upload_cmd(), &tex, up_layout, !dirty);
+                    vkCmdCopyBufferToImage(upload_cmd(), buffer, tex.image, up_layout,
                                            (uint32_t)copies.size(), copies.data());
                     copies.clear();
                 }
@@ -2599,7 +2716,10 @@ bool upload_inner(Texture& tex, const Ranges* dirty) {
     if (!copies.empty()) {
         texture_resident_flush(&tex);
         checkpoint_mark(upload_cmd(), tex.gpu, 'u');
-        vkCmdCopyBufferToImage(upload_cmd(), buffer, tex.image, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)copies.size(),
+        const VkImageLayout up_layout =
+            is_depth_texture(&tex) ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+        up_guard.begin(upload_cmd(), &tex, up_layout, !dirty);
+        vkCmdCopyBufferToImage(upload_cmd(), buffer, tex.image, up_layout, (uint32_t)copies.size(),
                                copies.data());
     }
     return true;
@@ -3165,13 +3285,14 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
     // MB held, and a budget of 4035 MB took 4300)
     if (!x.sparse) x.pad = std::max(x.bytes, allocation_size(x.allocation)) - x.bytes;
     total_bytes += x.bytes + x.pad;
-    // into GENERAL, and cleared (a target the game renders into before writing it all reads zeros, not garbage)
+    // into GENERAL (or TRANSFER_DST_OPTIMAL -> DEPTH_STENCIL_ATTACHMENT_OPTIMAL for depth), and cleared
+    // (a target the game renders into before writing it all reads zeros, not garbage)
     VkCommandBuffer cmd = upload_cmd();
     VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
     b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
     b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    b.newLayout = depth ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     b.image = x.image;
     b.subresourceRange = {x.aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
@@ -3181,7 +3302,7 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
     vkCmdPipelineBarrier2(cmd, &di);
     if (depth) {
         const VkClearDepthStencilValue z{0.0f, 0};
-        vkCmdClearDepthStencilImage(cmd, x.image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &b.subresourceRange);
+        vkCmdClearDepthStencilImage(cmd, x.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &z, 1, &b.subresourceRange);
     } else if (!is_bc(x.format) && !is_astc(x.format)) {
         const VkClearColorValue z{};
         vkCmdClearColorImage(cmd, x.image, VK_IMAGE_LAYOUT_GENERAL, &z, 1, &b.subresourceRange);
@@ -3196,9 +3317,11 @@ Texture* create(const Key& key, const nvn_tex* t, VkFormat vf, bool astc, int bw
         b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
         b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
         b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
-        b.oldLayout = b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.oldLayout = depth ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+        b.newLayout = depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
         vkCmdPipelineBarrier2(cmd, &di);
     }
+    x.layout = depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
     Texture* p = tex.get();
     static uint32_t ids;
     p->id = ++ids;
@@ -3333,6 +3456,7 @@ void pass_start_barrier(VkCommandBuffer cmd) {
 void texture_begin_recording(VkCommandBuffer upload, uint64_t value) {
     last_barrier_cmd = VK_NULL_HANDLE;   // (a new recording: its command buffers start afresh, whatever their handles held)
     up_cmd = upload;
+    up_rec_id = next_rec_id.fetch_add(1, std::memory_order_relaxed);
     if (value != rec_value) epoch++;   // (a submission's parts check a texture's memory once: nothing is collected between)
     rec_value = value;
     up_used = false;
@@ -3350,8 +3474,19 @@ bool texture_uploads_recorded() {
     return up_used;
 }
 
+void texture_transition_layout(VkCommandBuffer cmd, Texture* tex, VkImageLayout target, bool discard) {
+    if (!is_depth_texture(tex) || !tex->image) return;
+    if (cmd != up_cmd && tex->layout_cmd_rec != up_rec_id) {
+        tex->layout_cmd_rec = up_rec_id;
+        tex->layout_before_cmd = tex->layout;
+    }
+    if (tex->layout == target && !discard) return;
+    emit_layout_barrier(cmd, tex, tex->layout, target, discard);
+    tex->layout = target;
+}
+
 int view_nvn_format(const nvn_tex* t, const nvn_view* v) {
-    return v && v->set_format ? v->format : t->d.format;
+    return scene_view_format(t->d.format, v && v->set_format ? v->format : t->d.format);
 }
 unsigned view_level(const nvn_view* v) {
     return v && v->set_levels ? v->base_level : 0;
@@ -5407,8 +5542,8 @@ void compact_step(uint64_t completed) {
         const auto f = by_allocation.find(moves[i].src);
         Texture* t = f == by_allocation.end() ? nullptr : f->second;   // (none: an image the GPU is not done with)
         const VkImageUsageFlags both = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-        bool ok = t && t->image && !t->sparse && t != present_source && t->samples == VK_SAMPLE_COUNT_1_BIT &&
-                  (t->usage & both) == both;
+        bool ok = t && t->image && !t->sparse && t != present_source && t->layout_cmd_rec != up_rec_id &&
+                  t->samples == VK_SAMPLE_COUNT_1_BIT && (t->usage & both) == both;
         VkImage image = VK_NULL_HANDLE;
         if (ok) {
             VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};   // (as create() made it)
@@ -5437,11 +5572,15 @@ void compact_step(uint64_t completed) {
             cmd = upload_cmd();
             full_barrier(cmd, "compaction: before the copies");
         }
+        const bool depth_copy = is_depth_texture(t);
+        const VkImageLayout src_layout = depth_copy ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+        const VkImageLayout dst_layout = depth_copy ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+        if (depth_copy) texture_transition_layout(cmd, t, src_layout);
         VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
         b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
         b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
         b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.newLayout = dst_layout;
         b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         b.image = image;
         b.subresourceRange = {t->aspect, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
@@ -5457,13 +5596,14 @@ void compact_step(uint64_t completed) {
             r.extent = {std::max(1u, t->width >> l), std::max(1u, t->height >> l), std::max(1u, t->depth >> l)};
             regions.push_back(r);
         }
-        vkCmdCopyImage(cmd, t->image, VK_IMAGE_LAYOUT_GENERAL, image, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)regions.size(), regions.data());
+        vkCmdCopyImage(cmd, t->image, src_layout, image, dst_layout, (uint32_t)regions.size(), regions.data());
         compact.old_images.push_back(t->image);
         for (auto& kv : t->views)
             if (kv.second) compact.old_views.push_back(kv.second);
         t->views.clear();   // (made again when next asked for)
         gone_note(t->id);   // (what was resolved to this texture's views is stale)
         t->image = image;
+        t->layout = dst_layout;
         t->last_value = std::max(t->last_value, rec_value);   // (its end, if it goes now, waits for the copy too)
         compact.moved++, compact.moved_bytes += t->bytes + t->pad;
     }

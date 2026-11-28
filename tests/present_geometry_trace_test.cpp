@@ -18,6 +18,7 @@ using namespace mkwvk;
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); std::exit(1); } } while (0)
 using VkImage = uint64_t;
 using VkImageView = uint64_t;
+enum VkFormat { VK_FORMAT_UNDEFINED = 0, VK_FORMAT_A2B10G10R10_UNORM_PACK32 = 64 };
 constexpr VkImage VK_NULL_HANDLE = 0;
 constexpr int VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL = 1, VK_IMAGE_ASPECT_COLOR_BIT = 1;
 struct VkClearColorValue { float r, g, b, a; };
@@ -61,6 +62,7 @@ void logf(const char* format, ...) {
 void vkCmdClearColorImage(int, VkImage, int, const VkClearColorValue*, int, const VkImageSubresourceRange*) { ++clears; }
 void image_barrier(int, VkImage, int, int) {}
 void full_barrier(int) {}
+void dlssg_backbuffer(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) {}   // (vk_dlssg.cpp: Streamline's, not traced)
 VkImageView framegen_scaled_view() { return 19; }
 VkImage framegen_hdr(int, VkImageView, uint32_t, uint32_t, const int*, uint32_t, uint32_t, bool, int mode = 0) {
     hdr_colour = mode;
@@ -73,7 +75,8 @@ VkImage framegen_scale(int, VkImageView, VkImage, uint32_t, uint32_t, const int*
 }
 void blit_crop_to_rect(int, VkImage, uint32_t, uint32_t, const int*, VkImage, int, PresentRect rect) { ++blits; drawn = rect; }
 void present(VkImage src = 1, uint32_t sw = 3440, uint32_t sh = 1440, const int* crop = nullptr, VkImageView view = 2,
-             [[maybe_unused]] bool allow_scale = true, [[maybe_unused]] bool source_srgb = false) {
+             [[maybe_unused]] bool allow_scale = true, [[maybe_unused]] bool source_srgb = false,
+             [[maybe_unused]] VkFormat framegen_format = VK_FORMAT_UNDEFINED) {
     struct { int cmd = 1; } f; VkImage dst = 3;
     [[maybe_unused]] const unsigned index = 0;
     /* ACTUAL_DRAW */

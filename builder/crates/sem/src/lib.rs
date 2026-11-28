@@ -22,6 +22,8 @@ mod simdmem;
 mod sys;
 mod vreg;
 
+pub use fpfast::{NanMidStats, nan_mid, nan_mid_broken};
+
 /// Why an instruction has no semantics here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Fault {

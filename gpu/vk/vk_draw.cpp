@@ -1468,6 +1468,7 @@ struct Targets {
     Texture* depth = nullptr;
     VkImageView depth_view = VK_NULL_HANDLE;
     VkFormat depth_format = VK_FORMAT_UNDEFINED;
+    VkImageLayout depth_layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
     int n = 0;
     bool has_block_images = false;
     uint32_t width = 0, height = 0;
@@ -2635,7 +2636,7 @@ struct StateRec2 {
 static_assert(sizeof(StateRec2) == 552 && std::is_trivially_copyable_v<StateRec2>, "the state list's record is a file format");
 std::string state_list_path(const char* name) {
     // (the shipped list is the build's, beside the game; the ones play adds to are this PC's, in the game folder's cache/)
-    return strstr(name, "_shipped") ? game_folder_path() + name : cache_path(name);
+    return strstr(name, "_shipped") ? data_file(name) : cache_path(name);
 }
 template <class R>
 uint64_t state_hash(const R& r) {
@@ -3899,10 +3900,11 @@ uint32_t aniso_override() {
 }
 // (longshot) The upscalers' texture LOD bias. OoT draws its 3D at 3/4 of the output and gives its world's materials a LOD bias of
 // -0.5 for that (sampler_make's log line). An upscaler that draws from another share adds to the samplers the game biases below 0
-// (upscaler_rows.h upscale_lod_bias_for): DLSS and DLAA NVIDIA's log2(render / output) - 1 in all (Quality -1.17 more, DLAA -0.58,
-// Auto -1), FSR 3.1 and FSR 4 log2(share / 0.75) below 75 %; 0 with the game's own upscale, Off and FSR 4's native AA.
-// RX_VK_UPSCALE_LOD_BIAS=0: off. RX_VK_DLSS_LOD_OFFSET=<steps>: DLSS's -1 for a run (0: the render size's own detail, as
-// before). Part of every sampler's key; the menu's Upscaler, Render resolution and Quality preset rows move the samplers' generation
+// (upscaler_rows.h upscale_lod_bias_for): DLSS, DLAA, FSR 3.1, FSR 4 and FSR 4's native AA use log2(render / output) - 1 in all
+// (Quality -1.17 more, Native AA / 100% -0.58, Auto -1), XeSS uses log2(share / 0.75) below 75 %; 0 with the game's own upscale,
+// Off and XeSS's native AA. RX_VK_UPSCALE_LOD_BIAS=0: off. RX_VK_DLSS_LOD_OFFSET=<steps>: the -1 offset for a run (0: the render
+// size's own detail, as before). Part of every sampler's key; the menu's Upscaler, Render resolution and Quality preset rows move
+// the samplers' generation
 float upscale_lod_bias() {
     static const bool off = getenv("RX_VK_UPSCALE_LOD_BIAS") && atoi(getenv("RX_VK_UPSCALE_LOD_BIAS")) == 0;
     if (off) return 0.0f;
@@ -4610,18 +4612,24 @@ VkDescriptorBufferInfo uniform_range(const NvnState& s, const Stage& st, uint32_
 }
 
 struct DescWriter {
+    struct DepthSample {
+        Texture* tex;
+        size_t img_index;
+    };
     std::vector<VkWriteDescriptorSet> writes;
     std::vector<VkDescriptorBufferInfo> bufs;
     std::vector<VkDescriptorImageInfo> imgs;
     std::vector<VkBufferView> views;
+    std::vector<DepthSample> depth_samples;   // (all sampled depth/stencil textures and their imgs[] slot)
     const Program* prog = nullptr;   // (the program they were built for: a dispatch builds its own over a draw's)
     void reset() {
-        writes.clear(), bufs.clear(), imgs.clear(), views.clear();
+        writes.clear(), bufs.clear(), imgs.clear(), views.clear(), depth_samples.clear();
     }
 };
 TLS_OBJECT(dw, DescWriter)
 TLS_OBJECT(draw_sampled, std::vector<const Texture*>)   // (the textures the descriptors being built sample or store)
 TLS_OBJECT(gfx_sampled, std::vector<const Texture*>)    // (the last draw's: kept while its descriptors are reused)
+TLS_OBJECT(gfx_depth_sampled, std::vector<Texture*>)    // (the last graphics draw's sampled depth/stencil textures)
 
 /// Fills dw with the program's descriptors for the bound state (bindings in Eden's order). Storage the program
 /// writes is noted: textures it stores into are GPU-written, buffers it stores into are stamped (vk_memory.cpp).
@@ -5250,11 +5258,13 @@ void build_descriptors(const NvnState& s, const Program& p) {
                                (unsigned long long)p.key, k, handle, tex ? tex->id : 0, (unsigned long long)(tex ? tex->gpu : 0),
                                tex ? tex->width : 0, tex ? tex->height : 0, tex ? tex->layers : 0, tex ? (void*)tex->image : nullptr,
                                (void*)view, view ? "" : " (dummy)");
+                const bool depth_img = view && is_depth_texture(tex);
                 if (view && tex && tex->gpu_written) draw_sampled().push_back(tex);
+                if (depth_img) out.depth_samples.push_back({tex, out.imgs.size()});
                 if (!view) view = dummies.view[(int)vt], st_dummy_textures += handle != 0;
                 // (an image of one level: no anisotropy of the row's, sampler_make)
                 out.imgs.push_back({sampler_for((int)(handle >> 20), d.is_depth, tex && tex->levels <= 1), view,
-                                    VK_IMAGE_LAYOUT_GENERAL});
+                                    depth_img ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL});
             }
             w.pImageInfo = &out.imgs[first];
             out.writes.push_back(w);
@@ -5831,6 +5841,7 @@ struct Pass {
     uint32_t depth_level = 0, depth_layer = 0;
     uint64_t prog = 0;
     VkImageView depth = VK_NULL_HANDLE;
+    VkImageLayout depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     int n = 0;
     uint32_t width = 0, height = 0;
     int draws = 0;           // (RX_VK_GPU_PROFILE: its draws, and its label's targets)
@@ -5861,6 +5872,7 @@ struct DescBound {
     bool fp_dummy = false;
     bool fp_on = false;   // (the last build recorded its handles: one made with the row off has none to check)
     uint64_t samp = 0, destroy = 0;
+    bool depth_feedback = false;
 };
 int64_t st_desc_slotgen_saves;   // (reuses the global registrations' generation check would have rebuilt for)
 struct LastVb { VkBuffer b[16]; VkDeviceSize o[16], z[16], s[16]; };
@@ -5956,10 +5968,17 @@ bool targets_persistent(const Targets& at) {
     return at.depth && at.depth->first_render_frame && at.depth->first_render_frame < now;
 }
 
-void begin_pass(VkCommandBuffer cmd, const Targets& at) {
+VkImageLayout depth_attachment_layout(bool samples_depth, bool writes_depth, bool open_read_only) {
+    if (samples_depth && writes_depth) return VK_IMAGE_LAYOUT_GENERAL;
+    if (samples_depth || (!writes_depth && open_read_only)) return VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    return VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+}
+
+void begin_pass(VkCommandBuffer cmd, const Targets& at, VkImageAspectFlags depth_clear_aspect = 0,
+                VkClearDepthStencilValue depth_clear_val = VkClearDepthStencilValue()) {
     Pass& ps = pass();   // (once: the accessor is a call and a thread-local read at each use. The same object for the thread's life: draw_begin_recording resets it in place)
-    bool same = ps.open && ps.depth == at.depth_view && ps.n == at.n && ps.width == at.width &&
-                ps.height == at.height;
+    bool same = ps.open && ps.depth == at.depth_view && (!at.depth || ps.depth_layout == at.depth_layout) &&
+                ps.n == at.n && ps.width == at.width && ps.height == at.height && !depth_clear_aspect;
     for (int i = 0; i < at.n && same; i++) same = ps.color[i] == at.color_view[i];
     if (same) return;
     end_pass(cmd);
@@ -5971,6 +5990,11 @@ void begin_pass(VkCommandBuffer cmd, const Targets& at) {
         full_barrier(cmd, "barrier (after BC slice loads)");
     } else {
         pass_start_barrier(cmd);   // (what the pass before wrote, and the transfers before it: vk_texture.cpp)
+    }
+    if (at.depth) {
+        const bool discard = depth_clear_aspect == at.depth->aspect && at.depth->levels == 1 && at.depth->layers == 1 &&
+                             at.width == at.depth->width && at.height == at.depth->height;
+        texture_transition_layout(cmd, at.depth, at.depth_layout, discard);
     }
     work_since_barrier = true;
     VkRenderingAttachmentInfo ca[8]{};
@@ -5988,15 +6012,21 @@ void begin_pass(VkCommandBuffer cmd, const Targets& at) {
     }
     for (int i = at.n; i < 8; i++) ps.color[i] = VK_NULL_HANDLE;
     VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    VkRenderingAttachmentInfo sa{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     if (at.depth) {
+        const bool ro = at.depth_layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
         da.imageView = at.depth_view;
-        da.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        da.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        texture_written(at.depth, "a pass's depth target");
+        da.imageLayout = at.depth_layout;
+        da.loadOp = (depth_clear_aspect & VK_IMAGE_ASPECT_DEPTH_BIT) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+        da.storeOp = ro ? VK_ATTACHMENT_STORE_OP_NONE : VK_ATTACHMENT_STORE_OP_STORE;
+        da.clearValue.depthStencil = depth_clear_val;
+        sa = da;
+        sa.loadOp = (depth_clear_aspect & VK_IMAGE_ASPECT_STENCIL_BIT) ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+        if (!ro) texture_written(at.depth, "a pass's depth target");
         texture_rendered(at.depth);
     }
     ps.depth = at.depth_view;
+    ps.depth_layout = at.depth ? at.depth_layout : VK_IMAGE_LAYOUT_UNDEFINED;
     ps.has_block_images = at.has_block_images;
     ps.depth_tex = at.depth, ps.depth_level = at.depth_level, ps.depth_layer = at.depth_layer;
     ps.n = at.n, ps.width = at.width, ps.height = at.height;
@@ -6006,7 +6036,7 @@ void begin_pass(VkCommandBuffer cmd, const Targets& at) {
     ri.colorAttachmentCount = (uint32_t)at.n;
     ri.pColorAttachments = ca;
     if (at.depth && depth_aspect(at.depth_format)) ri.pDepthAttachment = &da;
-    if (at.depth && has_stencil(at.depth_format)) ri.pStencilAttachment = &da;
+    if (at.depth && has_stencil(at.depth_format)) ri.pStencilAttachment = &sa;
     gprof_begin(cmd);
     ps.draws = 0, ps.format0 = at.n ? at.color_format[0] : at.depth_format;
     ps.wm_or = 0, ps.wm_n = 0;
@@ -6587,6 +6617,14 @@ void reactive_scene_draw(VkCommandBuffer cmd, const Program& p, const NvnState& 
     end_pass(cmd);   // (a copy cannot be made in a pass)
     reactive::copy_scene(cmd, at.color[0], at.color_level[0], at.color_layer[0], at.width, at.height);
 }
+bool depth_writes_enabled(const NvnState& s, const Targets& at) {
+    if (!at.depth) return false;
+    const bool depth_w = !sw().no_depth && depth_aspect(at.depth_format) && s.ds.dw;
+    const bool stencil_w = has_stencil(at.depth_format) && s.ds.st &&
+                           ((s.stencil_mask[0] & 0xFF) != 0 || (s.stencil_mask[1] & 0xFF) != 0);
+    return depth_w || stencil_w;
+}
+
 // doc: docs/dev/reference/architecture.md#rules-from-mkw (rule 5: a draw that samples what its pass wrote gets a pass of its own)
 /// A draw that samples a target this pass already wrote, or writes a target an earlier draw of this pass sampled: in
 /// a pass of its own, after a full barrier (begin_pass makes it), as for the clears above: in one pass the GPU orders
@@ -6597,7 +6635,7 @@ uint16_t draw_hazards(VkCommandBuffer cmd, const Program& p, const NvnState& s, 
     uint16_t writes = 0;
     for (int i = 0; i < at.n; i++)
         if (at.color[i] && target_write_mask(p, s, i)) writes |= (uint16_t)(1u << i);
-    if (at.depth && s.ds.dw) writes |= 1u << 8;
+    if (depth_writes_enabled(s, at)) writes |= 1u << 8;
     samples = 0;
     for (const Texture* t : gfx_sampled()) {
         if (!t) continue;
@@ -6605,6 +6643,9 @@ uint16_t draw_hazards(VkCommandBuffer cmd, const Program& p, const NvnState& s, 
             if (at.color[i] == t) samples |= (uint16_t)(1u << i);
         if (at.depth == t) samples |= 1u << 8;
     }
+    if (at.depth && !(samples & (1u << 8)))
+        for (const Texture* t : gfx_depth_sampled())
+            if (at.depth == t) { samples |= 1u << 8; break; }
     const uint16_t feedback = samples & writes;
     static std::atomic<int> self_logged{0};
     if (feedback && self_logged.load(std::memory_order_relaxed) < 12 &&
@@ -6671,7 +6712,7 @@ void clear_color_target(VkCommandBuffer cmd, NvnState& s, int index, const float
 
 void clear_depth_stencil(VkCommandBuffer cmd, NvnState& s, float depth, bool depth_mask, uint32_t stencil,
                          uint32_t stencil_mask) {
-    const Targets at = targets(s);
+    Targets at = targets(s);
     if (!at.depth) return;
     VkImageAspectFlags aspect = 0;
     if (depth_mask && depth_aspect(at.depth_format)) aspect |= VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -6682,14 +6723,27 @@ void clear_depth_stencil(VkCommandBuffer cmd, NvnState& s, float depth, bool dep
         if (logged++ < 4) logf("vk: stencil clear with write mask %#x: cleared whole", stencil_mask);
     }
     clear_after_draws(cmd);
-    begin_pass(cmd, at);
     const VkRect2D rect = clear_rect(s, at.width, at.height);
     if (!rect.extent.width || !rect.extent.height) return;
-    VkClearAttachment ca{};
-    ca.aspectMask = aspect;
-    ca.clearValue.depthStencil = {std::clamp(depth, 0.0f, 1.0f), stencil & 0xFF};
-    const VkClearRect cr{rect, 0, 1};
-    vkCmdClearAttachments(cmd, 1, &ca, 1, &cr);
+    at.depth_layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    const VkClearDepthStencilValue val{std::clamp(depth, 0.0f, 1.0f), stencil & 0xFF};
+    Pass& ps = pass();
+    bool same_open = ps.open && ps.depth == at.depth_view &&
+                     ps.depth_layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL &&
+                     ps.n == at.n && ps.width == at.width && ps.height == at.height;
+    for (int i = 0; i < at.n && same_open; i++) same_open = ps.color[i] == at.color_view[i];
+    const bool full_rect = rect.offset.x == 0 && rect.offset.y == 0 &&
+                           rect.extent.width == at.width && rect.extent.height == at.height;
+    if (!same_open && full_rect) {
+        begin_pass(cmd, at, aspect, val);
+    } else {
+        begin_pass(cmd, at);
+        VkClearAttachment ca{};
+        ca.aspectMask = aspect;
+        ca.clearValue.depthStencil = val;
+        const VkClearRect cr{rect, 0, 1};
+        vkCmdClearAttachments(cmd, 1, &ca, 1, &cr);
+    }
     pass().written |= 1u << 8;
     st_clears++, pass().clears++;
 }
@@ -7059,6 +7113,7 @@ void end_pass(VkCommandBuffer cmd) {
     if (!ps.open) return;
     vkCmdEndRendering(cmd);
     ps.open = false;
+    ps.depth_layout = VK_IMAGE_LAYOUT_UNDEFINED;
     if (ps.has_block_images) {
         full_barrier(cmd, "barrier (before BC slice stores)");
         for (int i = 0; i < ps.n; i++)
@@ -9157,7 +9212,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         static int logged;
         if (logged++ < 5) logf("vk: a draw with patches");
     }
-    const Targets at = bare_targets(s, targets(s));
+    Targets at = bare_targets(s, targets(s));
     if (!at.width || !at.height) SKIP_HERE();
     // (longshot) the scene's camera and depth for the temporal upscalers: NVIDIA DLSS and AMD FSR 4 (vk_temporal.cpp) and AMD
     // FSR 3.1 (vk_fsr3_inputs.cpp). The vertex stage's uniform buffer 3 (NVN's binding 0)
@@ -9472,7 +9527,13 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
                 if (d.is_written) return true;
         return false;
     }();
-    const bool same_desc = !no_reuse && !early_rebind && cb.desc.valid && cb.desc.prog == &p && cb.desc.bind == s.bind_gen &&
+    const bool depth_w = depth_writes_enabled(s, at);
+    const bool prev_depth_fb = cb.desc.valid && cb.desc.depth_feedback;
+    const bool may_depth_fb = depth_w && at.depth &&
+                              std::find(gfx_depth_sampled().begin(), gfx_depth_sampled().end(), at.depth) !=
+                                  gfx_depth_sampled().end();
+    const bool same_desc = !no_reuse && !early_rebind && !prev_depth_fb && !may_depth_fb &&
+                           cb.desc.valid && cb.desc.prog == &p && cb.desc.bind == s.bind_gen &&
                            cb.desc.ub == ub_gen && cb.desc.dgen == dgen &&
                            (slotgen ? cb.desc.fp_on && desc_slots_kept(cb.desc, reg_gen) : cb.desc.reg == reg_gen) &&
                            (!p.fallback || dw().prog == &p);
@@ -9507,6 +9568,11 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     PROF_HOT(PROF_CMDS);
     texture_watch_prog(p.key);
     if (!same_desc) gfx_sampled() = draw_sampled();
+    if (!same_desc) {
+        cb.desc.valid = false;
+        gfx_depth_sampled().clear();
+        for (const auto& ds : dw().depth_samples) gfx_depth_sampled().push_back(ds.tex);
+    }
     // (longshot) NVIDIA DLAA before the game's bloom and tone map: the frame's draws into the scene and those that read it, and
     // at the bloom's first draw DLAA on the scene, before this draw reads it (vk_temporal.cpp, pre_bloom.h). Its passes and
     // its actor motion's draws bound a pipeline, a viewport, vertex streams and descriptors of their own: this draw sets
@@ -9522,6 +9588,25 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     {
         FINE_SCOPE(FT_HAZARD);
         writes = draw_hazards(cmd, p, s, at, samples);
+    }
+    bool depth_fb = false;
+    if (at.depth) {
+        const bool open_ro = ps.open && ps.depth == at.depth_view &&
+                             ps.depth_layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        at.depth_layout = depth_attachment_layout((samples & (1u << 8)) != 0, (writes & (1u << 8)) != 0, open_ro);
+        depth_fb = at.depth_layout == VK_IMAGE_LAYOUT_GENERAL;
+        if (depth_fb) {
+            for (const auto& ds : dw().depth_samples)
+                if (ds.tex == at.depth) dw().imgs[ds.img_index].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        }
+    }
+    if (depth_fb || prev_depth_fb) descriptors_disturbed();
+    for (Texture* t : gfx_depth_sampled()) {
+        if (!is_depth_texture(t)) continue;
+        const VkImageLayout want = (depth_fb && t == at.depth) ? VK_IMAGE_LAYOUT_GENERAL
+                                                               : VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        if (t->layout != want) end_pass(cmd);
+        texture_transition_layout(cmd, t, want);
     }
     BufferRef mesh_args{};
     uint32_t mesh_args_at = 0;
@@ -9630,6 +9715,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
         if (!bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p)) SKIP_HERE();
         cb.desc.valid = true, cb.desc.prog = &p, cb.desc.bind = s.bind_gen, cb.desc.reg = reg_gen;
         cb.desc.ub = ub_gen, cb.desc.dgen = dgen;
+        cb.desc.depth_feedback = depth_fb;
         cb.desc.fp_on = desc_fp_on;
         if (desc_fp_on)   // (Descriptor reuse: what its handles resolved; the next such draw may keep it through other slots' churn)
             cb.desc.fp = desc_fp(), cb.desc.fp_dummy = desc_fp_dummy, cb.desc.samp = desc_samp_seen,
@@ -12173,7 +12259,7 @@ bool compile_level_all() {
             why = "RX_VK_COMPILE_SHADERS";
         } else {
             std::string ini = game_module_string();
-            ini = ini.substr(0, ini.find_last_of("\\/") + 1) + "longshot_options.ini";
+            ini = ini.substr(0, ini.find_last_of("\\/") + 1) + (organized_game() ? "config/build.ini" : "longshot_options.ini");
             if (FILE* f = fopen(ini.c_str(), "r")) {
                 char line[80];
                 while (fgets(line, sizeof line, f))
@@ -12970,6 +13056,8 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
     ub_prog_key = p.key;   // (the Grass distance row: uniform_range)
     build_descriptors(s, p);
     ub_prog_key = 0;
+    for (const auto& ds : dw().depth_samples)
+        texture_transition_layout(cmd, ds.tex, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
     grid_patch_want = false;
     dclock.t_desc = slow_dispatch_timing() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (dump_on())

@@ -176,7 +176,7 @@ std::string known_code(const std::string& code) {
 }
 std::string language_txt() {
     const std::string path = game_module_string();
-    return path.substr(0, path.find_last_of("\\/") + 1) + "language.txt";
+    return path.substr(0, path.find_last_of("\\/") + 1) + (organized_game() ? "config/language.txt" : "language.txt");
 }
 /// language.txt's language, as host/nn_applet.c reads it: its first line that is not blank or a comment and holds a code the
 /// game has (a stray line is passed over); "" when none does

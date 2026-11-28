@@ -20,6 +20,7 @@
    same functions as the proc table (nvn2_dispatch, from gen/nvn2_exports.c). */
 #include "hos.h"
 #include "shadow_slot.h"   /* (the storage a character's shadow map reserves) */
+#include "scene_format.h"   /* (the scene's light in RGBA16F with PsychoV35) */
 #include "../gpu/render/rx_nvn.h"
 #include "../gpu/vk/vk_api.h"   /* (HOS_OPT_RENDER_THREAD: the present poll, nvnEventGetValue) */
 #include <stdio.h>
@@ -643,6 +644,28 @@ NV(nvnTextureBuilderSetPackagedTextureData) { TB(P(0))->pkg_data = U64(1); }
 NV(nvnTextureBuilderGetPackagedTextureData) { RET(CTB(P(0))->pkg_data); }
 /* storage classes are opaque identifiers here: 0 buffer textures, 1 the rest (not a Tegra memory kind) */
 static int storage_class(const nvn_texdesc *d) { return d->target == NVN_TEXTURE_TARGET_BUFFER ? 0 : 1; }
+/* (longshot) A builder's description as its texture is made: the scene's light in RGBX16F with PsychoV35 (scene_format.h).
+   The answer is kept in the builder for its description, from the first size, alignment or offset asked to the texture made
+   (which forgets it): the tone mapper can change between the game's questions and its Initialize (hos_scene_rgba16f is the
+   presentation thread's), and a texture made larger than the storage set aside for it would run into the next target */
+extern volatile int hos_scene_rgba16f;   /* (nn_vi.c: HDR Native with the PsychoV35 tone mapper) */
+static uint32_t desc_key(const nvn_texdesc *d) {
+    uint32_t h = 2166136261u;
+    const uint8_t *p = (const uint8_t *)d;
+    for (size_t i = 0; i < sizeof *d; i++) h = (h ^ p[i]) * 16777619u;
+    return h;
+}
+static nvn_texdesc made_desc(nvn_tex_builder *b) {
+    static int on = -1;   /* (HOS_SCENE_RGBA16F=0: R11G11B10F, as before; read once, by any thread: the same answer) */
+    if (on < 0) on = env_on_or("HOS_SCENE_RGBA16F", 1);
+    nvn_texdesc d = b->d;
+    const uint32_t key = desc_key(&d);
+    if (!b->scene_set || b->scene_key != key)
+        b->scene_set = 1, b->scene_key = key, b->scene_on = on && hos_scene_rgba16f;
+    d.format = hos_scene_format(b->scene_on, d.format, d.target, d.flags, d.samples, d.levels, d.depth,
+                                b->has_layout || b->pkg_data);
+    return d;
+}
 NV(nvnTextureBuilderGetStorageClass) { RET(storage_class(&CTB(P(0))->d)); }
 NV(nvnTextureBuilderGetFlags) { RET((uint32_t)CTB(P(0))->d.flags); }
 /* (longshot) A size or alignment asked of no builder: the game passes 0 here while a scene loaded (thread
@@ -674,17 +697,19 @@ static int shadow_slot_layout(const nvn_texdesc *d, nvn_texlayout *out) {
 NV(nvnTextureBuilderGetStorageSize) {
     if (no_builder(c, "storage size")) { RET(0); return; }
     nvn_texlayout L, slot;
-    nvn_tex_layout(&CTB(P(0))->d, &L);
+    const nvn_texdesc made = made_desc(TB(P(0)));
+    nvn_tex_layout(&made, &L);
     if (!L.bpb) hos_log("nvn: texture format %#x unknown: storage size 0", CTB(P(0))->d.format);
-    if (L.bpb && shadow_slot_layout(&CTB(P(0))->d, &slot) && slot.size > L.size) L.size = slot.size;
+    if (L.bpb && shadow_slot_layout(&made, &slot) && slot.size > L.size) L.size = slot.size;
     RET(L.size);
 }
 NV(nvnTextureBuilderGetStorageAlignment) {
     if (no_builder(c, "storage alignment")) { RET(512); return; }
     nvn_texlayout L, slot;
-    nvn_tex_layout(&CTB(P(0))->d, &L);
+    const nvn_texdesc made = made_desc(TB(P(0)));
+    nvn_tex_layout(&made, &L);
     /* (the slot's alignment where it is the larger: one alignment for every side within a step, and the texture's own still met) */
-    if (L.bpb && shadow_slot_layout(&CTB(P(0))->d, &slot) && slot.align > L.align) L.align = slot.align;
+    if (L.bpb && shadow_slot_layout(&made, &slot) && slot.align > L.align) L.align = slot.align;
     RET(L.align);
 }
 NV(nvnTextureBuilderGetZCullStorageSize) { RET(0); }   /* no ZCull: nothing to store */
@@ -763,7 +788,7 @@ int nvn_tex_live_at(uint64_t gpu, nvn_tex *out) {
 
 void hos_watch_guest_writes(const uint8_t *data, uint64_t size);   /* (below) */
 NV(nvnTextureInitialize) {
-    const nvn_tex_builder *b = CTB(P(1));
+    nvn_tex_builder *b = TB(P(1));
     nvn_tex *o = TX(P(0));
     if (o->magic == NVN_MAGIC('T', 'E', 'X', 0) && o->serial) {   /* initialised again without Finalize */
         live_del(o);
@@ -771,7 +796,8 @@ NV(nvnTextureInitialize) {
     }
     memset(o, 0, sizeof *o);
     o->magic = NVN_MAGIC('T', 'E', 'X', 0);
-    o->d = b->d;
+    o->d = made_desc(b);
+    b->scene_set = 0;   /* (this texture made: the next one built from it is answered again) */
     o->pool = b->pool;
     o->off = b->off;
     o->has_layout = b->has_layout;

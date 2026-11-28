@@ -170,7 +170,7 @@ pub(crate) fn clang() -> Option<&'static str> {
     found
 }
 
-fn compiles(text: &str) {
+pub(crate) fn compiles(text: &str) {
     let Some(clang) = clang() else { return };
     // (a folder of each call's own: tests run at once)
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -284,7 +284,8 @@ fn checked_sample(entry: u64) -> Function {
     let nan = body.push(hb, Op::FCmp(FPred::Uno, sum, sum));
     let r = body.push(hb, Op::Select(nan, p1, sum));
     body.terminate(hb, Term::Return);
-    let helper = Helper { name: "lifter.test.add".into(), params: vec![Type::F32, Type::F32], body, result: r };
+    let helper =
+        Helper { name: "lifter.test.add".into(), params: vec![Type::F32, Type::F32], body, result: r, mid: None };
 
     let mut f = Function::new(entry);
     let h = f.add_helper(helper);
@@ -310,6 +311,270 @@ fn checked_sample(entry: u64) -> Function {
     f.terminate(b, Term::Return);
     f.verify().unwrap();
     f
+}
+
+/// A helper of `params`, its body `f(params' values)` (one block).
+fn helper_of(
+    name: &str,
+    params: &[Type],
+    body_of: impl FnOnce(&mut Function, mir::BlockId, &[mir::Value]) -> mir::Value,
+) -> mir::Helper {
+    let mut body = Function::new(0);
+    let b = body.start;
+    let ps: Vec<mir::Value> =
+        params.iter().enumerate().map(|(i, &ty)| body.push(b, Op::Param { index: i as u8, ty })).collect();
+    let result = body_of(&mut body, b, &ps);
+    body.terminate(b, Term::Return);
+    mir::Helper { name: name.into(), params: params.to_vec(), body, result, mid: None }
+}
+
+/// A function of one float add of `ty` (a single, or a vector of two: V0's and V1's low bits) with its slow path, the
+/// helper's (`lifter.fp.add.*`: its second operand where the sum is a NaN), and with `mid` a middle path (its test: any
+/// subnormal; its value: the sum's first operand where it is a NaN). What they compute does not matter here: how the
+/// writer calls them does.
+fn mid_sample(entry: u64, ty: Type, mid: bool) -> Function {
+    use mir::{FBinOp, FClass, FPred};
+    let spell = if ty == Type::F32 { "f32" } else { "v2f32" };
+    let params = [ty, ty, Type::I64];
+    let nan_or = |which: usize| {
+        move |f: &mut Function, b: mir::BlockId, p: &[mir::Value]| {
+            let sum = f.push(b, Op::FBin(FBinOp::Add, p[0], p[1]));
+            let nan = f.push(b, Op::FCmp(FPred::Uno, sum, sum));
+            f.push(b, Op::Select(nan, p[which], sum))
+        }
+    };
+    let mut helper = helper_of(&format!("lifter.fp.add.{spell}.{spell}.i64"), &params, nan_or(1));
+    if mid {
+        let test = helper_of(&format!("lifter.fp.mid.subnormal.{spell}.{spell}.{spell}"), &[ty, ty, ty], |f, b, p| {
+            let mut any = None;
+            for &x in p {
+                let t = f.push(b, Op::FClass(FClass::Subnormal, x));
+                let t = if ty.is_vector() { f.push(b, Op::Reduce(mir::Reduce::Or, t)) } else { t };
+                any = Some(any.map_or(t, |a| f.push(b, Op::Bin(BinOp::Or, a, t))));
+            }
+            any.unwrap()
+        });
+        let value = helper_of(&format!("lifter.fp.mid.add.{spell}.{spell}.i64"), &params, nan_or(0));
+        helper.mid = Some(Box::new(mir::Mid { test, value }));
+    }
+    let mut f = Function::new(entry);
+    let h = f.add_helper(helper);
+    let b = f.start;
+    let mut operand = |n: u8| {
+        let v = f.push(b, Op::Get(Loc::V(n)));
+        let lo = f.push(b, Op::Extract(v, 0));
+        if ty == Type::F32 {
+            let lo = f.push(b, Op::Cast(mir::Cast::Trunc, Type::I32, lo));
+            f.push(b, Op::Bitcast(Type::F32, lo))
+        } else {
+            f.push(b, Op::Bitcast(ty, lo))
+        }
+    };
+    let (x, y) = (operand(0), operand(1));
+    let fpcr = f.push(b, Op::Get(Loc::Fpcr));
+    let fast = f.push(b, Op::FBin(FBinOp::Add, x, y));
+    let tiny = f.push(b, Op::FClass(FClass::NanOrSubnormal, fast));
+    let slow = if ty.is_vector() { f.push(b, Op::Reduce(mir::Reduce::Or, tiny)) } else { tiny };
+    let r = f.push(b, Op::Checked { fast, slow, helper: h, args: vec![x, y, fpcr] });
+    let bits = f.push(b, Op::Bitcast(if ty == Type::F32 { Type::I32 } else { Type::I64 }, r));
+    let bits = if ty == Type::F32 { f.push(b, Op::Cast(mir::Cast::Zext, Type::I64, bits)) } else { bits };
+    let zero = f.push(b, Op::Const { ty: Type::I128, value: 0 });
+    let zero = f.push(b, Op::Bitcast(mir::V128, zero));
+    let v = f.push(b, Op::Insert(zero, 0, bits));
+    f.push(b, Op::Set(Loc::V(2), v));
+    f.terminate(b, Term::Return);
+    f.verify().unwrap();
+    f
+}
+
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "two helpers named lifter.test.k compute differently")]
+fn two_helpers_of_one_name_computing_differently_stop_the_writer() {
+    // (a name is written once: a second function's helper of that name and another body would be written as the first)
+    let with = |entry: u64, value: u128| {
+        let helper = helper_of("lifter.test.k", &[], |f, b, _| {
+            let k = f.push(b, Op::Const { ty: Type::I32, value });
+            f.push(b, Op::Bitcast(Type::F32, k))
+        });
+        let mut f = Function::new(entry);
+        let h = f.add_helper(helper);
+        let b = f.start;
+        let x0 = f.push(b, Op::Get(Loc::X(0)));
+        let lo = f.push(b, Op::Cast(mir::Cast::Trunc, Type::I32, x0));
+        let fast = f.push(b, Op::Bitcast(Type::F32, lo));
+        let slow = f.push(b, Op::FCmp(mir::FPred::Uno, fast, fast));
+        let r = f.push(b, Op::Checked { fast, slow, helper: h, args: vec![] });
+        let bits = f.push(b, Op::Bitcast(Type::I32, r));
+        let bits = f.push(b, Op::Cast(mir::Cast::Zext, Type::I64, bits));
+        f.push(b, Op::Set(Loc::X(1), bits));
+        f.terminate(b, Term::Return);
+        f.verify().unwrap();
+        f
+    };
+    let mut m = Module::new(Options::default());
+    m.add(&with(0x8000_9000, 0x3f80_0000), Runs::default());
+    m.add(&with(0x8000_a000, 0x3f80_0000), Runs::default());
+    m.add(&with(0x8000_b000, 0x4000_0000), Runs::default());
+}
+
+#[test]
+fn a_fast_path_whose_helper_takes_no_arguments_is_written() {
+    // (the operands a middle path tests are taken only for one: a helper of no parameters is no float operation's,
+    // and the writer must not read past its arguments)
+    let helper = helper_of("lifter.test.k", &[], |f, b, _| {
+        let k = f.push(b, Op::Const { ty: Type::I32, value: 0x3f80_0000 });
+        f.push(b, Op::Bitcast(Type::F32, k))
+    });
+    let mut f = Function::new(0x8000_9000);
+    let h = f.add_helper(helper);
+    let b = f.start;
+    let x0 = f.push(b, Op::Get(Loc::X(0)));
+    let lo = f.push(b, Op::Cast(mir::Cast::Trunc, Type::I32, x0));
+    let fast = f.push(b, Op::Bitcast(Type::F32, lo));
+    let slow = f.push(b, Op::FCmp(mir::FPred::Uno, fast, fast));
+    let r = f.push(b, Op::Checked { fast, slow, helper: h, args: vec![] });
+    let bits = f.push(b, Op::Bitcast(Type::I32, r));
+    let bits = f.push(b, Op::Cast(mir::Cast::Zext, Type::I64, bits));
+    f.push(b, Op::Set(Loc::X(1), bits));
+    f.terminate(b, Term::Return);
+    f.verify().unwrap();
+    let mut m = Module::new(Options::default());
+    m.add(&f, Runs::default());
+    let text = m.finish();
+    assert!(text.contains("call float @lifter.test.k()"), "{text}");
+    compiles(&text);
+}
+
+#[test]
+fn a_middle_path_is_tested_then_inline_and_the_helper_called_only_past_it() {
+    for ty in [Type::F32, Type::Vec(2, mir::Elem::F32)] {
+        let t = llvm_type(ty);
+        let spell = if ty == Type::F32 { "f32" } else { "v2f32" };
+        // (two functions with the middle path, one without it, in one module: each helper written once)
+        let mut m = Module::new(Options::default());
+        m.add(&mid_sample(0x8000_5000, ty, true), Runs::default());
+        m.add(&mid_sample(0x8000_6000, ty, true), Runs::default());
+        m.add(&mid_sample(0x8000_7000, ty, false), Runs::default());
+        let text = m.finish();
+        let test = format!("@lifter.fp.mid.subnormal.{spell}.{spell}.{spell}");
+        let value = format!("@lifter.fp.mid.add.{spell}.{spell}.i64");
+        let full = format!("@lifter.fp.add.{spell}.{spell}.i64");
+        assert_eq!(text.matches(&format!("define internal i1 {test}({t} %p0, {t} %p1, {t} %p2) #5 {{")).count(), 1);
+        assert_eq!(text.matches(&format!("define internal {t} {value}({t} %p0, {t} %p1, i64 %p2) #5 {{")).count(), 1);
+        assert_eq!(text.matches(&format!("define internal {t} {full}({t} %p0, {t} %p1, i64 %p2) #2 {{")).count(), 1);
+        assert_eq!(text.matches(&format!("= call i1 {test}(")).count(), 2, "{text}");
+        assert_eq!(text.matches(&format!("= call {t} {value}(")).count(), 2, "{text}");
+        assert_eq!(text.matches(&format!("= call {t} {full}(")).count(), 3, "{text}");
+        assert!(text.contains("attributes #5 = { nounwind willreturn alwaysinline memory(none) }"), "{text}");
+        assert!(text.contains("attributes #6 = { nounwind willreturn memory(none) }"), "{text}");
+        // (the test reads the operands and the fast value through an empty asm, in a vector register: a single as it
+        // is, a vector of two singles as a double)
+        let carrier = if ty == Type::F32 { "float" } else { "double" };
+        assert_eq!(text.matches(&format!("= call {carrier} asm \"\", \"=x,0\"({carrier} ")).count(), 6, "{text}");
+        // (three ways into the join with the middle path, two without)
+        // (in each function with it: the test, then the branch to the full path or the middle one; the middle one's
+        // value and then the join, with no call of the helper on the way; the helper only on the full path)
+        for entry in ["80005000", "80006000"] {
+            let body = text.split(&format!("@f_{entry}(")).nth(1).unwrap().split("\n}").next().unwrap();
+            let at = |what: &str| body.find(what).unwrap_or_else(|| panic!("{what} in f_{entry}:\n{body}"));
+            let (test_at, value_at, full_at) =
+                (at(&format!("call i1 {test}(")), at(&format!("call {t} {value}(")), at(&format!("call {t} {full}(")));
+            assert!(test_at < value_at && value_at < full_at, "{body}");
+            let mid_block = &body[test_at..full_at];
+            let (branch, rest) = mid_block.split_once("\n  br i1 ").unwrap();
+            assert!(!branch.contains(&full) && !rest.contains(&full), "{body}");
+            // (`br i1 %test, label %<full>, label %<middle>`: the test true takes the helper)
+            let labels: Vec<&str> =
+                rest.lines().next().unwrap().split("label %").skip(1).map(|l| l.split(',').next().unwrap()).collect();
+            let [full_label, mid_label] = labels[..] else { panic!("{body}") };
+            // (a block: its label's line to the next label's; it ends in its branch)
+            let block = |label: &str| -> Vec<&str> {
+                let from = body.split(&format!("\n{label}:\n")).nth(1).unwrap_or_else(|| panic!("{label}:\n{body}"));
+                from.lines().take_while(|l| !l.ends_with(':')).collect()
+            };
+            let (mid_block, full_block) = (block(mid_label), block(full_label));
+            // (the middle path: its value, no helper's call, and straight to the join, where the phi takes it)
+            assert!(mid_block.iter().any(|l| l.contains(&format!("call {t} {value}("))), "{mid_block:?}");
+            assert!(!mid_block.iter().any(|l| l.contains(&full)), "{mid_block:?}");
+            let join =
+                mid_block.last().unwrap().strip_prefix("  br label %").unwrap_or_else(|| panic!("{mid_block:?}"));
+            assert!(!join.contains(' '), "{mid_block:?}");
+            assert!(full_block.iter().any(|l| l.contains(&format!("call {t} {full}("))), "{full_block:?}");
+            assert_eq!(full_block.last().unwrap(), &format!("  br label %{join}"), "{full_block:?}");
+            let phi = block(join).into_iter().find(|l| l.contains("= phi ")).unwrap();
+            // (and the values: the branch on the test's result, the phi taking the middle value from the middle block
+            // and the helper's from the full one)
+            let result_of = |lines: &[&str], callee: &str| -> String {
+                let l = lines.iter().find(|l| l.contains(&format!(" {callee}("))).unwrap();
+                l.trim().split(" = ").next().unwrap().to_string()
+            };
+            let test_line = body.lines().find(|l| l.contains(&format!("call i1 {test}("))).unwrap();
+            let test_result = test_line.trim().split(" = ").next().unwrap();
+            assert!(rest.starts_with(&format!("{test_result}, label %")), "{rest}");
+            let (m, r) = (result_of(&mid_block, &value), result_of(&full_block, &full));
+            assert!(phi.contains(&format!("[ {m}, %{mid_label} ]")), "{phi}");
+            assert!(phi.contains(&format!("[ {r}, %{full_label} ]")), "{phi}");
+            // (what the test reads: through the empty asm, the helper's operands (its arguments but FPCR) and the fast
+            // value (the phi's first), in that order; a vector of two singles through a double, there and back)
+            let full_line = full_block.iter().find(|l| l.contains(&full)).unwrap();
+            let mut expect: Vec<String> = full_line
+                .split('(')
+                .nth(1)
+                .unwrap()
+                .split(", ")
+                .take(2)
+                .map(|a| a.rsplit(' ').next().unwrap().to_string())
+                .collect();
+            expect.push(phi.split("[ ").nth(1).unwrap().split(',').next().unwrap().to_string());
+            let slow: Vec<&str> = body[..test_at].lines().rev().take_while(|l| !l.ends_with(':')).collect();
+            let slow: Vec<&str> = slow.into_iter().rev().collect();
+            let mut read = Vec::new();
+            for l in slow.iter().filter(|l| l.contains("asm \"\", \"=x,0\"")) {
+                let input = l.split("=x,0\"(").nth(1).unwrap().split(')').next().unwrap();
+                let input = input.rsplit(' ').next().unwrap().to_string();
+                let out = l.trim().split(" = ").next().unwrap();
+                // (through a bitcast: its source, and the cast back of the asm's result)
+                let source = slow
+                    .iter()
+                    .find(|b| b.trim().starts_with(&format!("{input} = bitcast ")))
+                    .map(|b| b.split(" to ").next().unwrap().rsplit(' ').next().unwrap().to_string());
+                let given = slow
+                    .iter()
+                    .find(|b| b.contains(&format!(" bitcast {carrier} {out} to ")))
+                    .map(|b| b.trim().split(" = ").next().unwrap().to_string());
+                read.push((source.unwrap_or(input), given.unwrap_or(out.to_string())));
+            }
+            assert_eq!(read.iter().map(|r| r.0.clone()).collect::<Vec<_>>(), expect, "{body}");
+            let test_args: Vec<String> = test_line
+                .split('(')
+                .nth(1)
+                .unwrap()
+                .trim_end_matches(')')
+                .split(", ")
+                .map(|a| a.rsplit(' ').next().unwrap().to_string())
+                .collect();
+            assert_eq!(test_args, read.iter().map(|r| r.1.clone()).collect::<Vec<_>>(), "{body}");
+        }
+        let phis: Vec<&str> = text.lines().filter(|l| l.contains(&format!("= phi {t} "))).collect();
+        assert_eq!(phis.len(), 3, "{text}");
+        assert_eq!(phis.iter().filter(|l| l.matches("], [").count() == 2).count(), 2, "{phis:?}");
+        compiles(&text);
+        // (a module without a middle path has none of its text)
+        let mut plain = Module::new(Options { count_checks: true, ..Options::default() });
+        plain.add(&mid_sample(0x8000_7000, ty, false), Runs::default());
+        let plain = plain.finish();
+        for absent in ["lifter.fp.mid", "#5", "#6", "asm", "lifter_mid_checks"] {
+            assert!(!plain.contains(absent), "{absent}: {plain}");
+        }
+        // (counted: the middle path's runs too)
+        let mut counted = Module::new(Options { count_checks: true, ..Options::default() });
+        counted.add(&mid_sample(0x8000_5000, ty, true), Runs::default());
+        let text = counted.finish();
+        assert!(text.contains("@lifter_mid_checks = external global i64"), "{text}");
+        assert_eq!(text.matches("load i64, ptr @lifter_mid_checks").count(), 1, "{text}");
+        compiles(&text);
+    }
 }
 
 #[test]

@@ -645,7 +645,7 @@ Id EmitShuffleButterfly(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id
                         Id segmentation_mask);
 Id EmitQuadBroadcast(EmitContext& ctx, Id value, Id lane);
 Id EmitMatrixMulAddF16(EmitContext& ctx, Id a, Id b, Id c);
-void DefineSoftwareMatrixFunction(EmitContext& ctx);
+void DefineSoftwareMatrixFunction(EmitContext& ctx, const IR::Program& program);
 bool DefineWmma16MatrixFunction(EmitContext& ctx, const IR::Program& program);
 void DefineWmma16PairFunction(EmitContext& ctx, const IR::Program& program);
 void EmitMatrixMulAddF16Fused(EmitContext& ctx, IR::Inst* inst);

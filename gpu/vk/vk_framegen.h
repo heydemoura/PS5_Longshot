@@ -12,7 +12,9 @@ void fg_latency_swapchain_gone();
 /// multiplier), a fixed one at most NVIDIA DLSS Frame Generation's runtime's most made frames + 1 while DLSS-G is to make the
 /// frames (vk_dlss.h dlss_fg_most: 6x on an RTX 50's runtime, 2x on an RTX 40's; that most is 0 otherwise: no cap). Past it
 /// NGX was not asked for the sets, and the renderer's own or AMD FSR 3.1 made every frame with DLSS FG chosen. A saved value
-/// past it is kept (another engine runs it), and is shown and run as that top. Off and Auto are as they are
+/// past it is kept (another engine runs it), and is shown and run as that top. Off and Auto are as they are.
+/// framegen_now is 0 while NVIDIA Streamline makes DLSS FG's frames (vk_dlssg.h): it shows them itself, and none of the
+/// renderer's frame generation runs (its sets, its display thread, its swapchain images)
 int framegen_capped(int framegen, int dlss_most);
 int framegen_now();
 /// (longshot) Each present: frame generation off for 120 presents lets its images go (the built-in interpolation's two frames, its
@@ -23,9 +25,12 @@ int framegen_now();
 /// framegen_queue, so a set this present filled is the display thread's by then
 void framegen_idle(bool recorded);
 /// Records the frame's processing into the present's recording (src: the window texture's view, sw x sh, the crop
-/// x, y, w, h; native_pq: the encoding of that captured present); false when interpolation cannot run
-/// (the present goes to the window as without it)
-bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t sh, const int crop[4], bool native_pq);
+/// x, y, w, h; native_pq: the encoding of that captured present; game_at: when the game's thread presented the frame,
+/// steady clock ns, 0 when not known: the game's timeline a fixed multiplier's set is put on, fixed_clock; game_wait: how
+/// long the game's thread was held in that present, ns, which tells whether the game runs below its cap); false when
+/// interpolation cannot run (the present goes to the window as without it)
+bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t sh, const int crop[4], bool native_pq,
+                     int64_t game_at = 0, int64_t game_wait = 0);
 /// (longshot) Who made the made frames of the sets shown lately (the last 64, about a second at 60): what the Insert menu's
 /// Frame generation by row and the FPS counter name. None: none made (Off, nothing to blend from, none for half a second).
 /// DlssPaused: DLSS FG chosen, and the sets were the game's frames alone, with no Upscaler picture to make frames from (the
@@ -53,7 +58,8 @@ void framegen_hud_before(VkCommandBuffer cmd, Texture* picture, uint32_t level);
 /// After that recording's submit (value): the display thread shows its frames
 void framegen_queue(uint64_t value);
 /// The window's present of an image (GENERAL, w x h; crop as above or null), vk_replay.cpp: the display thread's
-void present_image(VkImage src, uint32_t w, uint32_t h, const int crop[4], VkImageView view = VK_NULL_HANDLE, bool source_srgb = false, bool allow_scale = true);
+void present_image(VkImage src, uint32_t w, uint32_t h, const int crop[4], VkImageView view = VK_NULL_HANDLE, bool source_srgb = false,
+                   bool allow_scale = true, VkFormat framegen_format = VK_FORMAT_UNDEFINED);
 /// (longshot) Present ahead (vk_framegen.cpp display_main): while present_defer_into is set on a thread, present_image
 /// submits the frame's copy into its swapchain image and stops there, with what present_commit needs to show it later. The
 /// copy is then on the queue before the game's next frame, so its present at its time does not wait for that frame's rendering
@@ -65,6 +71,8 @@ struct PendingPresent {
     uint64_t reflex_frame = ~0ull;           // (NVIDIA Reflex: the frame it shows, vk_reflex.h reflex_present_frame)
     uint64_t antilag_frame = ~0ull;          // (AMD Anti-Lag 2: the frame it shows, vk_antilag.h antilag_present_frame)
     uint64_t swapchain_generation = 0;
+    bool game = false;   // (RX_VK_PRESENT_PROBE: it shows its set's game frame, not a made one)
+    uint64_t set = 0;    // (RX_VK_PRESENT_PROBE: its set, the display thread's count of the sets it took)
 };
 extern thread_local PendingPresent* present_defer_into;
 bool present_commit(const PendingPresent& p);   // (false: not shown, nothing deferred or a swapchain made again since)

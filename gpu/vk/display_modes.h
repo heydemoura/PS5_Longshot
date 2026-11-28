@@ -3,7 +3,7 @@
 
    The screen's modes (Windows' display settings, or HOS_DISPLAY_MODES=1920x1080,2560x1080,... for a run) become the sizes
    offered: each side rounded down to a multiple of 8, as host/nn_applet.c takes an output size, only those it accepts
-   (hos_output_size_valid: 640 x 360 up to 5120 x 2880's pixels, 5:4 to 48:9), each once, by width then height. Their shapes
+   (hos_output_size_valid: 640 x 360 up to 7680 x 2160's pixels, 5:4 to 48:9), each once, by width then height. Their shapes
    are named as screens are sold (16:9, 21:9, 16:10, 4:3...) so the Aspect ratio row groups them. */
 #pragma once
 

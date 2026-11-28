@@ -9,3 +9,9 @@ profile
 
 # launcher_startup: progress and window handoff for launcher-managed Play and Reload.
 launcher_startup
+
+# Packaged assets, configuration and diagnostics have distinct directories.
+organized_build
+
+# Play resolves installation settings and a launcher profile ID beside the builder.
+managed_profile_id

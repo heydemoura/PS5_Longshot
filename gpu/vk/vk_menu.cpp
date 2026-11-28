@@ -200,6 +200,11 @@ unsigned upscalers_available() {
 }
 /// (FSR 3.1 has inputs of its own; DLSS, FSR 4 and XeSS run on the frame chain they share, temporal_mode; Off is neither)
 int upscaler() { return fsr3_wanted() ? (int)ur::FSR3 : temporal_off() ? (int)ur::OFF : temporal_mode(); }
+/// (longshot) Under NVIDIA Streamline a change of the Upscaler to another than DLSS or DLAA waits for the restart (vk_temporal.h
+/// temporal_row): the row says After restart, and shows and steps from the value chosen, while what runs (upscaler) and the
+/// rows that follow it stay as they are until then
+bool upscaler_waits() { return temporal_row() != opts.dlss; }
+int upscaler_row() { return upscaler_waits() ? opts.dlss : upscaler(); }
 bool dlss5_offered() { return dlss_nr_offered(); }   // (vk_dlss.cpp: its DLL looked for once a run)
 bool dlss5_model_offered() { return dlss_nr_model_offered(); }   // (vk_dlss.cpp: an RTX 50 with both of DLSS 5's files)
 namespace {   // (#1633: the anonymous namespace again, after what the modules ask)
@@ -1291,7 +1296,7 @@ void set_row(Row& r, int v, int dir, bool keep = true) {
     if (r.setting && r.setting->step_fn && dir && v == *r.value + dir * r.step) v = r.setting->step_fn(*r.value, dir);
     // (the scaling rows: only what can run here; the Render resolution row through the Upscaler's own ascending fixed stops)
     // (the Upscaler by engine; the Render resolution's Native is the engine's full-size form: upscaler_rows.h)
-    if (r.value == &opts.dlss) v = ur::step_engine(upscaler(), dir, upscalers_available());
+    if (r.value == &opts.dlss) v = ur::step_engine(upscaler_row(), dir, upscalers_available());
     if (r.value == &opts.resolution) {
         int up = upscaler(), res = *r.value;
         if (dir) {
@@ -1540,7 +1545,7 @@ const char* output_field_apply() {
         if (!size_text(output_field.text, &w, &h)) return "Type the width, an x, then the height: 3440x1440.";
         w &= ~7u, h &= ~7u;
         if (!hos_output_size_valid(w, h))
-            return "Not a size the game can draw: at least 640x360, at most 5120x2880's pixels, from 5:4 to 48:9 in shape.";
+            return "Not a size the game can draw: at least 640x360, at most 7680x2160's pixels, from 5:4 to 48:9 in shape.";
     }
     if (request_native_preview({w, h}, true)) {
         output_field_show();
@@ -2427,7 +2432,7 @@ void bug_report_save() {
     in.version = LONGSHOT_VERSION;
     in.gpu = device_report_text();
     in.options = changed_rows_text(in.pc_options);
-    in.game_dir = game_folder_path();   // (its logs/ and bug-reports/: vk_paths.h)
+    in.game_dir = game_folder_path() + (organized_game() ? "diagnostics/" : "");   // (its logs/ and bug-reports/: vk_paths.h)
     in.log = [](const char* line) { logf("%s", line); };
     in.ask_picture = bug_report_picture;
     logf("menu: bug report asked for");
@@ -4384,6 +4389,7 @@ void menu_init() {
     first_start = !has_options;
     sim_turf_settings_init();
     menu_colour_vision_changed(opts.colour_vision);
+    menu_antilag_changed(opts.antilag);
     menu_sync_hud_placement();
     sync_transition_autosave();
     grass_distance_now.store(opts.grass_distance, std::memory_order_relaxed);
@@ -5854,6 +5860,7 @@ void menu_tick() {
         }
     }
     fps_level_now.store(fps_stats::level_of(opts.show_fps), std::memory_order_relaxed);   // (what vk_fps.cpp measures)
+    menu_antilag_changed(opts.antilag);   // (what vk_antilag.cpp reads across presentation threads)
     if (opts.show_fps) {
         static int64_t next = 0, last_game = 0, last_shown = 0;
         const int64_t now = prof_now();

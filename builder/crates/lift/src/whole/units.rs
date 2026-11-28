@@ -106,6 +106,20 @@ pub fn plan(
     base: &str,
     key_of: &dyn Fn(u64) -> String,
 ) -> Vec<Unit> {
+    plan_with(functions, hot, cold, sizing, base, key_of, &|_| None)
+}
+
+/// [`plan`], each hot unit's key also holding `hot_unit(its functions)` where that is `Some`: an option that changes
+/// the hot units' IR alone ([`super::LiftOptions::fp_nan_mid`]) is in their keys, not in every unit's.
+pub fn plan_with(
+    functions: &[(u64, u64)],
+    hot: &BTreeSet<u64>,
+    cold: &BTreeSet<u64>,
+    sizing: Sizing,
+    base: &str,
+    key_of: &dyn Fn(u64) -> String,
+    hot_unit: &dyn Fn(&[u64]) -> Option<String>,
+) -> Vec<Unit> {
     let (mut regular, mut hots, mut colds) = (Vec::new(), Vec::new(), Vec::new());
     for &(e, n) in functions {
         let list = if hot.contains(&e) {
@@ -128,6 +142,11 @@ pub fn plan(
             k.text("base", base).text("unit", &name);
             for &e in &functions {
                 k.part("entry", &e.to_le_bytes()).text("function", &key_of(e));
+            }
+            if prefix == "lifted_hot"
+                && let Some(text) = hot_unit(&functions)
+            {
+                k.text("hot options", &text);
             }
             units.push(Unit { name, functions, cost, key: k.hex() });
         }

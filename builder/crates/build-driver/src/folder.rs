@@ -253,7 +253,7 @@ pub fn after_swap(out: &Path, remove: &[String], romfs_dir: crate::stages::Romfs
 pub fn index_removals(out: &Path, remove: &[String], romfs_dir: crate::stages::RomfsDir) -> Vec<String> {
     let mut gone = Vec::new();
     for rel in remove.iter().filter(|r| fsx::relative_ok(r)) {
-        let p = out.join(rel);
+        let p = build_core::game_layout::data(out).join(rel);
         if p.is_file() && std::fs::remove_file(&p).is_ok() {
             gone.push(rel.clone());
         }
@@ -627,7 +627,7 @@ fn writable(mut p: std::fs::Permissions) -> std::fs::Permissions {
 
 /// The language a game folder was built in: the code line of its language.txt.
 pub fn folder_language(out: &Path) -> Option<&'static str> {
-    let text = std::fs::read_to_string(out.join("language.txt")).ok()?;
+    let text = std::fs::read_to_string(build_core::game_layout::config(out).join("language.txt")).ok()?;
     text.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
@@ -650,7 +650,11 @@ pub fn language_text(code: &str) -> String {
 
 /// The game folder's `longshot_options.ini`, which the game's menu also writes.
 pub fn options_path(out: &Path) -> PathBuf {
-    out.join("longshot_options.ini")
+    if build_core::game_layout::organized(out) {
+        out.join("config/build.ini")
+    } else {
+        out.join("longshot_options.ini")
+    }
 }
 
 const COMPILE_KEY: &str = "compile_shaders";

@@ -55,7 +55,7 @@ LAYOUT = (
     ("config", "dev_build.json and job_queue.json: your settings for dev.py's builds and the queue"),
     ("builder-cache", "longshot-builder's per-user cache for every dev build (LONGSHOT_CACHE: runtimes, sources, tools), not a player's"),
     ("work", "`mise run build`'s work folders, one per checkout (work-windows: the Windows game built on Linux)"),
-    ("sdk", "the vendors' SDKs scripts/fetch.py downloads: ngx-linux, ngx-windows, ffx, xess"),
+    ("sdk", "the vendors' SDKs scripts/fetch.py downloads: ngx-linux, ngx-windows, ffx, xess, sl"),
     ("runs", "game runs' output: longshot_ctl.py's control runs, memtour.py's, cover.py's"),
     ("update", "`dev.py update`'s worktree, work folder, backups of the game folder and history"),
     ("tools", "tools the checks and profiling use: glslang, Tracy's capture tools"),

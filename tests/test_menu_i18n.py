@@ -192,7 +192,7 @@ class MenuI18nTests(unittest.TestCase):
             "2560x1600. Each side is rounded down to a multiple of 8; a size the Output resolution offers is chosen there. Empty: "
             "none. Docked only. Applies after a restart.",
             "Type the width, an x, then the height: 3440x1440.",
-            "Not a size the game can draw: at least 640x360, at most 5120x2880's pixels, from 5:4 to 48:9 in shape.",
+            "Not a size the game can draw: at least 640x360, at most 7680x2160's pixels, from 5:4 to 48:9 in shape.",
             "None", "Edit", "Paste", "Done", "Cancel", "Caret", "Character", "Add", "Remove",
         )
         self.assertEqual(len(self.tables), 13)

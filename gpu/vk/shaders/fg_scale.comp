@@ -18,7 +18,14 @@ const float kSteps = 255.0;
 // (side 1) or black (side 2), with a short soft edge; vk_framegen.cpp wide_sides. Side 3: this dispatch makes the picture at
 // 1/8 for side 1's blur instead, into dst; side 1 then reads it as small)
 layout(binding = 2) uniform sampler2D small;
-layout(push_constant) uniform P { int mode; float sharp; float x0; float x1; int side; } pc;
+layout(push_constant) uniform P { int mode; float sharp; float x0; float x1; int side; int crop_x; int crop_y; int crop_w; int crop_h; } pc;
+// Map crop-normalized UVs [0, 1] into full-texture UVs clamped strictly to the crop's texel centers so
+// bilinear sampling never bleeds across padding outside the crop rectangle.
+vec2 crop_uv(vec2 uv) {
+    const vec2 org = vec2(pc.crop_x, pc.crop_y);
+    const vec2 ext = vec2(pc.crop_w, pc.crop_h);
+    return clamp(org + uv * ext, org + 0.5, org + ext - 0.5) / vec2(textureSize(src, 0));
+}
 const float PI = 3.14159265;
 float lanczos2(float x) {
     x = abs(x);
@@ -43,19 +50,20 @@ float reach() { return pc.mode == 0 ? 1.0 : 2.0; }
 // again past that, a mip chain first if anyone plays a 5K picture in a quarter-size window
 const float kMaxStretch = 4.0;
 vec3 filtered(vec2 uv) {
-    const vec2 size = vec2(textureSize(src, 0));
+    const vec2 size = vec2(pc.crop_w, pc.crop_h);
     const vec2 s = clamp(size / vec2(imageSize(dst)), vec2(1.0), vec2(kMaxStretch));
-    if (pc.mode == 0 && s == vec2(1.0)) return textureLod(src, uv, 0.0).rgb;
+    if (pc.mode == 0 && s == vec2(1.0)) return textureLod(src, crop_uv(uv), 0.0).rgb;
     const vec2 p = uv * size - 0.5;
     // (at stretch 1: the 4 x 4 around p for Catmull-Rom and Lanczos, as before)
     const ivec2 lo = ivec2(floor(p - reach() * s)) + 1, hi = ivec2(floor(p + reach() * s));
+    const ivec2 crop_lo = ivec2(pc.crop_x, pc.crop_y), crop_hi = crop_lo + ivec2(pc.crop_w, pc.crop_h) - 1;
     vec3 sum = vec3(0.0);
     float weight = 0.0;
     for (int y = lo.y; y <= hi.y; y++) {
         const float wy = kernel((float(y) - p.y) / s.y);
         for (int x = lo.x; x <= hi.x; x++) {
             const float w = kernel((float(x) - p.x) / s.x) * wy;
-            sum += w * texelFetch(src, clamp(ivec2(x, y), ivec2(0), ivec2(size) - 1), 0).rgb;
+            sum += w * texelFetch(src, clamp(crop_lo + ivec2(x, y), crop_lo, crop_hi), 0).rgb;
             weight += w;
         }
     }
@@ -105,7 +113,7 @@ void main() {
         const vec2 block = 1.0 / vec2(d);   // (one pixel of dst: 8 x 8 of the picture)
         vec3 sum = vec3(0.0);
         for (int y = 0; y < 4; y++)
-            for (int x = 0; x < 4; x++) sum += textureLod(src, uv + (vec2(x, y) - 1.5) * 0.25 * block, 0.0).rgb;
+            for (int x = 0; x < 4; x++) sum += textureLod(src, crop_uv(uv + (vec2(x, y) - 1.5) * 0.25 * block), 0.0).rgb;
         imageStore(dst, g, vec4(sum / 16.0, 1.0));
         return;
     }
@@ -124,9 +132,9 @@ void main() {
         // The neighbours one picture pixel away (one window pixel when the window is the smaller). They were one window
         // pixel away, a fraction of a picture pixel when the window is larger (0.53 for 2048 x 1152 on a 3840 x 2160
         // screen): what the slider did then hung on the window's size, not on the picture.
-        const vec2 e = max(1.0 / vec2(textureSize(src, 0)), 1.0 / vec2(d));
-        const vec3 n = textureLod(src, uv + vec2(0.0, -e.y), 0.0).rgb, s = textureLod(src, uv + vec2(0.0, e.y), 0.0).rgb;
-        const vec3 w = textureLod(src, uv + vec2(-e.x, 0.0), 0.0).rgb, r = textureLod(src, uv + vec2(e.x, 0.0), 0.0).rgb;
+        const vec2 e = max(1.0 / vec2(pc.crop_w, pc.crop_h), 1.0 / vec2(d));
+        const vec3 n = textureLod(src, crop_uv(uv + vec2(0.0, -e.y)), 0.0).rgb, s = textureLod(src, crop_uv(uv + vec2(0.0, e.y)), 0.0).rgb;
+        const vec3 w = textureLod(src, crop_uv(uv + vec2(-e.x, 0.0)), 0.0).rgb, r = textureLod(src, crop_uv(uv + vec2(e.x, 0.0)), 0.0).rgb;
         c = sharpen(c, n, s, w, r, pc.sharp);
     }
     if (outside > 0.0) c = mix(c, pc.side == 2 ? vec3(0.0) : side_fill(uv) + dither(g), outside);

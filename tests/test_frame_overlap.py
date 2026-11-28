@@ -110,7 +110,7 @@ def check_source():
         need(word not in sig, "the frame ahead counters change what is recorded or submitted: " + word)
 
     # (the presenter thread: the swapchain is one thread's at a time)
-    image = block(replay, "void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view, bool source_srgb, bool allow_scale, OutputTrialSource trial) {")
+    image = block(replay, "void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view,\n                              bool source_srgb, bool allow_scale, OutputTrialSource trial, VkFormat framegen_format) {")
     need(image.rindex("present_thread_drain();", 0, image.index("vkAcquireNextImageKHR(")) > image.index("frame_index = (slot + 1) % slots;"),
          "present_image acquires the next image while the presenter thread may still present the last")
     copy = block(replay, "bool presenter_wait_copy(VkFence done) {")

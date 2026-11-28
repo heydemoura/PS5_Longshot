@@ -87,7 +87,8 @@ std::vector<display_modes::Size> screen_modes() {
 constexpr Out kOutputs[] = {{2048, 1152}, {2560, 1440}, {3840, 2160}, {1920, 1080}, {5120, 1440}, {5120, 2880}};
 Out outputs_screen{0, 0};   // (the window's screen's size the choices were read for: outputs_follow_screen)
 /// A screen's own size among the modes, and its shape at the most pixels a picture of another shape takes when the size itself
-/// is past what the game accepts: a 7680x2160 32:9 screen gets 6256x1760, so its shape is still offered
+/// is past what the game accepts: a 7680x4320 screen is offered scaled down, so its shape is still offered. A 7680x2160
+/// 32:9 screen is itself a size the game takes (hos_output_size_valid)
 void add_screen_size(std::vector<dm::Size>& modes, uint32_t sw, uint32_t sh) {
     modes.push_back({sw, sh});
     unsigned w = 0, h = 0;
@@ -145,7 +146,7 @@ int output_choice_of(uint32_t w, uint32_t h) {
     return custom_index();
 }
 /// output_res= (or HOS_OUTPUT_RES) to a choice: "<width>x<height>" (each side a multiple of 8, rounded down; at least 640 x 360,
-/// at most 5120 x 2880's pixels, 5:4 to 48:9), one of the sizes offered or the player's own (custom_output); the numbers saved
+/// at most 7680 x 2160's pixels, 5:4 to 48:9), one of the sizes offered or the player's own (custom_output); the numbers saved
 /// before (0 to 5: 2048x1152, 2560x1440, 3840x2160, 1920x1080, 5120x1440, 5120x2880) as those sizes; anything else the game's
 /// own (host/nn_applet.c hos_output_parse: the same rules)
 int parse_output(const char* text) {
@@ -292,8 +293,9 @@ int output_for_aspect(int v) {
     return i < 0 ? opts.output_res : output_ids()[i];
 }
 /// The picture an Output resolution choice makes: a size not 16:9 (the Aspect ratio row's 21:9, 16:10, 4:3...) takes its own
-/// shape; a 16:9 one, at the monitor's own Aspect ratio, the screen's. Both keep at most hos_wide_max_px() pixels, matching
-/// host/hos_main.c at startup (host/hos_wide_size.h); otherwise the 16:9 output. The game's own choice (0) as the game draws it,
+/// shape; a 16:9 one, at the monitor's own Aspect ratio, the screen's. Both keep at most hos_wide_max_px() pixels, unless the
+/// choice is already that shape and a size the game accepts (7680x2160), matching host/hos_main.c at startup
+/// (host/hos_wide_size.h hos_wide_picture); otherwise the 16:9 output. The game's own choice (0) as the game draws it,
 /// its 2048x1152 widened the same way (2728x1152 at a 5120x2160 screen's 21:9). *native: the screen's own size
 Out picture_for(int v, bool* native) {
     v = output_choice(v);
@@ -309,7 +311,7 @@ Out picture_for(int v, bool* native) {
         const double game = 16.0 / 9.0;
         if (want > game * 1.01 || (want > 1.0 && want < game * 0.99)) {
             unsigned w = 0, h = 0;
-            hos_wide_size(o.h, hos_wide_clamp(want), hos_wide_max_px(), &w, &h);
+            hos_wide_picture(o.w, o.h, hos_wide_clamp(want), hos_wide_max_px(), &w, &h);
             o = Out{w, h};
         }
     }

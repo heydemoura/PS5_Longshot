@@ -247,6 +247,60 @@ inline bool parse_decimal(const char* text, double hi, double& out) {
     return true;
 }
 
+/// A queue's global priority (VkQueueGlobalPriorityKHR), as the rules hold it: 0 none asked, the driver's own. Asked by
+/// RX_VK_QUEUE_PRIORITY for the replay's queue and RX_VK_PRESENT_QUEUE_PRIORITY for the presents' own (vk_main.cpp
+/// create_device)
+constexpr uint32_t kPriorityLow = VK_QUEUE_GLOBAL_PRIORITY_LOW_KHR, kPriorityMedium = VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR,
+                   kPriorityHigh = VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR, kPriorityRealtime = VK_QUEUE_GLOBAL_PRIORITY_REALTIME_KHR;
+/// Its name, for the log and the switch: none for 0
+inline const char* queue_priority_name(uint32_t level) {
+    return level == 0                   ? "none"
+           : level == kPriorityLow      ? "low"
+           : level == kPriorityMedium   ? "medium"
+           : level == kPriorityHigh     ? "high"
+           : level == kPriorityRealtime ? "realtime"
+                                        : "?";
+}
+/// A global priority switch's value: a level's name (any case, spaces around it not counted) asks that level, an off word
+/// (env_value_off) none, 0. false for anything else, which the caller ignores and says so
+inline bool parse_queue_priority(const char* text, uint32_t& out) {
+    if (!text || !*text) return false;
+    if (env_value_off(text)) {
+        out = 0;
+        return true;
+    }
+    const char* a = text;
+    while (*a == ' ' || *a == '\t') a++;
+    const char* b = a + std::strlen(a);
+    while (b > a && (b[-1] == ' ' || b[-1] == '\t' || b[-1] == '\r' || b[-1] == '\n')) b--;
+    for (const uint32_t level : {kPriorityLow, kPriorityMedium, kPriorityHigh, kPriorityRealtime}) {
+        const char* const w = queue_priority_name(level);
+        size_t k = 0;
+        while (a + k < b && w[k] && (char)(a[k] | 0x20) == w[k]) k++;
+        if (a + k == b && !w[k]) {
+            out = level;
+            return true;
+        }
+    }
+    return false;
+}
+/// The family's gate: whether a level may be asked of a queue's family. It may where the family lists it (levels, count:
+/// VkQueueFamilyGlobalPriorityPropertiesKHR's priorities and priorityCount, read no further than the list's room), or where
+/// the driver gives no list (levels null: VK_EXT_global_priority without VK_EXT_global_priority_query). Asked unlisted, a
+/// level the driver refuses makes the device fail, and create_device makes it again without it
+inline bool queue_priority_listed(uint32_t level, const VkQueueGlobalPriorityKHR* levels, uint32_t count) {
+    if (!levels) return true;
+    for (uint32_t i = 0; i < count && i < VK_MAX_GLOBAL_PRIORITY_SIZE_KHR; i++)
+        if ((uint32_t)levels[i] == level) return true;
+    return false;
+}
+/// Whether vkCreateDevice's result, with a level asked, is the level refused, as the spec gives it: VK_ERROR_NOT_PERMITTED_KHR
+/// (no privilege for it) or VK_ERROR_INITIALIZATION_FAILED (no resources for it, or a level the family does not list). Any
+/// other failure may have another cause; create_device makes the device again without the level either way, and says which
+inline bool queue_priority_refused(VkResult made) {
+    return made == VK_ERROR_NOT_PERMITTED_KHR || made == VK_ERROR_INITIALIZATION_FAILED;
+}
+
 }  // namespace policy_rule
 
 /// The fields a switch can set (device_policy_env), for DevicePolicy::set and the log's mark
@@ -442,6 +496,11 @@ struct DevicePolicy {
     // Steam Deck and an RX 9060 XT); a test shader on the device then says which is used. RX_VK_MMA_UNROLL. Site
     // (vk_coopmat.cpp), step 7
     bool mma_unroll_try = false;
+    // RADV: the software matrix multiplies' B through a workgroup memory tile a subgroup instead of 16 shuffles (measured on the
+    // Steam Deck, where the shuffles are ds_bpermute_b32 through the LDS anyway), where compute subgroups can be pinned to 32
+    // lanes (sg32_stages: not GCN's, nor Vega's) and are full and a test shader on the device gives the shuffles' words. RX_VK_MMA_STAGE_B. Site (vk_coopmat.cpp
+    // software_stage_b_wanted, choose_staged_b), step 7
+    bool mma_stage_b_try = false;
     // Mesa's Intel driver, with dynamic indexing of storage buffer arrays: the tables searched in loops, as Mesa inlines
     // the written-out form (Windows not tried). RX_VK_GM_LOOP. Site (vk_coopmat.cpp table_loop_wanted), step 7
     bool global_table_loop = false;
@@ -455,6 +514,10 @@ struct DevicePolicy {
     // Adrenalin 26.10.1). RX_VK_FSR4_TUNE can only turn it off: it rewrites AMD's shaders for AMD's GPUs. Read (vk_fsr4.cpp
     // tune::on)
     bool fsr4_tune = false;
+    // AMD's older Windows shader compiler (RDNA 1 and 2, as nan_bits): FSR 4's folded passes may build with 1 GiB of memory to
+    // spare, not 8. Their compile memory (<60 MB each) was measured on this compiler, on an RX 6700 XT; other compilers keep
+    // 8 GiB until it is measured there. Read (vk_fsr4.cpp build_want)
+    bool fsr4_compact_builds = false;
     // The Steam Deck's own APU: its peak clock state while its power level is auto, which the site reads later (+8% to
     // +46% for about 4 W). RX_VK_GPU_CLOCK. Site (gpu_clock.h, vk_gpu_clock.cpp), step 2
     bool gpu_clock_peak = false;
@@ -637,9 +700,12 @@ inline DevicePolicy device_policy(const DeviceFacts& f) {
     // (corrected: GCN by the one definition, radv_gcn. To go back: f.radv() && !(f.sg32_stages == 0 && f.subgroup_size > 32))
     p.batch_submits = f.radv() && !f.radv_gcn() && !(f.rdna4() && f.discrete());
     p.mma_unroll_try = f.radv() || (f.rdna4() && f.driver_id == VK_DRIVER_ID_AMD_PROPRIETARY);
+    p.mma_stage_b_try = f.radv() && (f.sg32_stages & VK_SHADER_STAGE_COMPUTE_BIT);
     p.global_table_loop = f.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA && f.storage_buffer_array_dynamic_indexing;
     p.occ_copy = f.driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && f.discrete();
     p.fsr4_tune = f.amd();
+    p.fsr4_compact_builds = f.windows && f.driver_id == VK_DRIVER_ID_AMD_PROPRIETARY && f.driver_info &&
+                            std::strstr(f.driver_info, "proprietary shader compiler");
     p.gpu_clock_peak = f.amd() && f.deck_apu();
     p.readback_late_newest = f.handheld();
     p.acquire_ahead = true;   // (every driver; not under frame generation or FIFO: vk_replay.cpp acquire_ahead_wanted)
@@ -863,10 +929,12 @@ template <class Line> void device_policy_log(const DevicePolicy& p, const Device
         l.flag("mesh_shared_warp_default", p.mesh_shared_warp);
         l.flag("batch_submits", p.batch_submits, p.set(Sw::batch_submits));
         l.flag("mma_unroll_try", p.mma_unroll_try);
+        l.flag("mma_stage_b_try", p.mma_stage_b_try);
         l.flag("global_table_loop", p.global_table_loop);
         l.flag("occ_copy", p.occ_copy, p.set(Sw::occ_copy), "101.9154");
         l.flag("intel_side_by_side_auto", p.intel_side_by_side_auto, false, "101.9154");
         l.flag("fsr4_tune", p.fsr4_tune, p.set(Sw::fsr4_tune));
+        l.flag("fsr4_compact_builds", p.fsr4_compact_builds);
         l.flag("gpu_clock_peak", p.gpu_clock_peak);
         l.flag("readback_late_newest", p.readback_late_newest);
         l.flag("acquire_ahead", p.acquire_ahead, p.set(Sw::acquire_ahead));

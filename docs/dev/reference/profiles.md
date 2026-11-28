@@ -14,8 +14,12 @@ game's paths are [`host/longshot_profile.h`](../../../host/longshot_profile.h).
 <profile>/
   profile.json          which profile it is (below)
   settings.ini          the game's settings (longshot_options.ini's lines)
+  longshot_env.txt      optional game switches shared across builds
   saves/                the saves alone: save/<uid>/slot_NN/, save-work/
 ```
+
+When the profile has no `longshot_env.txt`, the game reads the build's `config/longshot_env.txt`
+(or `longshot_env.txt` at the build root in older layouts). See [switch precedence](switches.md#how-the-game-reads-them).
 
 A launcher names the folders and keeps which one is current in its own settings; the builder's default profile is
 `$XDG_DATA_HOME/longshot/profiles/default` on a fresh Linux installation (usually under `~/.local/share`). Fresh Windows installs use `%LOCALAPPDATA%\Longshot\data\profiles\default`. A marked portable launcher shares `Longshot/data/profiles/default` with its version executables. Standalone versions keep previously populated `profile/` directories. Nothing else of the game's goes in the profile:
@@ -99,3 +103,12 @@ itself, `mods/`, `saves/save`, `saves/save-work`) and tries each for writing. On
 the `profile_unwritable` error (an event with `--output json`, a message box with `--output user`, exit status 121) names
 the folder and why, and the game is not started. A saves folder the game still can't use is a plain fatal error of the
 game's, never a fall back to another profile's saves.
+
+### Launcher-managed installations
+
+Steam starts the builder in the chosen installation with `play --profile-id <id>`.
+The launcher writes `launcher-instance.json` beside that executable. Format 1 records
+the absolute `profiles` and `cache` directories and the installation’s `upscalers`
+array. Managed play reads these on every start and leaves builder updates to the
+launcher. The profile directory supplies the game source, saves and player settings.
+Standalone builders continue to accept a profile directory via `--profile`.

@@ -77,7 +77,7 @@ void hos_options_choose(void) {
         put("", settings, NULL);   /* (absolute: the builder gives it so) */
         return;
     }
-    if (game_folder(game, sizeof game)) put(game, options_name, NULL);   /* (beside the game, as before) */
+    if (game_folder(game, sizeof game)) put(game, hos_organized_build() ? "config/settings.ini" : options_name, NULL);   /* (beside the game, as before) */
 }
 
 const char *hos_options_file(void) { return file; }
@@ -106,7 +106,7 @@ void hos_options_carry(void) {
     if (!file[0] || GetFileAttributesA(file) != INVALID_FILE_ATTRIBUTES) return;
     char from[HOS_PATH_CAP];
     const size_t g = game_folder(from, sizeof from);
-    if (!g || snprintf(from + g, sizeof from - g, "%s", options_name) >= (int)(sizeof from - g)) return;
+    if (!g || snprintf(from + g, sizeof from - g, "%s", hos_organized_build() ? "config/settings.ini" : options_name) >= (int)(sizeof from - g)) return;
 #ifdef _WIN32
     if (!_stricmp(from, file)) return;   /* (beside the game: the file is already where it is read) */
 #else

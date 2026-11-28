@@ -74,7 +74,12 @@ typedef struct {
     void *dev; nvn_texdesc d; nvn_pool *pool; int64_t off;
     uint8_t has_layout, layout[8];
     uint64_t pkg_data;                    /* SetPackagedTextureData (guest address): copied into the storage at Initialize */
+    /* (longshot) the scene format's answer for this description (host/scene_format.h): what the size and alignment were
+       answered with is what the texture is made in, though the tone mapper changes between (nvn_native.c made_desc) */
+    uint32_t scene_key;                   /* the description's hash it was answered for */
+    uint8_t scene_set, scene_on;          /* answered; RGBX16F */
 } nvn_tex_builder;
+NVN_FITS(nvn_tex_builder, NVNtextureBuilder);
 typedef struct {
     uint32_t magic; nvn_texdesc d; uint8_t has_layout, layout[8];
     uint8_t output_preview;               /* 1–3 for preview slots, 0 for regular textures */

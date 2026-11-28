@@ -5,7 +5,8 @@
    default, both ways and up and down. The menus are not moved (on a narrower screen they are drawn smaller to fit), except
    with the Ultrawide menus row at Extended (HOS_OPT_WIDE_MENUS, 102) on a wider screen: their layouts are planned as the
    HUD's are, by the screen's whole extra width, with the pause menu's pages spaced wider apart and its background drawn in
-   three pieces (hos_wide_ui_bg), and the lists kept at the screen's width widened as they are built (hos_wide_ui_built).
+   three pieces (hos_wide_ui_bg), and the lists kept at the screen's width widened as their engines are set up
+   (hos_wide_ui_list_setup: before they count their item slots) and as they are built (hos_wide_ui_built).
 
    The game's 2D layouts keep their panes in an array (the layout's +0x100, 0xb0 bytes each). f_8154cab0 makes a pane's
    final 3x4 transform (+0x28, the translation at +0x4c) from its own position, scale and rotation and its parent's
@@ -41,6 +42,7 @@ extern volatile float hos_wide_ratio;
 enum {
     LAYOUT_RES = 0xf8, RES_NAME = 0x18, RES_PANE_NAMES = 0x20,   /* (the layout file's UIL header: its name, its panes') */
     LAYOUT_PANES = 0x100, LAYOUT_COUNT = 0x13c, PANE_SIZE = 0xb0,
+    LIST_OWNER = 0x10, LIST_PANE = 0x28, OWNER_LAYOUT = 0x60,   /* (a list's engine: its owner, its pane's index; the owner's layout) */
     PANE_LAYOUT = 0x18, PANE_XX = 0x28, PANE_YY = 0x38, PANE_X = 0x4c, PANE_Y = 0x50, PANE_W = 0x58, PANE_H = 0x5c,
     PANE_FLAGS = 0xa8,
     PANE_TYPE_NULL = 0, PANE_TYPE_SCISSOR = 4, PANE_TYPE_CAPTURE = 5, PANE_TYPE_PART = 6, PANE_TYPE_HOST = 7,   /* (7: holds other layouts, a list) */
@@ -1525,6 +1527,23 @@ void hos_wide_ui_size(Ctx *c, uint64_t pane) {
     ui_unlock();
 }
 
+/* Pane i of a layout, a list kept at the screen's width, widened now (once: what an earlier call widened is put back
+   first). 0 when no node is left for it. Under ui_lock, with ui_menus on */
+static int widen_kept_list(Ctx *c, uint64_t layout, uint64_t pane) {
+    if ((((uint32_t)recomp_load32(c, pane + PANE_FLAGS) >> 22) & 0xf) != PANE_TYPE_HOST) return 1;
+    Node probe = {0};
+    classify(&probe, pane, layout);
+    if (probe.rule != RULE_KEEP_WIDE) return 1;
+    Node *n = node_take(pane);
+    if (!n) return 0;
+    restore_width(c, n, pane);
+    classify(n, pane, layout);
+    n->layout = layout, n->type = PANE_TYPE_HOST, n->wide = ui_mwx;
+    n->size_game = load_f(c, pane + PANE_W), n->size_set = n->size_game * n->wide;
+    store_f(c, pane + PANE_W, n->size_set);
+    return 1;
+}
+
 /* A layout's panes just built (f_81545d60 returned, the layout x19): a list kept at the screen's width is widened now. It
    lays out its items by its width as it opens, before it is first placed: widened only then, its items stayed where the
    16:9 width put them, one item off the selection, until the selection moved */
@@ -1534,20 +1553,25 @@ void hos_wide_ui_built(Ctx *c, uint64_t layout) {
     if (!ui_menus) { ui_unlock(); return; }
     const uint64_t base = recomp_load64(c, layout + LAYOUT_PANES);
     const uint32_t count = (uint32_t)recomp_load32(c, layout + LAYOUT_COUNT) & 0xffff;
-    for (uint32_t i = 0; base && i < count; i++) {
-        const uint64_t pane = base + (uint64_t)i * PANE_SIZE;
-        if ((((uint32_t)recomp_load32(c, pane + PANE_FLAGS) >> 22) & 0xf) != PANE_TYPE_HOST) continue;
-        Node probe = {0};
-        classify(&probe, pane, layout);
-        if (probe.rule != RULE_KEEP_WIDE) continue;
-        Node *n = node_take(pane);
-        if (!n) { ui_unlock(); return; }
-        restore_width(c, n, pane);
-        classify(n, pane, layout);
-        n->layout = layout, n->type = PANE_TYPE_HOST, n->wide = ui_mwx;
-        n->size_game = load_f(c, pane + PANE_W), n->size_set = n->size_game * n->wide;
-        store_f(c, pane + PANE_W, n->size_set);
-    }
+    for (uint32_t i = 0; base && i < count; i++)
+        if (!widen_kept_list(c, layout, base + (uint64_t)i * PANE_SIZE)) break;
+    ui_unlock();
+}
+
+/* A list's engine about to be set up (f_8151eb00, the engine x19; its layout at [[engine + 0x10] + 0x60], its own pane's
+   index at engine + 0x28): a list kept at the screen's width is widened now, before the layout is built. The engine
+   counts its item slots here from its pane's width, once: counted at 16:9, the item quick select's carousel kept 10
+   slots, and with every slot holding an item on screen, the items past them on a wider screen got none and were not
+   drawn (the right side cut off as the selection moved right) */
+void hos_wide_ui_list_setup(Ctx *c, uint64_t engine) {
+    if (!engine || !__atomic_load_n(&menus_fast, __ATOMIC_ACQUIRE)) return;
+    const uint64_t owner = recomp_load64(c, engine + LIST_OWNER);
+    const uint64_t layout = owner ? recomp_load64(c, owner + OWNER_LAYOUT) : 0;
+    const uint64_t base = layout ? recomp_load64(c, layout + LAYOUT_PANES) : 0;
+    const uint32_t i = (uint32_t)recomp_load32(c, engine + LIST_PANE);
+    if (!base || i >= ((uint32_t)recomp_load32(c, layout + LAYOUT_COUNT) & 0xffff)) return;
+    ui_lock();
+    if (ui_menus) widen_kept_list(c, layout, base + (uint64_t)i * PANE_SIZE);
     ui_unlock();
 }
 

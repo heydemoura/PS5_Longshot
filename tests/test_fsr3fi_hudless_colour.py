@@ -9,8 +9,8 @@ around the HUD's see-through parts. The shader's own hudless_colour, compiled as
 pass takes the presented pixel whole where they differ (scripts/shaders.py FI_PATCHES, its own check:
 test_fsr3_shaders.py); hud_source tells the shader whether the picture is the native HDR one.
 
-fg_hud_comp_spv.h names the hash of the fg_hud.comp it was made from (its first line), checked with or without glslang; with
-glslangValidator the rest of the header is its output byte for byte, but for glslang's own version line. --write makes it.
+Both fg_hud_comp_spv.h and fg_hud_pq_comp_spv.h name their source hash. With glslangValidator the rest of each header is
+its output byte for byte, apart from glslang's version line. --write makes both variants.
 
 python -I -B tests/test_fsr3fi_hudless_colour.py [--cxx g++] [--glslang glslangValidator] [--write]
 """
@@ -29,23 +29,23 @@ RUN_ALL_ARGS = ["--cxx", "{cxx}", "--glslang", "{glslang}"]
 ROOT = Path(__file__).resolve().parents[1]
 SHADERS = ROOT / "gpu" / "vk" / "shaders"
 COMP = SHADERS / "fg_hud.comp"
-HEADER = SHADERS / "fg_hud_comp_spv.h"
-VAR = "FG_HUD_COMP_SPV"
+HEADERS = (("fg_hud_comp_spv.h", "FG_HUD_COMP_SPV", []),
+           ("fg_hud_pq_comp_spv.h", "FG_HUD_PQ_COMP_SPV", ["-DFG_NATIVE_PQ"]))
 
 
-def source_line():
+def source_line(var, defines):
     """the header's first line: the shader's hash (line ends as LF, as the checkout has them) and how the header is made"""
     digest = hashlib.sha256(COMP.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
     return ("// fg_hud.comp sha256 %s (tests/test_fsr3fi_hudless_colour.py --write: glslangValidator -V --target-env "
-            "vulkan1.3 --vn %s)\n" % (digest, VAR)).encode()
+            "vulkan1.3 %s--vn %s)\n" % (digest, "".join(d + " " for d in defines), var)).encode()
 
 
-def compile_header(glslang, out):
-    r = subprocess.run([glslang, "-V", "--target-env", "vulkan1.3", "--vn", VAR, "-o", str(out), str(COMP)],
+def compile_header(glslang, out, var, defines):
+    r = subprocess.run([glslang, "-V", "--target-env", "vulkan1.3", *defines, "--vn", var, "-o", str(out), str(COMP)],
                        capture_output=True, text=True)
     if r.returncode:
         raise SystemExit("fg_hud.comp does not compile:\n" + r.stdout + r.stderr)
-    return out.read_bytes()
+    return out.read_bytes().replace(b"\r\n", b"\n")
 
 
 def without_version(header):
@@ -119,20 +119,28 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--cxx", default="g++")
     p.add_argument("--glslang", default="glslangValidator")
-    p.add_argument("--write", action="store_true", help="make fg_hud_comp_spv.h from fg_hud.comp")
+    p.add_argument("--write", action="store_true", help="make the SDR and Native HDR headers from fg_hud.comp")
     a = p.parse_args()
     glslang = shutil.which(a.glslang)
     if a.write:
         if not glslang:
             raise SystemExit("--write needs %s" % a.glslang)
-        with tempfile.TemporaryDirectory(prefix="fg-hud-") as tmp:
-            HEADER.write_bytes(source_line() + compile_header(glslang, Path(tmp) / "out.h"))
-        print("wrote %s" % HEADER)
+    with tempfile.TemporaryDirectory(prefix="fg-hud-spv-") as tmp:
+        for name, var, defines in HEADERS:
+            header = SHADERS / name
+            notice = source_line(var, defines)
+            made = compile_header(glslang, Path(tmp) / "out.h", var, defines) if glslang else None
+            if a.write:
+                header.write_bytes(notice + made)
+                print("wrote %s" % header)
+                continue
+            first, _, rest = header.read_bytes().replace(b"\r\n", b"\n").partition(b"\n")
+            if first + b"\n" != notice or (made is not None and without_version(made) != without_version(rest)):
+                raise SystemExit(f"{name} was not made from this fg_hud.comp: "
+                                 "python -I -B tests/test_fsr3fi_hudless_colour.py --write")
+            print(f"{name}: verified against fg_hud.comp")
+    if a.write:
         return
-    first, _, rest = HEADER.read_bytes().partition(b"\n")
-    if first + b"\n" != source_line():
-        raise SystemExit("fg_hud_comp_spv.h was not made from this fg_hud.comp (its first line names another hash or "
-                         "command): python -I -B tests/test_fsr3fi_hudless_colour.py --write")
     text = COMP.read_text(encoding="utf-8")
     body = block(text, "void main()")
     if "imageStore(hudless, g, vec4(hudless_colour(scene, drawn, shown, pc.pq != 0), 1.0));" not in body:
@@ -154,14 +162,6 @@ def main():
         subprocess.run([a.cxx, "-std=c++20", "-O1", "-Wall", "-Wextra", "-Wno-unused-function", str(cpp), "-o", str(exe)],
                        check=True)
         subprocess.run([str(exe)], check=True)
-        if glslang:
-            made = compile_header(glslang, Path(tmp) / "out.h")
-            if without_version(made) != without_version(rest):
-                raise SystemExit("fg_hud_comp_spv.h is not glslang's output for fg_hud.comp: "
-                                 "python -I -B tests/test_fsr3fi_hudless_colour.py --write")
-            print("fg_hud_comp_spv.h: glslang's output for this fg_hud.comp")
-        else:
-            print("fg_hud_comp_spv.h: names this fg_hud.comp (no %s here to compile it)" % a.glslang)
 
 
 if __name__ == "__main__":

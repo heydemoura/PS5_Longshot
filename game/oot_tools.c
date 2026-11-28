@@ -69,6 +69,13 @@ void game_init(void) {
     hos_oot_heap_test_init();
     const char *protect_hearts = getenv("HOS_OOT_PROTECT_HEARTS");
     hos_oot_protect_hearts = protect_hearts && !strcmp(protect_hearts, "1");
+    void hos_oot_cloth_init(void);   /* (game/oot_cloth.c: HOS_NATIVE_CLOTH=check's sites, before the game's threads) */
+    hos_oot_cloth_init();
+}
+/* the game's last log lines at a close (game.h; host/hos_relaunch.c's hos_close_finish) */
+void game_close_log(void) {
+    void hos_oot_cloth_end(void);   /* (game/oot_cloth.c: HOS_CLOTH_DECLINES' last counts) */
+    hos_oot_cloth_end();
 }
 /* Trace the request before the save manager queues it. */
 int hos_oot_trace_save(Ctx *c) {

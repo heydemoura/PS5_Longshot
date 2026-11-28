@@ -260,6 +260,7 @@ void vkDestroySemaphore(int, VkSemaphore semaphore, void*) {
 }
 VkResult vkEndCommandBuffer(VkCommandBuffer) { return VK_SUCCESS; }
 VkFence present_copy_done = VK_NULL_HANDLE;
+struct { VkFence copy_fence = VK_NULL_HANDLE; } probe;   // (RX_VK_PRESENT_PROBE's: the presented image's copy)
 bool present_acquire_ahead = false;
 void present_finish(VkResult r, bool on_presenter) {   // (the presenter's: out of date or suboptimal asks for a new swapchain)
     if (on_presenter && (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)) resize_asked = true;
@@ -298,7 +299,7 @@ void presenter_run() {   // (the presenter thread's turn: the present handed ove
     std::unique_lock<std::mutex> lk(presenter.mu);
     if (!presenter.busy) return;
 @@LOOP_HEAD@@
-    (void)done, (void)reflex_id;
+    (void)done, (void)reflex_id, (void)antilag_id;
     (void)trial;
     presenter_presented = false;
     const bool copied = true;
@@ -312,7 +313,7 @@ bool present_out(uint32_t index, std::unique_lock<QueueLock>& qk, OutputTrialSou
     if (!qk.owns_lock()) problem("the present made without the queue's lock");
     if (!present_copy_done) problem("present_image's present without its copy's fence: not handed to the presenter");
     qk.unlock();
-    present_hand_off(index, present_copy_done, 0, {trial.generation});
+    present_hand_off(index, present_copy_done, 0, 0, {trial.generation});
     if (presenter.trial.generation != trial.generation) problem("trial receipt lost at hand-over");
     return true;
 }
@@ -615,8 +616,10 @@ int main() {
 
 BROKEN = [
     ("the ahead acquire made on the render thread at the hand-over, before the present",
-     "    present_out(index, qk, trial, preview_path);\n    present_copy_done = VK_NULL_HANDLE;\n    present_acquire_ahead = false;",
-     "    acquire_ahead(dev.swapchain, dev.swapchain_generation);\n    present_out(index, qk, trial, preview_path);\n    present_copy_done = VK_NULL_HANDLE;\n"
+     "    present_out(index, qk, trial, preview_path);\n    present_copy_done = probe.copy_fence = VK_NULL_HANDLE;\n"
+     "    present_acquire_ahead = false;",
+     "    acquire_ahead(dev.swapchain, dev.swapchain_generation);\n    present_out(index, qk, trial, preview_path);\n"
+     "    present_copy_done = probe.copy_fence = VK_NULL_HANDLE;\n"
      "    present_acquire_ahead = false;"),
     ("the hand-over not passing acquire ahead to the presenter",
      "presenter.ahead = present_acquire_ahead;",
@@ -699,7 +702,7 @@ def cut(text, start, end, what):
 
 
 def fixture(replay, windows, mode):
-    present = block(replay, "void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view, bool source_srgb, bool allow_scale, OutputTrialSource trial) {")
+    present = block(replay, "void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view,\n                              bool source_srgb, bool allow_scale, OutputTrialSource trial, VkFormat framegen_format) {")
     acquire = cut(present, "    // (the presenter thread, RX_VK_PRESENT_THREAD: the present handed over",
                   "    if (vkResetCommandPool(dev.device, f.pool, 0)",
                   "present_image's drain and acquire")
@@ -715,7 +718,7 @@ def fixture(replay, windows, mode):
     idle = block(replay, "bool presenter_wait_idle(std::unique_lock<std::mutex>& lk, int limit_ms = 0) {")
     idle = (idle.replace("presenter.cv.wait_for(lk, std::chrono::milliseconds(limit_ms), idle)", "model_wait(lk, idle)")
                 .replace("presenter.cv.wait(lk, idle);", "if (!model_wait(lk, idle)) problem(\"a hand-over waits without end\");"))
-    hand = block(replay, "void present_hand_off(uint32_t index, VkFence done, uint64_t reflex_id, OutputTrialFrame trial) {")
+    hand = block(replay, "void present_hand_off(uint32_t index, VkFence done, uint64_t reflex_id, uint64_t antilag_id, OutputTrialFrame trial) {")
     hand = hand.replace('::mkwvk::cxx_escape::spawn_needed("presenter", presenter_loop);', "")
     drain = block(replay, "bool present_thread_drain() {")
     loop = block(replay, "void presenter_loop() {")

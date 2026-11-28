@@ -34,7 +34,6 @@ DOCS_ONLY = (
     "docs/*",
     ".forgejo/ISSUE_TEMPLATE/*",
     ".forgejo/pull_request_template.md",
-    ".forgejo/workflows/website.yml",
     ".forgejo/workflows/pr-description.yml",
     ".forgejo/workflows/third-party.yml",
     "AGENTS.md",

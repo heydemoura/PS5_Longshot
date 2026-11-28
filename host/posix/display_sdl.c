@@ -97,6 +97,41 @@ static void pointer_update(uint32_t pressed, int wheel) {
 }
 static uint32_t sdl_button_bit(int b) { return b == 1 ? HOS_MOUSE_LEFT : b == 3 ? HOS_MOUSE_RIGHT : b == 2 ? HOS_MOUSE_MIDDLE : 0; }
 
+/* ---- (longshot) the cursor over the window, as host/display.c's on Windows (gm_cursor_shown): shown until the pads or the keys
+   are used (nn_hid.c: hos_player_input_ns), and again once the mouse is (moved, or a button pressed). Before, it was hidden
+   only while the mouse was captured, so a player on a controller had it in the middle of the picture. While it is hidden a
+   move of up to 4 units (SDL's window units) does not bring it back, nor does the first move after
+   the window changed size (SDL can report the cursor at rest at its new point in the window: F11). The Insert menu shows it, for
+   its clicks; a move under it counts as the mouse used. Without the focus it is shown. The capture's relative mode hides it on
+   its own. Window thread only ---- */
+int64_t hos_player_input_ns(void);
+static int gm_shown = 1, gm_rebase = 1, cursor_hidden;
+static float gm_mx, gm_my;
+static int64_t gm_mouse_ns;
+static void gm_mouse_init(void) { hos_sdl_mouse_position(&gm_mx, &gm_my); gm_rebase = 0; }
+static void gm_mouse_used(void) { gm_mouse_ns = hos_now_ns(), gm_shown = 1; }
+static int gm_cursor_shown(void) {
+    if (gm_shown && hos_player_input_ns() > gm_mouse_ns) gm_shown = 0;
+    return gm_shown;
+}
+/* a move to (x, y): from the last point a move counted at, any other point while shown, more than 4 units away while hidden */
+static void gm_mouse_moved(float x, float y) {
+    if (gm_rebase) {
+        gm_rebase = 0, gm_mx = x, gm_my = y;
+        return;
+    }
+    const float slack = gm_cursor_shown() ? 0.0f : 4.0f;
+    if (fabsf(x - gm_mx) <= slack && fabsf(y - gm_my) <= slack) return;
+    gm_mx = x, gm_my = y;
+    gm_mouse_used();
+}
+static void cursor_apply(void) {
+    const int hide = !menu_open && hos_posix_window[0] && !gm_cursor_shown();
+    if (hide == cursor_hidden) return;
+    cursor_hidden = hide;
+    hos_sdl_cursor(!hide);
+}
+
 /* ---- keys: SDL's scancodes (USB HID usages) as Windows' virtual keys ---- */
 static void keys_update(void) {
     int n = 0;
@@ -367,7 +402,7 @@ void hos_display_loop(void) {
         char png[MAX_PATH];
         DWORD n = hos_game_path_a(png, MAX_PATH);
         while (n && png[n - 1] != '/') n--;
-        snprintf(png + n, sizeof png - n, "longshot.png");
+        snprintf(png + n, sizeof png - n, "%s", hos_organized_build() ? "data/longshot.png" : "longshot.png");
         hos_sdl_icon(window, png);
     }
     refresh_monitors();
@@ -378,6 +413,7 @@ void hos_display_loop(void) {
         if (hos_monitor_screen_size(&dw, &dh))
             __atomic_store_n(&desktop_w, dw, __ATOMIC_RELAXED), __atomic_store_n(&desktop_h, dh, __ATOMIC_RELAXED);
     }
+    gm_mouse_init();   /* establish the point before the first motion, even if the pads are used first */
     pointer_update(0, 0);
     __atomic_store_n(&launcher_window, managed, __ATOMIC_RELAXED);
     CloseHandle(CreateThread(NULL, 0, renderer_main, NULL, 0, NULL));
@@ -425,6 +461,7 @@ void hos_display_loop(void) {
                     rx_close_asked();
                     hos_window_closed_exit();
                 case HOS_SDL_EV_RESIZED:
+                    gm_rebase = 1;
                     pointer_update(0, 0);   /* publish pixels before waking the renderer's size consumer */
                     if (renderer) {
                         int w = 0, h = 0;
@@ -465,6 +502,7 @@ void hos_display_loop(void) {
                 case HOS_SDL_EV_MOUSE_DOWN:
                     ptr_in = 1;
                     ptr_held |= sdl_button_bit(e.button);
+                    gm_mouse_used();
                     if (menu_open) pointer_publish_at(e.x, e.y, sdl_button_bit(e.button), 0);   /* (the menu's click) */
                     else if (renderer && !mouse_captured) mouse_capture(1);
                     break;
@@ -475,7 +513,7 @@ void hos_display_loop(void) {
                     if (menu_open) pointer_update(0, (int)(e.wheel * 120));
                     break;
                 case HOS_SDL_EV_MOUSE_MOTION:
-                    if (!mouse_captured) ptr_in = 1;
+                    if (!mouse_captured) ptr_in = 1, gm_mouse_moved(e.x, e.y);
                     if (mouse_captured) {   /* (SDL3's motion comes in fractions of a pixel: the remainders kept for the next) */
                         static float rx, ry;
                         rx += e.dx, ry += e.dy;
@@ -509,5 +547,6 @@ void hos_display_loop(void) {
         }
         pointer_update(0, 0);
         keys_update();
+        cursor_apply();
     }
 }

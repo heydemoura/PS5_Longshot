@@ -168,6 +168,212 @@ function = "f_81b47080"
 signature_offset = 0x28
 signature = "d107c3ff aa0103fb"   # (sub sp, sp, #0x1f0; mov x27, x1)
 
+# Havok cloth on host code with HOS_NATIVE_CLOTH (game/oot_cloth.c, game/cloth_*.cpp). Three leaves hooked whole at their
+# entry; each loop's site is its set-up's last instruction or the branch into it, and jumps to the loop's way out, where
+# its *End site (check mode) is.
+# The bending pass, f_81c7f880 (one caller).
+[[site]]
+name = "cloth.bend"
+function = "f_81c7f880"
+signature = "7100041f 5400000b/ff00001f 90000008/9f00001f fd400080"   # (cmp w0, #1; b.lt *; adrp x8, *; ldr d0, [x4])
+
+# The skinned-anchor pass, f_81c7bd00 (one caller). f_81c7cb40, its caller's other branch, is the same code word for word
+# (its adrp pages aside), so nothing inside the function tells the two apart: the signature is its last instructions,
+# the alignment padding after it and the first word of the function that follows (f_81c7c100; f_81c7cb40's is another).
+[[site]]
+name = "cloth.anchor"
+function = "f_81c7bd00"
+signature_offset = 0x3e8
+signature = "2f00e407 14000000/fc000000 d65f03c0 00000000 00000000 00000000 bd406c00"   # (movi d7, #0; b *; ret; padding; f_81c7c100's ldr s0, [x0, #0x6c])
+
+# Prepare Matrices, f_81cdff40 (60 call sites). f_81b54500 (one caller, outside the cloth) is the same code word for word,
+# so the signature is the function's last two instructions and the first of the function that follows (f_81ce1a24).
+[[site]]
+name = "cloth.matrices"
+function = "f_81cdff40"
+signature_offset = 0x1adc
+signature = "6cc53bef d65f03c0 d503237f"   # (ldp d15, d14, [sp], #0x50; ret; f_81ce1a24's pacibsp)
+
+# A link constraint set's solve, f_81c86720: inside its Havok timer scope, the set-up loads the count (w9) and the records
+# from the set (x20) and ends with alignment nops; the site is the last nop, before the first record.
+[[site]]
+name = "cloth.links"
+function = "f_81c86720"
+offset = 0x19c                     # (the set-up's last nop)
+to = 0x258                         # (the loop's way out: ldrb w9, [x25])
+signature_offset = 0x17c
+signature = "b9403289 7100053f 5400000b/ff00001f f940168a 12bff00b 9100114a"   # (ldr w9, [x20, #0x30]; cmp w9, #1; b.lt *; ldr x10, [x20, #0x28]; mov w11, #0x7fffff; add x10, x10, #4)
+
+[[site]]
+name = "cloth.linksEnd"
+function = "f_81c86720"
+in = "cloth.links"
+offset = 0x258                     # (the loop's way out)
+
+# A bend link set's solve, f_81c7d2e0: as the links'.
+[[site]]
+name = "cloth.bendLinks"
+function = "f_81c7d2e0"
+offset = 0x19c                     # (the set-up's nop, before the first record)
+to = 0x27c                         # (the loop's way out: ldrb w9, [x25])
+signature_offset = 0x17c
+signature = "b9403289 7100053f 5400000b/ff00001f 9000000b/9f00001f"   # (ldr w9, [x20, #0x30]; cmp w9, #1; b.lt *; adrp x11, *)
+
+[[site]]
+name = "cloth.bendLinksEnd"
+function = "f_81c7d2e0"
+in = "cloth.bendLinks"
+offset = 0x27c                     # (the loop's way out)
+
+# A tether set's solve, f_81c88940: as the links'.
+[[site]]
+name = "cloth.tethers"
+function = "f_81c88940"
+offset = 0x19c                     # (the set-up's last nop)
+to = 0x228                         # (the loop's way out: ldrb w9, [x24])
+signature_offset = 0x174
+signature = "b9403289 7100053f 5400000b/ff00001f f940168a 2f00e407"   # (ldr w9, [x20, #0x30]; cmp w9, #1; b.lt *; ldr x10, [x20, #0x28]; movi d7, #0)
+
+[[site]]
+name = "cloth.tethersEnd"
+function = "f_81c88940"
+in = "cloth.tethers"
+offset = 0x228                     # (the loop's way out)
+
+# hclSimClothInstance::updateAabbs, f_81b38800: the particle loop's set-up after the timer scope's begin (both of its paths
+# meet there), which loads the count from the instance (x20).
+[[site]]
+name = "cloth.boxes"
+function = "f_81b38800"
+offset = 0x13c                     # (the set-up's adrp)
+to = 0x214                         # (the loop's way out: ldr x10, [x20, #0x2d8])
+signature_offset = 0x13c
+signature = "90000009/9f00001f f9434129 b9402a8a"   # (adrp x9, *; ldr x9, [x9, #0x680]; ldr w10, [x20, #0x28])
+
+[[site]]
+name = "cloth.boxesEnd"
+function = "f_81b38800"
+in = "cloth.boxes"
+offset = 0x214                     # (the loop's way out)
+
+# The capsule collidable's cull, f_81b5a3c0: the loop's set-up tests the count (w22) and the form (w24 bit 0).
+[[site]]
+name = "cloth.cull"
+function = "f_81b5a3c0"
+offset = 0x278                     # (cmp w22, #1)
+to = 0x39c                         # (the loop's way out: str w28, [sp, #0x70])
+signature_offset = 0x278
+signature = "710006df 36000018/fff8001f 5400000b/ff00001f f940228a"   # (cmp w22, #1; tbz w24, #0, *; b.lt *; ldr x10, [x20, #0x40])
+
+[[site]]
+name = "cloth.cullEnd"
+function = "f_81b5a3c0"
+in = "cloth.cull"
+offset = 0x39c                     # (the loop's way out)
+
+# hclSimulateOperator::_integrateTask, f_81c66a60: the Verlet loop's set-up after the timer scope's begin, which splits the
+# count (w25) into fours.
+[[site]]
+name = "cloth.verlet"
+function = "f_81c66a60"
+offset = 0x468                     # (ldr x8, [sp, #8])
+to = 0x650                         # (the loop's way out)
+signature_offset = 0x468
+signature = "f94007e8 11000f29"   # (ldr x8, [sp, #8]; add w9, w25, #3)
+
+[[site]]
+name = "cloth.verletEnd"
+function = "f_81c66a60"
+in = "cloth.verlet"
+offset = 0x650                     # (the loop's way out)
+
+# The capsule collision, f_81b8c000: the branch into its record loop (mode 0), reached once a call; then the loop of the
+# count & 15 particles left over, and the routine's way out.
+[[site]]
+name = "cloth.capsule"
+function = "f_81b8c000"
+offset = 0x118                     # (b to the record loop)
+to = 0x58b4                        # (the record loop's way out)
+signature_offset = 0x114
+signature = "ad0387e0 14000000/fc000000"   # (stp q0, q1, [sp, #0x70]; b *)
+
+[[site]]
+name = "cloth.capsuleRecordsEnd"
+function = "f_81b8c000"
+in = "cloth.capsule"
+offset = 0x58b4                    # (the record loop's way out)
+
+[[site]]
+name = "cloth.capsuleTail"
+function = "f_81b8c000"
+in = "cloth.capsule"
+offset = 0x58d0                    # (b to the loop of the particles left over)
+to = 0x11068                       # (the routine's way out)
+# (the guard: the count & 15 and the loop's constants the callback takes from the code before the site)
+guards = [
+    { offset = 0x58bc, signature = "72000d29 54000000/ff00001f 1e2e1000 2f00e401 12bff00a" },   # (ands w9, w9, #0xf; b.eq *; fmov s0, #1.0; movi d1, #0; mov w10, #0x7fffff)
+]
+
+[[site]]
+name = "cloth.capsuleEnd"
+function = "f_81b8c000"
+in = "cloth.capsule"
+offset = 0x11068                   # (the routine's way out: add sp, sp, #0x4e0)
+
+# The sphere collision, f_81c1a240 mode 0: the branch into its record loop, after the small constant is put in the frame.
+[[site]]
+name = "cloth.sphere"
+function = "f_81c1a240"
+offset = 0xe8                      # (b to the record loop)
+to = 0x560c                        # (the record loop's way out)
+signature_offset = 0xe0
+signature = "3dc09da0 3d8027e0 14000000/fc000000"   # (ldr q0, [x13, #0x270]; str q0, [sp, #0x90]; b *)
+
+[[site]]
+name = "cloth.sphereRecordsEnd"
+function = "f_81c1a240"
+in = "cloth.sphere"
+offset = 0x560c                    # (the record loop's way out)
+
+# Object Space Deform, f_81db9a40: the block loop's head, which the set-up branches to and each block's step reaches
+# after testing the block (w10) against the blocks (w9).
+[[site]]
+name = "cloth.skin"
+function = "f_81db9a40"
+offset = 0x6bf8                    # (the loop's head: prfm pldl1keep, [x27, #0x80])
+to = 0x7830                        # (the loop's way out)
+signature_offset = 0x6bc8
+signature = "f9407aa1 14000000/fc000000 d503201f d503201f d503201f d503201f"   # (ldr x1, [x21, #0xf0]; b * (to the head); nop x4)
+# (the guard: the block's step and test before the head)
+guards = [
+    { offset = 0x6bec, signature = "1100054a 6b09015f 54000000/ff00001f" },   # (add w10, w10, #1; cmp w10, w9; b.eq *)
+]
+
+[[site]]
+name = "cloth.skinEnd"
+function = "f_81db9a40"
+in = "cloth.skin"
+offset = 0x7830                    # (the loop's way out)
+
+# Mesh Bone Deform, f_81ce6500: the bone loop's set-up after the timer scope's begin. Three functions beside it share its
+# set-up, so the signature is two words of the timer scope's begin before it, and the set-up the callback mirrors a guard.
+[[site]]
+name = "cloth.bones"
+function = "f_81ce6500"
+offset = 0x124                     # (ldr w8, [x19, #0x38])
+to = 0x35c                         # (the loop's way out)
+signature_offset = 0xdc
+signature = "f9421508 b9400108"   # (ldr x8, [x8, #0x428]; ldr w8, [x8])
+guards = [
+    { offset = 0x124, signature = "b9403a68 34000008/ff00001f b9405aa8 7100051f 5400000b/ff00001f" },   # (ldr w8, [x19, #0x38]; cbz w8, *; ldr w8, [x21, #0x58]; cmp w8, #1; b.lt *)
+]
+
+[[site]]
+name = "cloth.bonesEnd"
+function = "f_81ce6500"
+in = "cloth.bones"
+offset = 0x35c                     # (the loop's way out)
+
 # A movie's frame count above a 60 cap (issue 1742; host/nn_vi.c hos_movie_frames, through game/oot_sites.c). The game's movie
 # player counts its updates while a movie plays (f_83b7c710: one more at +760 of the player, x20, each update), and a
 # cutscene that shows a movie places its narration, its rumble and its end by that count. The count grows by the frames'
@@ -1260,3 +1466,21 @@ function = "f_81545b60"
 offset = 0x140
 signature_offset = 0x13c
 signature = "94000000/fc000000 91004260 910003e1"   # (bl *; add x0, x19, #0x10; mov x1, sp)
+
+[[site]]
+name = "ui.listSetup"
+function = "f_8151eb00"
+offset = 0x4c
+signature_offset = 0x40
+signature = "d10223a1 d10243a2 52800044 aa0003f3"   # (sub x1, x29, #0x88; sub x2, x29, #0x90; mov w4, #2; mov x19, x0)
+
+# The box manager's acquire, after its virtual callback and before either unlock.
+# The exact unlock calls distinguish otherwise identical light-pool routines in
+# this build. The guard checks the object's lock acquisition before that call.
+[[site]]
+name = "light.boxAcquired"
+function = "f_831eaa90"
+offset = 0x80
+signature_offset = 0x7c
+signature = "d63f0100 9100c280 9429de57 91002260 9429de55"
+guards = [{ offset = 0x5c, signature = "9100c280 9429de5c" }]

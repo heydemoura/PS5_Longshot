@@ -36,6 +36,8 @@
 #include "vk_bug_report.h"
 #include "auto_settings.h"
 #include "vk_dlss.h"
+#include "vk_dlssg.h"
+#include "vk_dlssg_layer.h"
 #include "vk_fsr4.h"
 #include "vk_xess.h"
 #include "vk_reflex.h"
@@ -70,9 +72,15 @@ VKX_DEVICE3(VKX_DEFINE)
 static PFN_vkGetInstanceProcAddr get_instance_proc;
 
 bool load_global() {
+    // (longshot: NVIDIA DLSS Frame Generation through Streamline, vk_dlssg.cpp) NVIDIA Streamline's loader in place of
+    // vulkan-1.dll's when the rows as saved ask DLSS FG for frames and it started: it hooks the instance, the device, the
+    // swapchain and the present, and gives vulkan-1.dll's own for the rest. Null in a build without it
+    get_instance_proc = mkwvk::dlssg_load();
 #ifdef _WIN32
     // Windows Vulkan shims can intercept the executable's imports but miss calls from this DLL.
-    if (mkwvk::host && mkwvk::host->vulkan_loader_proc) {
+    if (get_instance_proc) {
+        // (Streamline loads vulkan-1.dll itself)
+    } else if (mkwvk::host && mkwvk::host->vulkan_loader_proc) {
         get_instance_proc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(mkwvk::host->vulkan_loader_proc());
     } else {
         // Older hosts leave System32 loader resolution to the renderer. The loader chooses the drivers in use.
@@ -274,6 +282,11 @@ bool create_instance() {
     VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ci.pApplicationInfo = &app;
     std::vector<const char*> ext_list(exts, exts + n_exts);
+    std::vector<const char*> layers;
+    // (longshot) Longshot's own layer under NVIDIA Streamline, while that makes DLSS FG's frames (vk_dlssg_layer.h): the
+    // instance is made without it, and without what it asks, when the loader refuses it
+    const char* const dlssg_layer = dlssg_instance_layer();
+    size_t without_layer = 0;
     {   // (longshot) what NVIDIA DLSS needs (vk_dlss.cpp; nothing in a build without it)
         uint32_t n = 0;
         vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
@@ -285,13 +298,24 @@ bool create_instance() {
         // whenever the driver has it; the SDR choice in create_swapchain keeps to the sRGB surface)
         if (has_extension(all, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME))
             ext_list.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME), dev.swapchain_colorspace = true;
+        without_layer = ext_list.size();
+        if (dlssg_layer) dlssg_layer_instance_extensions(ext_list, all);
     }
-    ci.enabledExtensionCount = (uint32_t)ext_list.size();
     ci.ppEnabledExtensionNames = ext_list.data();
     // RX_VK_VALIDATION=1: the Khronos validation layer (when installed)
-    const char* layer = "VK_LAYER_KHRONOS_validation";
-    if (env_on("RX_VK_VALIDATION")) ci.enabledLayerCount = 1, ci.ppEnabledLayerNames = &layer;
-    if (vkCreateInstance(&ci, nullptr, &dev.instance) != VK_SUCCESS) {
+    if (env_on("RX_VK_VALIDATION")) layers.push_back("VK_LAYER_KHRONOS_validation");
+    VkResult made = VK_ERROR_INITIALIZATION_FAILED;
+    for (int with_layer = dlssg_layer ? 1 : 0; with_layer >= 0 && made != VK_SUCCESS; with_layer--) {
+        if (with_layer) layers.push_back(dlssg_layer);
+        ci.enabledExtensionCount = (uint32_t)(with_layer ? ext_list.size() : without_layer);
+        ci.enabledLayerCount = (uint32_t)layers.size();
+        ci.ppEnabledLayerNames = layers.empty() ? nullptr : layers.data();
+        made = vkCreateInstance(&ci, nullptr, &dev.instance);
+        if (with_layer) layers.pop_back();
+        if (with_layer && made != VK_SUCCESS)
+            logf("vk: the instance was not made with Longshot's layer under Streamline (VkResult %d): made without it", (int)made);
+    }
+    if (made != VK_SUCCESS) {
         logf("vk: vkCreateInstance failed");
         return false;
     }
@@ -417,6 +441,7 @@ static bool native_fadd_wanted(const char* env, VkDriverId driver, uint32_t devi
 }
 
 bool create_device() {
+    dlssg_device(dev.physical);   // (longshot: Streamline asked whether DLSS FG runs on the GPU chosen; no: it gives up, vk_dlssg.cpp)
     uint32_t n = 0;
     vkEnumerateDeviceExtensionProperties(dev.physical, nullptr, &n, nullptr);
     std::vector<VkExtensionProperties> exts(n);
@@ -505,6 +530,15 @@ bool create_device() {
         optional(VK_AMD_BUFFER_MARKER_EXTENSION_NAME, dev.buffer_marker);
     optional(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, dev.device_fault);
     optional(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME, dev.coop_matrix);
+    // (longshot) f16 pair dot products into f32 (v_dot2_f32_f16 on RADV): the software multiplies' Dot2 form, vk_coopmat.cpp
+    // choose_software_form. Asked for only where that form can be tried, by its own rules (software_dot2_extension_wanted:
+    // RADV and AMD RDNA 4 on AMD's proprietary driver, RX_VK_MMA_UNROLL and RX_VK_MMA_DOT2 over them), as whether the
+    // multiplies run in software (no cooperative matrices, or their tests failing) is known only once the device is made.
+    // Only with Vulkan headers that have it (1.4.345 does)
+#ifdef VK_VALVE_shader_mixed_float_dot_product
+    if (software_dot2_extension_wanted(fadd_driver.driverID, dev.props))
+        optional(VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME, dev.mixed_dot_f16);
+#endif
     // (longshot) the GPU's own float add on storage buffers: the game's RED/ATOM.ADD.F32 become one OpAtomicFAddEXT instead
     // of a compare-exchange loop, which gives up after CAS_LOOP_MAX_TRIES attempts and loses that add (eden
     // spirv_emit_context.cpp DefineStorageBuffers). By default with NVIDIA's driver, AMD's Windows driver on 0x1114 from 0x8001a0, and Intel's Windows driver on the
@@ -526,6 +560,7 @@ bool create_device() {
     if (fsr4_wants_descriptor_buffer()) optional(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME, fsr_descriptor_buffer);
     xess_device_extensions(want, exts);   // (longshot: Intel XeSS's, when its library is there and the instance took its own)
     reflex_device_extensions(want, exts);   // (longshot: NVIDIA Reflex's, vk_reflex.cpp)
+    dlssg_layer_device_extensions(want, exts);   // (longshot: present timing for Longshot's layer under Streamline, vk_dlssg_layer.cpp)
     antilag_device_extensions(want, exts);   // (longshot: AMD Anti-Lag 2's, vk_antilag.cpp)
 
     // the queue: one family for graphics, compute and transfer
@@ -585,6 +620,84 @@ bool create_device() {
     queues(dev.queue_family, 1);
     if (compute_family != UINT32_MAX) queues(compute_family, 1);
     (void)q;
+    // (longshot, diagnosis) The queues' global priority (VK_KHR_global_priority, else VK_EXT_global_priority): low, medium,
+    // high or realtime (any case; an off word none); RX_VK_QUEUE_PRIORITY for the replay's queue, RX_VK_PRESENT_QUEUE_PRIORITY
+    // for the presents' own (RX_VK_PRESENT_QUEUE=1). Unset: none asked, the driver's own. A level the queue's family does not
+    // list is not asked (device_policy.h's parse_queue_priority and queue_priority_listed, tests/test_queue_priority.py), and
+    // a device not made with them is made again without them (said refused only for the spec's refusals, its
+    // queue_priority_refused); the log says what was asked and what the device was made with.
+    // For where the game frame's present waits on the GPU with frame generation (RX_VK_PRESENT_PROBE, vk_replay.cpp).
+    VkDeviceQueueGlobalPriorityCreateInfoKHR queue_priority[2] = {{VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR},
+                                                                  {VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR}};
+    const char* priority_ext = nullptr;   // (set when a priority is chained: the extension added to `want`)
+    {
+        const char* const names[2] = {"RX_VK_QUEUE_PRIORITY", "RX_VK_PRESENT_QUEUE_PRIORITY"};
+        const char* const whose[2] = {"the replay's queue", "the presents' own queue"};
+        const uint32_t family_of[2] = {dev.queue_family, compute_family};
+        const char* const ext = has_extension(exts, VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME)   ? VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME
+                                : has_extension(exts, VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME) ? VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME
+                                                                                             : nullptr;
+        const bool can_list = has_extension(exts, VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME) ||
+                              has_extension(exts, VK_EXT_GLOBAL_PRIORITY_QUERY_EXTENSION_NAME);
+        for (int k = 0; k < 2; k++) {
+            const char* const e = getenv(names[k]);
+            if (!e || !*e) continue;
+            uint32_t level = 0;   // (device_policy.h's rules: the level's read, then the family's gate)
+            if (!policy_rule::parse_queue_priority(e, level)) {
+                logf("vk: %s=%s: not low, medium, high, realtime or off; no priority asked for %s", names[k], e, whose[k]);
+                continue;
+            }
+            if (!level) continue;   // (an off word: none asked, the driver's own)
+            if (family_of[k] == UINT32_MAX) {
+                logf("vk: %s=%s: the presents have no queue of their own (RX_VK_PRESENT_QUEUE); no priority asked", names[k], e);
+                continue;
+            }
+            if (!ext) {
+                logf("vk: %s=%s: the driver has no VK_KHR_global_priority nor VK_EXT_global_priority; no priority asked", names[k], e);
+                continue;
+            }
+            std::string listed;   // (the family's levels, where its list is read)
+            std::vector<VkQueueFamilyGlobalPriorityPropertiesKHR> gp;   // (the families' lists, where the driver gives them)
+            if (can_list) {
+                auto props2 = (PFN_vkGetPhysicalDeviceQueueFamilyProperties2)instance_proc()(dev.instance,
+                                                                                            "vkGetPhysicalDeviceQueueFamilyProperties2");
+                uint32_t count = 0;
+                if (props2) props2(dev.physical, &count, nullptr);
+                if (props2 && family_of[k] < count) {
+                    gp.assign(count, {VK_STRUCTURE_TYPE_QUEUE_FAMILY_GLOBAL_PRIORITY_PROPERTIES_KHR});
+                    std::vector<VkQueueFamilyProperties2> fp(count, {VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2});
+                    for (uint32_t i = 0; i < count; i++) fp[i].pNext = &gp[i];
+                    props2(dev.physical, &count, fp.data());
+                    const VkQueueFamilyGlobalPriorityPropertiesKHR& g = gp[family_of[k]];
+                    for (uint32_t i = 0; i < g.priorityCount && i < VK_MAX_GLOBAL_PRIORITY_SIZE_KHR; i++) {
+                        listed += (listed.empty() ? "" : "/");
+                        listed += policy_rule::queue_priority_name((uint32_t)g.priorities[i]);
+                    }
+                    if (listed.empty()) listed = "none";
+                }
+            }
+            // (no list read: the level asked unlisted, the device made again without it if refused)
+            const VkQueueFamilyGlobalPriorityPropertiesKHR* const g = gp.empty() ? nullptr : &gp[family_of[k]];
+            const bool in_list = policy_rule::queue_priority_listed(level, g ? g->priorities : nullptr, g ? g->priorityCount : 0);
+            if (g)
+                logf("vk: %s=%s for %s (family %u): the family lists %s%s", names[k], e, whose[k], family_of[k], listed.c_str(),
+                     in_list ? "" : "; not asked");
+            else   // (the driver gives no list, or one it says it gives could not be read: no call, or not that family)
+                logf("vk: %s=%s for %s (family %u): %s; asked unlisted", names[k], e, whose[k], family_of[k],
+                     can_list ? "no list of the family's levels could be read"
+                              : "the driver gives no list of the family's levels (no VK_KHR_global_priority nor "
+                                "VK_EXT_global_priority_query)");
+            if (!in_list) continue;
+            for (auto& x : qs)
+                if (x.queueFamilyIndex == family_of[k]) {
+                    queue_priority[k].globalPriority = (VkQueueGlobalPriorityKHR)level;
+                    x.pNext = &queue_priority[k];
+                    priority_ext = ext;
+                }
+        }
+        if (priority_ext && std::find_if(want.begin(), want.end(), [&](const char* w) { return !strcmp(w, priority_ext); }) == want.end())
+            want.push_back(priority_ext);
+    }
     // (the presenter thread's waits for its presents to be shown: VK_KHR_present_id + VK_KHR_present_wait, where the driver has them)
     const bool want_present_wait = has_extension(exts, VK_KHR_PRESENT_ID_EXTENSION_NAME) &&
                                    has_extension(exts, VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
@@ -636,11 +749,16 @@ bool create_device() {
     if (dev.memory_priority) *tail = &mem_priority, tail = &mem_priority.pNext;
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
     if (dev.coop_matrix) *tail = &coop, tail = &coop.pNext;
+#ifdef VK_VALVE_shader_mixed_float_dot_product
+    VkPhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE mixed_dot{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MIXED_FLOAT_DOT_PRODUCT_FEATURES_VALVE};
+    if (dev.mixed_dot_f16) *tail = &mixed_dot, tail = &mixed_dot.pNext;
+#endif
     VkPhysicalDeviceShaderAtomicFloatFeaturesEXT afloat{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT};
     if (atomic_float) *tail = &afloat, tail = &afloat.pNext;
     VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptor_buffer{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
     if (fsr_descriptor_buffer) *tail = &descriptor_buffer, tail = &descriptor_buffer.pNext;
     reflex_device_features(tail);   // (present ids, when NVIDIA Reflex's extensions are there)
+    dlssg_layer_device_features(tail);   // (longshot: present timing's, when its extensions were added)
     VkPhysicalDevicePresentIdFeaturesKHR present_id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR};
     VkPhysicalDevicePresentWaitFeaturesKHR present_wait{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR};
     if (want_present_wait) {
@@ -654,6 +772,15 @@ bool create_device() {
     dev.view_2d_of_3d = dev.view_2d_of_3d && v2d3d.sampler2DViewOf3D;
     dev.memory_priority = dev.memory_priority && mem_priority.memoryPriority;
     coop.cooperativeMatrixRobustBufferAccess = VK_FALSE;
+#ifdef VK_VALVE_shader_mixed_float_dot_product
+    {   // (only the f16 one into f32 on: the one the Dot2 form emits)
+        dev.mixed_dot_f16 = dev.mixed_dot_f16 && mixed_dot.shaderMixedFloatDotProductFloat16AccFloat32;
+        mixed_dot.shaderMixedFloatDotProductFloat16AccFloat32 = dev.mixed_dot_f16 ? VK_TRUE : VK_FALSE;
+        mixed_dot.shaderMixedFloatDotProductFloat16AccFloat16 = VK_FALSE;
+        mixed_dot.shaderMixedFloatDotProductBFloat16Acc = VK_FALSE;
+        mixed_dot.shaderMixedFloatDotProductFloat8AccFloat32 = VK_FALSE;
+    }
+#endif
     dev.coop_matrix = dev.coop_matrix && coop.cooperativeMatrix &&
                       f12.vulkanMemoryModel && f12.vulkanMemoryModelDeviceScope;
     {   // (only the float add on buffers on: the one the translator emits)
@@ -890,7 +1017,28 @@ bool create_device() {
     ci.pQueueCreateInfos = qs.data();
     ci.enabledExtensionCount = (uint32_t)want.size();
     ci.ppEnabledExtensionNames = want.data();
-    if (vkCreateDevice(dev.physical, &ci, nullptr, &dev.device) != VK_SUCCESS) {
+    VkResult made = vkCreateDevice(dev.physical, &ci, nullptr, &dev.device);
+    if (priority_ext) {   // (the queues' global priority, RX_VK_QUEUE_PRIORITY / RX_VK_PRESENT_QUEUE_PRIORITY above)
+        if (made == VK_SUCCESS) {
+            const std::string presents = compute_family == UINT32_MAX ? std::string("the presents on the replay's queue (none of their own)")
+                                         : std::string("the presents' own ") +
+                                               (queue_priority[1].globalPriority ? getenv("RX_VK_PRESENT_QUEUE_PRIORITY") : "unasked");
+            logf("vk: the device was made with the queues' global priority asked (%s; the replay's %s, %s)", priority_ext,
+                 queue_priority[0].globalPriority ? getenv("RX_VK_QUEUE_PRIORITY") : "unasked", presents.c_str());
+        } else {
+            if (policy_rule::queue_priority_refused(made))   // (the spec's: no privilege, or no resources, for the level)
+                logf("vk: vkCreateDevice refused the queues' global priority (VkResult %d): made again without it", (int)made);
+            else
+                logf("vk: vkCreateDevice failed (VkResult %d) with the global priority asked: made again without it, the cause "
+                     "may be another", (int)made);
+            for (auto& x : qs) x.pNext = nullptr;
+            want.erase(std::remove_if(want.begin(), want.end(), [&](const char* w) { return !strcmp(w, priority_ext); }), want.end());
+            ci.enabledExtensionCount = (uint32_t)want.size();
+            ci.ppEnabledExtensionNames = want.data();
+            made = vkCreateDevice(dev.physical, &ci, nullptr, &dev.device);
+        }
+    }
+    if (made != VK_SUCCESS) {
         logf("vk: vkCreateDevice failed");
         return false;
     }
@@ -912,6 +1060,7 @@ bool create_device() {
     if (dev.buffer_marker) buffer_markers_init();
     coopmat_init();
     reflex_device_created();
+    dlssg_device_made();   // (longshot: Streamline's plugins are loaded now: their functions, vk_dlssg.cpp)
     antilag_device_created();
     // (longshot: on the Steam Deck the GPU held at amdgpu's peak power state while the game runs (RX_VK_GPU_CLOCK=0: not), gpu_clock.h;
     // the device's render node from VK_EXT_physical_device_drm, which needs no enabling to be asked)
@@ -1097,9 +1246,13 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     static std::string told_display;
     if (!opts.hdr) told = -1;
     if (opts.hdr) {
+        // (A2B10G10R10 when it is listed, in any order: gamescope's WSI layer lists A2R10G10B10 too, but makes a swapchain
+        // only in a format the driver has, and NVIDIA's has A2B10G10R10 alone, so A2R10G10B10 was refused (#1682). The HDR
+        // picture is blitted in (present_image_with_trial), so either one shows the same colours)
         for (const auto& f : formats)
-            if ((f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || f.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32) &&
-                f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT)
+            if (f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT &&
+                (f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
+                 (f.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32 && !(dev.hdr && fmt.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32))))
                 fmt = f, dev.hdr = true;
         std::string display;   // (the display Windows was asked about, named in the line: a PC can have several)
         if (!dev.hdr) {
@@ -1301,6 +1454,7 @@ bool create_swapchain(uint32_t width, uint32_t height) {
          vsync == 1 ? "On" : vsync == 2 ? "Off" : "Auto");
     swap_views_make(ci.imageUsage, mutable_view ? view_formats[1] : fmt.format);
     reflex_swapchain_created(sc);   // (NVIDIA Reflex: its sleep mode on the new swapchain)
+    dlssg_swapchain_made();   // (longshot: Streamline's DLSS FG, the toggle's hold from the screen's VRR floor, vk_dlssg.cpp)
     return true;
 }
 
@@ -2090,6 +2244,8 @@ bool prepare_compiler_busy() { return prepare_cpu_busy.load(std::memory_order_re
 // starts that crashed in a step are put back as this start found them (crash_markers.h): a quit is not a crash. Then, while the
 // shaders are prepared, their workers are stopped and what they made is kept (10 s at most: a driver can take longer on one
 // pipeline). Looked up by name, so an executable and a back end of different versions still close
+// (longshot) With NVIDIA Streamline's loader as the renderer's (vk_dlssg.cpp), Streamline is shut down instead of the
+// swapchain's retire below: it holds the presents and the queue until the process ends (dlssg_shutdown).
 extern "C"
 #ifdef _WIN32
 __declspec(dllexport)
@@ -2108,6 +2264,7 @@ void mkwvk_close_asked(void) {
     module_ids_flush();
     page_table_census_log("close");   // (the guest pools the page table cannot reach: how many came, vk_memory.cpp)
     page_table_check_close();         // (RX_VK_GP_TABLE: its bindings covered, and with =2 the loads checked, vk_draw.cpp)
+    present_probe_close();            // (RX_VK_PRESENT_PROBE: its lines queued written, its file flushed and closed, vk_replay.cpp)
     import_stats_log("close");        // (guest-memory imports made, refused by the driver, held after a refusal: vk_memory.cpp)
     fsr4_close();             // (AMD FSR 4's tuned layers: their background builds stopped first, what they made then saved below)
     pipeline_cache_close();   // (in play: the pipelines made since the last save, kept for the next start)
@@ -2117,6 +2274,7 @@ void mkwvk_close_asked(void) {
         if (WaitForSingleObject(prep_ended, 10000) != WAIT_OBJECT_0) logf("vk: the preparation did not stop within 10 s: closing anyway");
     }
     dlss_fg_close();   // (NVIDIA DLSS Frame Generation through NGX: its feature let go before the process exits, vk_dlss.cpp)
+    if (dlssg_shutdown()) return;   // (Streamline: its own shutdown, which keeps the present and queue locks to the end)
     // (longshot) let go of the window's swapchain and everything it pins while the process is still here. The compositor
     // (gamescope on the Deck, any Wayland/X server) reprograms the display right as the window goes away, and on the Deck an
     // atomic commit there failed with ENOMEM after a long run had this process holding most of the system's memory: the
@@ -2227,13 +2385,7 @@ static const MkwVkRenderer* init_body(const MkwVkHost* h) {
     cxx_escape::g_hooks.out_of_memory = [](const char* what) {
         if (host && host->out_of_memory) host->out_of_memory(what);   // (does not return)
     };
-    cxx_escape::g_hooks.fatal = [](const char* why) {   // (as vk_replay.cpp's replay_fatal: the crash window reads its "vk: FATAL:")
-        logf("vk: FATAL: %s", why);
-        if (host && host->log_flush) host->log_flush();
-        std::fprintf(stderr, "vk: FATAL: %s\n", why);
-        std::fflush(stderr);
-        std::_Exit(3);
-    };
+    cxx_escape::g_hooks.fatal = fatal_end;   // (vk_replay.cpp's replay_fatal: the crash window reads its "vk: FATAL:")
     if (!load_global()) {
 #ifdef _WIN32
         logf("vk: load_global failed (Vulkan loader library or vkCreateInstance missing)");

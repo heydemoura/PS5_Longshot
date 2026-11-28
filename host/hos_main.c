@@ -35,6 +35,8 @@ void hos_tracy_start(void) {
 #include "hos_wide_size.h"   /* (the widescreen picture's size, shared with the Insert menu) */
 #include "ws_floor.h"        /* (the game's memory kept in RAM: HOS_WS_FLOOR_MB) */
 #include "../gpu/vk/vk_api.h"
+#include "longshot_profile.h"
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,7 +57,6 @@ const char *hos_version(void);   /* (host/version.c: the one file builder/crates
 #include <sys/prctl.h>
 #include <sys/sysinfo.h>
 #endif
-#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/syscall.h>
@@ -636,7 +637,7 @@ static void recover_writes(void) {
     const DWORD len = hos_game_path_a(path, HOS_PATH_CAP);
     char *slash = len ? strrchr(path, SEP) : NULL;
     if (slash) {
-        snprintf(slash + 1, (size_t)(path + HOS_PATH_CAP - slash - 1), "language.txt");
+        snprintf(slash + 1, (size_t)(path + HOS_PATH_CAP - slash - 1), "%s", hos_organized_build() ? "config/language.txt" : "language.txt");
         hos_atomic_remove_stale(path);
     }
     if (hos_options_file()[0]) hos_atomic_remove_stale(hos_options_file());
@@ -644,7 +645,7 @@ static void recover_writes(void) {
     hos_atomic_remove_stale(path);
 }
 
-/* longshot_env.txt beside the game: NAME=VALUE lines set as environment variables before anything reads them, for the
+/* longshot_env.txt in the profile, or beside the game when the profile has none: NAME=VALUE lines set as environment variables before anything reads them, for the
    switches players are asked to test (RX_VK_NOOPT and the rest). Lines starting with # are notes. On Linux this runs
    before the window, so HOS_HEADLESS and HOS_WINDOW_SIZE are already set when the window is made.
    HOS_ENV_FILE=<path> reads that file instead: a scripted or A/B test run brings its own switches and leaves the
@@ -692,6 +693,7 @@ static int env_line_allowed(const char *name, const char *value) {
 static void load_longshot_env(void) {
     char path[HOS_PATH_CAP + 32];
     const char *other = getenv("HOS_ENV_FILE");
+    FILE *f = NULL;
 #ifdef __PROSPERO__
     /* (PS5) a title is started with no environment to put HOS_ENV_FILE in: a test run's switches are in
        hookshot_test_env.txt in the title folder, which the run tool writes before the start and takes away after the
@@ -702,13 +704,20 @@ static void load_longshot_env(void) {
     }
 #endif
     if (other && *other) {
-        snprintf(path, sizeof path, "%s", other);
+        f = fopen(other, "r");
     } else {
-        DWORD n = hos_game_path_a(path, HOS_PATH_CAP);
-        while (n && path[n - 1] != 92 && path[n - 1] != 47) n--;
-        memcpy(path + n, "longshot_env.txt", 17);
+        if (longshot_profile_path(getenv(LONGSHOT_PROFILE), SEP, "longshot_env.txt", path, sizeof path)) {
+            f = fopen(path, "r");
+            if (!f && errno != ENOENT) return;
+        }
+        if (!f) {
+            DWORD n = hos_game_path_a(path, HOS_PATH_CAP);
+            if (!n || n >= HOS_PATH_CAP) return;
+            while (n && path[n - 1] != 92 && path[n - 1] != 47) n--;
+            snprintf(path + n, sizeof path - n, "%s", hos_organized_build() ? "config/longshot_env.txt" : "longshot_env.txt");
+            f = fopen(path, "r");
+        }
     }
-    FILE *f = fopen(path, "r");
     if (!f) return;
     /* The environment the game was started with wins over the file: a switch set for one launch (HOS_FULLSCREEN=0 in a
        shell, a script's RX_VK_PACE=1) beats the same name saved in the file. The file's own later lines still replace its
@@ -1063,9 +1072,11 @@ static int game_main(int argc, char **argv) {
             char path[HOS_PATH_CAP + 32];
             DWORD n = hos_game_path_a(path, HOS_PATH_CAP);
             while (n && path[n - 1] != 92 && path[n - 1] != 47) n--;
-            if (n && n + 5 < HOS_PATH_CAP) {   /* (its logs/, which hos_game_layout made; else beside the game, as before) */
-                memcpy(path + n, "logs", 5);
-                if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) path[n + 4] = path[n - 1], n += 5;
+            const char *log_dir = hos_organized_build() ? "diagnostics/logs" : "logs";
+            const size_t log_len = strlen(log_dir);
+            if (n && n + log_len + 1 < HOS_PATH_CAP) {   /* (its logs/, which hos_game_layout made; else beside the game, as before) */
+                memcpy(path + n, log_dir, log_len + 1);
+                if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) path[n + log_len] = path[n - 1], n += (DWORD)log_len + 1;
             }
             memcpy(path + n, "longshot_log.txt", 17);
             hos_crash_record_prepare(path);   /* recovery before rotation; keep this run's actual destination */
@@ -1161,7 +1172,7 @@ static int game_main(int argc, char **argv) {
         if (slash) {
             *slash = 0;
             SetCurrentDirectoryA(dir);
-            snprintf(beside_image, HOS_PATH_CAP, "%s" SEP_S "image.bin", dir);
+            snprintf(beside_image, HOS_PATH_CAP, "%s" SEP_S "%s", dir, hos_organized_build() ? "data/image.bin" : "image.bin");
             snprintf(beside_romfs, HOS_PATH_CAP, "%s" SEP_S "romfs", dir);
             snprintf(beside_user, HOS_PATH_CAP, "%s" SEP_S "user", dir);
             if (GetFileAttributesA(beside_image) != INVALID_FILE_ATTRIBUTES) {
@@ -1306,10 +1317,11 @@ static int game_main(int argc, char **argv) {
         if (want > game * 1.01 || (want > 1.0f && want < game * 0.99)) {
             const double r = hos_wide_clamp(want);
             /* (the height kept, the width at the screen's ratio, at most hos_wide_max_px() pixels (5120 x 2160's, a 21:9 screen's
-               native at the 4K output) with the shape kept: host/hos_wide_size.h, which the Insert menu's Output and Render
+               native at the 4K output) with the shape kept, unless the output is already that shape and a size the game
+               accepts (7680 x 2160): host/hos_wide_size.h hos_wide_picture, which the Insert menu's Output and Render
                resolution rows share) */
             unsigned ow, oh;
-            hos_wide_size(output_h, r, hos_wide_max_px(), &ow, &oh);
+            hos_wide_picture(output_w, output_h, r, hos_wide_max_px(), &ow, &oh);
             const unsigned sh = oh * 3 / 4, sw = (unsigned)(ow * 0.75 / 8 + 0.5) * 8;   /* (the scene, 3/4 of the picture as shipped) */
             hos_wide_out = (uint64_t)oh << 32 | ow;
             hos_wide_scene = (uint64_t)sh << 32 | sw;

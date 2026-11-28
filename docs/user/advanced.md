@@ -30,9 +30,12 @@ whether each started, and why not.
 
 - **NVIDIA DLSS** (RTX cards): turn on **DLSS** in the launcher's build settings. It shows NVIDIA's license first; the
   build then downloads NVIDIA's SDK and puts DLSS's and DLSS Frame Generation's runtimes in the game folder's `ngx`
-  folder. An update keeps them. On Linux, NVIDIA's library loads them only from a folder whose whole path is plain
-  ASCII: for a game folder such as `~/Games/Longshot-Café`, the menu says so; copy `libnvidia-ngx-dlss*.so.*` from its
-  `ngx` folder into `~/.local/share/longshot/ngx`.
+  folder. An update keeps them. A Windows game built from source with NVIDIA Streamline's SDK
+  (`LONGSHOT_SL_SDK`, [setup](../dev/setup.md#upscaler-sdks-optional)), with Streamline's files put beside
+  `longshot.exe` by `scripts/fetch.py streamline --game`, shows DLSS Frame Generation's frames through it; `RX_VK_DLSSG=0` in `longshot_env.txt` leaves
+  Streamline out. The launcher's builds do not have it yet. On Linux, NVIDIA's library loads the `ngx` folder's
+  runtimes only from a folder whose whole path is plain ASCII: for a game folder such as `~/Games/Longshot-Café`, the
+  menu says so; copy `libnvidia-ngx-dlss*.so.*` from its `ngx` folder into `~/.local/share/longshot/ngx`.
 - **AMD FSR 4** (Windows): turn on **FSR 4** in the launcher's build settings. It shows AMD's license first, then
   fetches AMD's two DLLs into the game folder. On Linux, put a Vulkan FSR 4 library (`amd_fidelityfx_upscaler_vk.so`)
   beside the game yourself: AMD publishes none for Linux.
@@ -52,10 +55,12 @@ whether each started, and why not.
 
 ## Switches: longshot_env.txt
 
-Some workarounds are switches: lines of `NAME=VALUE` in a text file named `longshot_env.txt` in the game folder, read
-when the game starts. It takes only the game's own switches (names starting `RX_`, `HOS_`, `LONGSHOT_`, `EDEN_`,
+To apply a workaround to every build you play with a profile, create `longshot_env.txt` next to its `profile.json`.
+Put one `NAME=VALUE` switch on each line and restart the game. If the profile has no such file, Longshot reads
+`config/longshot_env.txt` in the build folder. Older builds keep the file at the root of that folder. An empty
+profile file skips all build-specific switches. The file takes only the game's own switches (names starting `RX_`, `HOS_`, `LONGSHOT_`, `EDEN_`,
 `NVN_` or `SDL_`) and no paths; the log names any line it left out. A switch that stands in for a menu row wins over
-it while the line is there, and `longshot_options.ini` keeps your menu choice. Delete the line to undo it. On Windows, check
+it while the line is there, and the profile's `settings.ini` keeps your menu choice. Delete the line to undo it. On Windows, check
 that the file isn't really called `longshot_env.txt.txt` (File Explorer: **View → Show → File name extensions**).
 
 The switches worth knowing as a player are on the pages that need them ([common problems](common-issues.md),

@@ -26,6 +26,9 @@ struct Texture {
     VkFormat format = VK_FORMAT_UNDEFINED;   // the image's own format (views may be others of its class)
     VkImageType type = VK_IMAGE_TYPE_2D;
     VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL;
+    uint64_t layout_cmd_rec = 0;   // (recording id when r.cmd first transitioned layout; guards r.upload ordering)
+    VkImageLayout layout_before_cmd = VK_IMAGE_LAYOUT_GENERAL;
     VkImageUsageFlags usage = 0;
     VkImageCreateFlags create_flags = 0;   // (longshot: as its image was made, for the compaction's copy of it)
     uint32_t width = 1, height = 1, depth = 1, levels = 1, layers = 1;   // the image's (after skip)
@@ -190,6 +193,12 @@ VkImageView texture_view(Texture* tex, const nvn_tex* t, const nvn_view* v, VkIm
 /// (longshot) The format rules texture_get and texture_view follow (vk_texture.cpp), shared with the pipeline state list
 VkFormat image_format_of(VkFormat vf, bool astc_decoded);
 VkFormat view_format_of(VkFormat image, bool astc_decoded, bool bc, int view_nvn, ViewUse use, VkFormat force_format);
+/// (longshot) A view's NVN format over a texture of NVN format tex_nvn: R11G11B10F over one of the game's R11G11B10F targets that
+/// the host made RGBX16F (host/scene_format.h: the scene's light with PsychoV35) is the texture's own, the format it holds; any
+/// other as it is
+inline int scene_view_format(int tex_nvn, int view_nvn) {
+    return view_nvn == NVN_FORMAT_R11G11B10F && tex_nvn == NVN_FORMAT_RGBX16F ? tex_nvn : view_nvn;
+}
 /// The format a draw renders in on this device, into a texture of NVN format tex_nvn through a view of NVN format view_nvn
 VkFormat attachment_format(int tex_nvn, int view_nvn);
 /// The view format an NVN texture and view sample / render in
@@ -243,6 +252,13 @@ uint64_t texture_bytes();
 /// A full memory barrier (all commands, all accesses): what separates dependent work for now
 /// (why: its label in RX_VK_PASS_TIMING's barrier lines)
 void full_barrier(VkCommandBuffer cmd, const char* why = "barrier (other)");
+inline bool is_depth_texture(const Texture* t) {
+    return t && (t->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
+}
+/// Transitions a depth/stencil texture to `target` layout on `cmd` if its current layout differs (no-op for colour
+/// textures or when already in `target`). When `discard` is true, `oldLayout` is UNDEFINED (caller guarantees the whole
+/// image is overwritten next).
+void texture_transition_layout(VkCommandBuffer cmd, Texture* tex, VkImageLayout target, bool discard = false);
 /// Full barriers recorded and left out (RX_VK_BARRIER_DEDUPE_OFF=1: none), since the start
 void barrier_stats(int64_t* made, int64_t* left_out);
 /// (longshot) Set around a draw's sampled-texture lookups (vk_draw.cpp): a new ASTC texture there may wait for a later frame

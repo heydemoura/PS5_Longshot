@@ -78,7 +78,7 @@ ALLOWED = {
     "host/nn_gs.c": [(["memset(GP(ARG(0)), 0, 0x40)"], OUT)],
     "host/nn_nfp.c": [
         (["memset(GP(ARG(0)), 0, 8)", "memset(t, 0, 0x58)", "memcpy(t, tag, 3)", "memcpy(t + 0x20, &protocol, 4)",
-          "memset(m, 0, 0x40)", "memcpy(m, tag + 0x54, 7)", "memcpy(m, &year, 2)", "memcpy(m + 8, &size, 4)",
+          "memset(m, 0, 0x40)", "memcpy(m, tag + 0x54, 3)", "memcpy(m, &year, 2)", "memcpy(m + 8, &size, 4)",
           "memset(m, 0, 0x100)", "memcpy(m + 0x58, &year, 2)", "memcpy(m + 0x5c, tag_name, n)"],
          "an NFC tag's DeviceHandle, TagInfo, ModelInfo, CommonInfo or RegisterInfo: " + OUT),
         (["memcpy(GP(ARG(0)), area, n)"], "a tag's application area, into the game's own buffer for it: nothing the GPU reads"),

@@ -135,6 +135,7 @@ void logf(const char*, ...) {}
 
 namespace ur = upscaler_rows;
 int upscaler() { return opts.dlss; }
+int upscaler_row() { return upscaler(); }   // (no Streamline here: nothing waits for the restart)
 // (the Output resolution's preview in play, none; a module's row locked by its own locked(), none: the CRT rows have none)
 Out output_preview_target{};
 bool module_locked(const int*) { return false; }

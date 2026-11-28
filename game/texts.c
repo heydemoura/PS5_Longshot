@@ -26,7 +26,7 @@ int hos_texts_romfs(const char *key, const char *mod, char *out, size_t cap) {
     char *const slash = len ? (strrchr(path, 92) ? strrchr(path, 92) : strrchr(path, 47)) : NULL;   /* (linux: '/') */
     if (!slash) return 0;
     slash[1] = 0;
-    snprintf(out, cap, "%stexts/%s", path, key + 5);   /* (builder/crates/build-assets/src/texts.rs names its files in lower case, as the key) */
+    snprintf(out, cap, "%s%stexts/%s", path, hos_organized_build() ? "data/" : "", key + 5);   /* (builder/crates/build-assets/src/texts.rs names its files in lower case, as the key) */
     if (GetFileAttributesA(out) == INVALID_FILE_ATTRIBUTES) return 0;
     if (InterlockedIncrement(&logged) <= 4) hos_log("texts: %s <- %s (the console's wording made the PC's)", key, out);
     return 1;

@@ -28,6 +28,7 @@
 #include "vk_antilag.h"   // (AMD Anti-Lag 2: which game frame a set shows, antilag_frame / antilag_present_frame)
 #include "vk_dlss.h"   // (NVIDIA DLSS Frame Generation through NGX: dlss_fg_frames)
 #include "vk_reflex.h"   // (NVIDIA Reflex: which game frame a set shows, reflex_frame / reflex_present_frame)
+#include "vk_dlssg.h"   // (NVIDIA DLSS Frame Generation through Streamline: this file's frame generation is off while it runs)
 #include "vk_fsr3_inputs.h"   // (AMD FSR 3.1 frame interpolation's depth and motion)
 #include "vk_fsr3fi.h"
 #include <sys/stat.h>
@@ -49,15 +50,20 @@ extern VmaAllocator vma;   // (vk_vma.cpp)
 
 #include "vk_builtin_spv.h"   // (RX_VK_SHADER_DIR)
 #include "shaders/fg_copy_comp_spv.h"
+#include "shaders/fg_copy_pq_comp_spv.h"
 #include "shaders/fg_flow_comp_spv.h"
-#include "shaders/fg_hud_comp_spv.h"   // (AMD FSR 3.1's interpolation source with the HUD marked: hud_source)
+#include "shaders/fg_hud_comp_spv.h"
+#include "shaders/fg_hud_pq_comp_spv.h"   // (AMD FSR 3.1's interpolation source with the HUD marked: hud_source)
 #include "shaders/fg_hud_composite_comp_spv.h"   // (the HUD over FSR 3.1's made frames: fsr3fi_frames)
+#include "shaders/fg_hud_composite_rgba8_comp_spv.h"
 #include "shaders/fg_hud_layer_comp_spv.h"   // (how see-through the HUD is: hud_source)
+#include "shaders/fg_hud_layer_rgba8_comp_spv.h"
 #include "shaders/fg_luma_comp_spv.h"
 #include "shaders/fg_median_comp_spv.h"
 #include "shaders/fg_scale_comp_spv.h"
 #include "shaders/fg_scale_pq_comp_spv.h"   // (fg_scale.comp with FG_SCALE_PQ: an RGB10A2 destination)
 #include "shaders/fg_synth_comp_spv.h"
+#include "shaders/fg_synth_pq_comp_spv.h"
 #include "shaders/hdr_encode_comp_spv.h"
 #include "shaders/crt_downsample_comp_spv.h"
 #include "shaders/crt_lottes_comp_spv.h"
@@ -102,9 +108,14 @@ struct OutSet {
     int64_t due[kMaxMult] = {};
     bool game[kMaxMult] = {};
     bool by_time = false;
-    // (by_time: the game's frame time it was made at (smoothed), the time since the game frame before (span), and the GPU's
-    // delay its times have (fg.late_ns then): for pace_delay on the display thread)
-    int64_t frame_ns = 0, span_ns = 0, extra_ns = 0;
+    // (by_time: the game's frame time it was made at (smoothed), the time since the game frame before (span), the same two
+    // on the render thread's hand-overs (hand_span, hand_frame: pace_feeds), and the GPU's delay its times have
+    // (fg.late_ns then): for pace_delay on the display thread. lag_ns: how long after the game's thread presented its game
+    // frame the render thread handed it over, -1 not known (fixed_clock), for the log; below_cap: at its hand-over because
+    // the game ran below its cap, for the log. hand_due_ns: its game frame's time where its hand-over puts it, when its
+    // own came before the hand-over, else 0: for FIFO's catch-up, fifo_catch_up)
+    int64_t frame_ns = 0, span_ns = 0, hand_span_ns = 0, hand_frame_ns = 0, extra_ns = 0, lag_ns = -1, hand_due_ns = 0;
+    bool below_cap = false;
     uint64_t reflex_id = 0;   // (NVIDIA Reflex: the game frame it was made at, 0 none: its game frame is presented with it)
     uint64_t antilag_id = 0;  // (AMD Anti-Lag 2: the same, its game frame's present stage)
 };
@@ -119,12 +130,29 @@ struct Pipe {
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline pipe = VK_NULL_HANDLE;
 };
+// (a fixed multiplier's sets on the game's timeline, fixed_clock: the last game frame's present known (game), the
+// render thread's lag after the presents, smoothed (lag), the set before's place (at), and the game's frame time there,
+// smoothed (frame), how long the game's thread was held in its presents, smoothed (wait), and whether that puts the
+// sets at their hand-over (held: below the game's cap))
+struct FixedClock {
+    int64_t game = 0, lag = 0, at = 0, frame = 0, wait = 0;
+    bool held = false;
+};
+// (a set's place there: the set before's (before) and its own (at), the lag it was handed over at (-1: its present's time
+// not known, or the game below its cap: at is the hand-over's), and whether it gets its times (timed))
+struct ClockPlace {
+    int64_t before = 0, at = 0, lag = -1;
+    bool timed = false;
+};
 
 struct State {
     bool init = false;
     std::atomic<bool> failed{false};   // also read by Reflex's game-thread eligibility check
     uint32_t w = 0, h = 0;
     Pipe copy, luma, flow, median, synth;
+    Pipe copy_pq, synth_pq;
+    bool pq_failed = false;
+    VkFormat color_format = VK_FORMAT_UNDEFINED;
     VkSampler nearest = VK_NULL_HANDLE, linear = VK_NULL_HANDLE;
     Img frames[2], lumas[2], flows[2];
     OutSet sets[3];   // (one shown, one waiting its place on the line, one being made: the pacer never holds the game back)
@@ -140,6 +168,7 @@ struct State {
     int mult = 0;   // (the multiplier the sets' frames were made for)
     int by = -1;    // (PS5: the Frame generation by row the generators were made for, fg_by.h)
     int64_t game_ns = 0;     // (Auto: the game's frame time, smoothed: the delay its frames are shown at)
+    FixedClock clock;   // (a fixed multiplier's sets' places on the game's timeline, fixed_clock)
     int64_t slot_next = 0;   // (Auto: the display's next refresh to be given a frame, on the game's timeline)
     // (a fixed multiplier's sets on the game's timeline: the delay past their lead (pace_lead) that the GPU asks for,
     // pace_delay. The display thread writes it, framegen_record reads it)
@@ -219,6 +248,63 @@ void fixed_dues(int64_t last, int64_t now, int made, int64_t delay, int64_t* due
     for (int k = 0; k <= made; k++) due[k] = last + (now - last) * (k + 1) / (made + 1) + delay;
 }
 
+// doc: docs/dev/reference/architecture.md#frame-generations-presents (rule 2: the game's timeline is its presents)
+/// (longshot) Where a fixed multiplier's set is on the game's timeline (fixed_dues): when the game's thread presented its
+/// game frame (game_at, vk_replay.cpp present), the render thread's lag after the presents later, smoothed over 16 sets
+/// (c.lag); not when the render thread handed it over (now, framegen_record). The hand-over comes after the main thread's
+/// signal and the frame's replay: 4.5 ms after the present at the median, its intervals 1.1 to 1.2 ms apart (sd) where the
+/// presents' were 0.27 ms (RTX 4090, DLSS Frame Gen 2x at 60 fps, FIFO, 240 Hz VRR), and the screen followed the
+/// hand-overs (the game frames' intervals on it against theirs: slope 0.93 to 0.98, r 0.92 to 0.94; against the
+/// presents', r 0.24). So the presents give the intervals and the smoothed lag the phase: the set's frames are made after
+/// its hand-over, and the GPU's delay (pace_delay) then takes up only how much the lag varies, not the lag itself (placed
+/// at the presents, a lag near a game frame, GPU-bound or near 100 fps, held the delay at its most, a game frame, and
+/// the frames went out late, as they came). A present not known (0: a present made without its time, which vk_replay.cpp's
+/// present gives every one it makes, queued or on the game's thread; not after the last one known, after now or more than
+/// 100 ms before it): now, the lag kept, so the next set is on the presents again (now
+/// is about where they put it). A hitch (the hand-over over 100 ms after the one before) takes the lag again. The set
+/// gets its times (timed) after a place, not after a hitch and at most 100 ms after it (two places far apart on either
+/// timeline: nothing to place it between), and only then is the frame time smoothed, as framegen_record's game_ns on the
+/// hand-overs. Only while the game runs at its cap: below it its thread waits in its present (wait: from game_at until
+/// its job is in vk_replay.cpp's queue, the main thread's signal that the frame's data is written, then the room
+/// there), so each present comes its own work after the one before let it go, and sets placed on them took in how both
+/// vary (RTX 4090 under a GPU load at 33 to 50 fps: 436 to 599 presents of 600 waited 7 to 21 ms each for the signal;
+/// on one scene at about 50 fps the GPU's delay reached a game frame 10.6 times a log window on the presents, against
+/// 0.5 at the hand-over, that run first; at the cap 4 to 47 waited for it, 0.1 to 0.2 ms). How long it waited, each
+/// taken to 2 ms at most, is smoothed over the known presents (c.wait): over 1 ms the set is at its hand-over (c.held),
+/// until it is under 0.5 ms; the lag is then taken again, so the first set on the presents is at its hand-over too. A
+/// 30 ms wait once a second (a load) raises it to 0.13 ms.
+/// RX_VK_FG_GAME_CLOCK=0 (env_off): now, as before, no wait taken
+ClockPlace fixed_clock(FixedClock& c, int64_t game_at, int64_t wait, int64_t now, bool hitch, bool env_off) {
+    ClockPlace p{c.at, now, -1, false};
+    if (!env_off && game_at > 0 && game_at > c.game && game_at <= now && now - game_at <= 100000000) {
+        c.wait += (std::clamp<int64_t>(wait, 0, 2000000) - c.wait) / 16;
+        if (c.wait > 1000000) c.held = true;
+        else if (c.wait < 500000) c.held = false;
+        c.game = game_at;
+        if (c.held) {
+            c.lag = 0;   // (taken again on the presents: the first set there is at its hand-over)
+        } else {
+            const int64_t lag = now - game_at;
+            c.lag = c.lag && !hitch ? (c.lag * 15 + lag) / 16 : lag;
+            p.at = game_at + c.lag;
+            p.lag = lag;
+        }
+    }
+    p.timed = p.before && !hitch && p.at > p.before && p.at - p.before <= 100000000;
+    if (p.timed) c.frame = c.frame ? (c.frame * 7 + (p.at - p.before)) / 8 : p.at - p.before;
+    c.at = p.at;
+    return p;
+}
+
+// doc: docs/dev/reference/architecture.md#frame-generations-presents (rule 3: not from a long game frame, on either timeline)
+/// (longshot) Whether a fixed multiplier's set feeds the GPU's delay back (pace_delay): not after a long game frame, over
+/// 1.5 smoothed ones, on the game's timeline (span, frame: its first frame's time came early by the difference, which is
+/// not the GPU's) nor in the render thread's hand-overs (hand_span, hand_frame: a set handed over that late came late by
+/// more than the smoothed lag follows, which is not the GPU's either). With RX_VK_FG_GAME_CLOCK=0 the two are the same
+bool pace_feeds(int64_t span, int64_t frame, int64_t hand_span, int64_t hand_frame) {
+    return span * 2 <= frame * 3 && hand_span * 2 <= hand_frame * 3;
+}
+
 /// (longshot) A fixed multiplier's set's delay before the GPU's (pace_delay): its made frames come from the game frame that
 /// came at now, so none of them can be shown before it. Delayed by made / (made + 1) of the game's frame time (frame), the
 /// set's first frame is due at now when the game frame came a frame time after the one before (earlier after a longer
@@ -271,6 +357,15 @@ int fifo_pick(int frames, int shown, int k) {
     return ((k + 1) * frames * 2 + shown) / (2 * shown) - 1;
 }
 
+/// (longshot) The time RX_VK_FG_GAME_CLOCK=0's hand-over gives a fixed set's game frame, for a set on the game's presents
+/// (fixed_clock) whose game frame is due (game_due) before the hand-over (now): its due time and how far its place is
+/// behind the hand-over. 0 otherwise: a game frame due after the hand-over has its own time to be held to, and at the
+/// hand-over itself it is due a lead and the GPU's delay later, never before. fifo_catch_up holds the game frame to the
+/// later of its own time and this one
+int64_t fixed_hand_due(int64_t game_due, int64_t place_at, int64_t now) {
+    return game_due < now ? game_due + (now - place_at) : 0;
+}
+
 // doc: docs/dev/reference/architecture.md#frame-generations-presents (rule 6: under FIFO the made frames do not queue)
 /// (longshot) FIFO's catch-up (display_main's take): how many made frames a fixed multiplier's set on the game's timeline
 /// leaves out, spread over it (fifo_pick). The frames shown go a refresh apart at the least (fifo_slot), the first a
@@ -281,16 +376,22 @@ int fifo_pick(int frames, int shown, int k) {
 /// game back (RX_VK_FG_FIFO_CAP: vk_reflex.cpp fifo_min_interval_us). At most made - 1: a made frame and the game's
 /// stay, as one frame alone is not presented ahead and would leave the timeline (present_ahead_wanted); so 2x (one made
 /// frame) keeps it. No slot or refresh yet: 0. Without it the frames queue: 6x at 165 Hz held the game to 27.5 frames a
-/// second and showed each game frame 138 ms after its hand-over
-int fifo_catch_up(int made, const int64_t* due, int64_t slot, int left, int64_t refresh, int64_t now) {
+/// second and showed each game frame 138 ms after its hand-over. The game frame's time is hand_due where that is later
+/// (0: none): a set on the game's presents (fixed_clock) whose game frame was due before the render thread handed it
+/// over (its lag past the smoothed one by more than the set's lead and the GPU's delay) is held to where its hand-over
+/// puts it (framegen_record; RX_VK_FG_GAME_CLOCK=0's time). Its frames cannot be shown sooner whatever the refresh, and
+/// from a time already past no frames a refresh apart fit: all its made frames but one were left out and the game
+/// frame went late anyway (3x and 4x on 240 Hz, a present held 50 ms in the replay, hold_ms)
+int fifo_catch_up(int made, const int64_t* due, int64_t slot, int left, int64_t refresh, int64_t now, int64_t hand_due) {
     if (made < 2 || slot <= 0 || refresh <= 0) return 0;
+    const int64_t own = std::max(due[made], hand_due);
     int64_t next = slot + std::max(left, 1) * refresh;
     if (next < now - refresh / 2) next = now;   // (as fifo_slot: a line fallen behind starts again from now)
     for (int shown = made + 1; shown > 2; shown--) {
         // (the frames picked, each at its slot as fifo_slot gives them: the first at next or its own time)
         int64_t at = std::max(due[fifo_pick(made + 1, shown, 0)], next);
         for (int k = 1; k < shown; k++) at = std::max(due[fifo_pick(made + 1, shown, k)], at + refresh);
-        if (at - due[made] <= refresh) return made + 1 - shown;
+        if (at - own <= refresh) return made + 1 - shown;
     }
     return made - 1;
 }
@@ -349,7 +450,7 @@ bool make_pipe(Pipe& p, const uint32_t* code, size_t bytes, std::initializer_lis
 
 // The optional interpolation is disabled after setup fails: retain none of its unused setup objects.
 void drop_setup() {
-    for (Pipe* p : {&fg.copy, &fg.luma, &fg.flow, &fg.median, &fg.synth}) drop_pipe(*p);
+    for (Pipe* p : {&fg.copy, &fg.luma, &fg.flow, &fg.median, &fg.synth, &fg.copy_pq, &fg.synth_pq}) drop_pipe(*p);
     if (fg.nearest) vkDestroySampler(dev.device, fg.nearest, nullptr);
     if (fg.linear) vkDestroySampler(dev.device, fg.linear, nullptr);
     fg.nearest = fg.linear = VK_NULL_HANDLE;
@@ -397,7 +498,7 @@ bool init_scale() {
     scale.init = scale.failed = true;
     if (!dev.push_descriptor || !vkCmdPushDescriptorSetKHR) return false;
     const VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    if (make_pipe(scale.pipe, BUILTIN_SPV_ARGS(FG_SCALE_COMP_SPV), {S, I, S}, 20)) {
+    if (make_pipe(scale.pipe, BUILTIN_SPV_ARGS(FG_SCALE_COMP_SPV), {S, I, S}, 36)) {
         VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
         si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         si.maxLod = 0.25f;
@@ -695,14 +796,40 @@ void drop_size() {
     for (OutSet& set : fg.sets)
         for (Img& t : set.frame) drop_img(t);
     fg.w = fg.h = 0;
+    fg.color_format = VK_FORMAT_UNDEFINED;
     fg.mult = 0;
     fg.have_prev = false;
     fg.recorded = nullptr;
 }
 
+bool init_pq_framegen() {
+    if (fg.copy_pq.pipe) return true;
+    if (fg.pq_failed) return false;
+    constexpr VkFormat format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    VkFormatProperties properties{};
+    vkGetPhysicalDeviceFormatProperties(dev.physical, format, &properties);
+    constexpr VkFormatFeatureFlags required = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
+                                             VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+    const VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    if ((properties.optimalTilingFeatures & required) == required && dev.features.shaderStorageImageExtendedFormats &&
+        make_pipe(fg.copy_pq, BUILTIN_SPV_ARGS(FG_COPY_PQ_COMP_SPV), {S, I}, 16) &&
+        make_pipe(fg.synth_pq, BUILTIN_SPV_ARGS(FG_SYNTH_PQ_COMP_SPV), {S, S, S, I}, 4))
+        return true;
+    drop_pipe(fg.copy_pq);
+    drop_pipe(fg.synth_pq);
+    fg.pq_failed = true;
+    logf("vk: frame interpolation: 10-bit HDR buffers unavailable; presenting the original HDR frames");
+    return false;
+}
+
+void drain_framegen_sets() {
+    std::unique_lock lk(fg.mu);
+    fg.cv.wait(lk, [] { return fg.jobs.empty() && !fg.sets[0].busy && !fg.sets[1].busy && !fg.sets[2].busy; });
+}
+
 bool by_short = false;   // (PS5: memory is short, the renderer's own in place of the row's generator; the menu reads it)
 std::atomic<int> memory_level{0};   // (PS5: fg_by::level_next's step, 0 to 2; framegen_on asks, the menu reads it)
-bool ensure_size(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
+bool ensure_size(VkCommandBuffer cmd, uint32_t w, uint32_t h, VkFormat color_format) {
     // (PS5: the Frame generation by row too. Its generators are made for the one the row names and let go with the rest
     // below, so a change of the row frees the other's images: never PS5_MihawkGen's network and Lossless Scaling's chain
     // at once)
@@ -726,11 +853,8 @@ bool ensure_size(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
 #else
     const int by = 0;
 #endif
-    if (fg.w == w && fg.h == h && fg.mult == multiplier() && fg.by == by) return true;
-    {   // (the display thread is done with the old sets first)
-        std::unique_lock lk(fg.mu);
-        fg.cv.wait(lk, [] { return fg.jobs.empty() && !fg.sets[0].busy && !fg.sets[1].busy && !fg.sets[2].busy; });
-    }
+    if (fg.w == w && fg.h == h && fg.mult == multiplier() && fg.color_format == color_format && fg.by == by) return true;
+    drain_framegen_sets();   // (the display thread is done with the old sets first)
     {
         std::lock_guard qk(dev.present_mu);   // (every queue idle: the present queue's too, device_wait_idle_locked)
         device_wait_idle_locked();
@@ -740,14 +864,14 @@ bool ensure_size(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
     const VkImageUsageFlags rw = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     bool ok = true;
     for (int i = 0; i < 2; i++) {
-        ok = ok && make_img(fg.frames[i], w, h, VK_FORMAT_R8G8B8A8_UNORM, rw | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+        ok = ok && make_img(fg.frames[i], w, h, color_format, rw | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
         ok = ok && make_img(fg.lumas[i], qw, qh, VK_FORMAT_R16_SFLOAT, rw);
         ok = ok && make_img(fg.flows[i], cw, ch, VK_FORMAT_R16G16B16A16_SFLOAT, rw);
     }
     const int mult = multiplier();
     for (OutSet& set : fg.sets)
         for (int k = 0; k < mult; k++)
-            ok = ok && make_img(set.frame[k], w, h, VK_FORMAT_R8G8B8A8_UNORM,
+            ok = ok && make_img(set.frame[k], w, h, color_format,
                                 rw | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     if (!ok) {
         fg.failed = true;
@@ -761,6 +885,9 @@ bool ensure_size(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
     if (fg.by != by) logf("vk: frame interpolation by: %s", fg_by::name(by));
 #endif
     fg.w = w, fg.h = h, fg.mult = mult, fg.by = by;
+    fg.color_format = color_format;
+    if (color_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32)
+        logf("vk: frame interpolation: 10-bit PQ color buffers (%ux%u, Vulkan format %u)", w, h, (unsigned)color_format);
     for (int i = 0; i < 2; i++) {
         to_general(cmd, fg.frames[i].image), to_general(cmd, fg.lumas[i].image), to_general(cmd, fg.flows[i].image);
     }
@@ -1024,9 +1151,12 @@ void display_main() {
     // copies did not go to the GPU as they came; ready: the others, ready_ns their first copies' ends past their game frames,
     // summed; slotted: their frames held back under FIFO to a refresh after the one before, fifo_slot; caught: made frames
     // left out by FIFO's catch-up, fifo_catch_up; games, game_ns: the sets' game frames presented and their time from the
-    // game's handing over (framegen_record) to their present call, summed)
+    // game's handing over (framegen_record) to their present call, summed; clocked, lag_ns, lag_max: the sets on the line
+    // placed on the game's presents (fixed_clock) and how long after them they were handed over, summed and at most;
+    // below: the others at their hand-over because the game ran below its cap; capped: the GPU's delay fed back at its
+    // most, a game frame (pace_delay))
     struct { int on_time, late, skipped; int64_t since; int by_time, early, waited, ready; int64_t ready_ns; int slotted, caught,
-             games; int64_t game_ns; } stat{};
+             games; int64_t game_ns; int clocked, below; int64_t lag_ns, lag_max; int capped; } stat{};
     int64_t next_show = 0, shown_at = 0, slot = 0;   // (slot: the time the last frame was given, for fifo_slot)
     int64_t fifo_refresh = 0;   // (the last set on the line's refresh, ns: take's catch-up under FIFO)
     int hist[7] = {};   // (<2 ms apart: two presents the screen hardly tells apart)
@@ -1045,10 +1175,12 @@ void display_main() {
         int first = 0;   // (made frames left out, spread over the set: FIFO's catch-up, take; frame k shown is fifo_pick's)
         int64_t step = 0, ready_at = 0;
         int64_t refresh = 0;   // (on the game's timeline: the display's refresh, ns, for fifo_slot; 0 not known)
+        uint64_t id = 0;       // (the sets taken so far, this one included: its presents' set for RX_VK_PRESENT_PROBE)
         PendingPresent pending[kMaxMult];
     };
     Taken taken[2];   // (the set being shown, and the next one, taken early: take_early)
     int held = 0;
+    uint64_t sets_taken = 0;
     // A fixed multiplier's set at its times on the game's timeline (by_time): fixed_on_timeline. Its game[] marks its
     // game frame, as Auto's
     const auto on_line = [&](const OutSet* set) { return set->shown < 0 && fixed_on_timeline(set->by_time, timeline_off); };
@@ -1062,8 +1194,10 @@ void display_main() {
         antilag_present_frame = (timed ? j.set->game[f] : f == j.set->made) ? j.set->antilag_id : 0;
         present_defer_into = &s.pending[k];
         const int64_t t0 = now_ns();
-        present_image(j.set->frame[f].image, fg.w, fg.h, nullptr, j.set->frame[f].view);
+        present_image(j.set->frame[f].image, fg.w, fg.h, nullptr, j.set->frame[f].view, false, true, fg.color_format);
         present_defer_into = nullptr;
+        s.pending[k].game = timed ? j.set->game[f] : f == j.set->made;   // (RX_VK_PRESENT_PROBE's columns, as at its copy)
+        s.pending[k].set = s.id;
         // (as it came: taken within 3 ms of its coming, and its first copy not held in present_image over 3 ms, waiting for a
         // frame slot, a swapchain image or a new swapchain. A wait there grows with the delay; the
         // copy's own time to submit (the game's held submits, the queue's lock) is the pipeline's and counts in the delay:
@@ -1080,6 +1214,7 @@ void display_main() {
     const auto take = [&](Taken& s, const Job& j, int room, int left) {
         s = Taken{};
         s.j = j;
+        s.id = ++sets_taken;
         if (last_at) {
             const int64_t d = j.at - last_at;
             if (d > 0 && d < 100000000) interval = (interval * 7 + std::clamp<int64_t>(d, 4000000, 50000000)) / 8;
@@ -1107,8 +1242,18 @@ void display_main() {
                 logf("vk: frame interpolation: the game's frame presented %.1f ms after it was handed over (%.1f at most, %d "
                      "frames)", lag.sum / 1e6 / lag.n, lag.most / 1e6, lag.n);
             lag = {};
+            if (stat.by_time && !stat.clocked)
+                logf("vk: frame interpolation: none of the sets on the game's timeline placed on the game's presents, all "
+                     "at their hand-over (%d with the game below its cap; RX_VK_FG_GAME_CLOCK=0, or no present's time known: "
+                     "all); the GPU's delay at its most, a game frame, %d times",
+                     stat.below, stat.capped);
+            else if (stat.by_time)
+                logf("vk: frame interpolation: %d of the sets on the game's timeline placed on the game's presents, the "
+                     "others at their hand-over (%d with the game below its cap; RX_VK_FG_GAME_CLOCK=0: all); handed over "
+                     "%.1f ms after their present (at most %.1f); the GPU's delay at its most, a game frame, %d times",
+                     stat.clocked, stat.below, stat.lag_ns / 1e6 / stat.clocked, stat.lag_max / 1e6, stat.capped);
             memset(hist, 0, sizeof hist);
-            stat = {0, 0, 0, j.at, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+            stat = {0, 0, 0, j.at, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
         }
         // (longshot) The pacer. The game hands over frames 12 to 28 ms apart around a mean of 19, and shown as they came that
         // was the stutter, whatever the frame rate. Every frame now has its place on an even line, the recent frame time
@@ -1125,7 +1270,7 @@ void display_main() {
         // whole, all its frames
         if (!s.auto_timed && dev.swap_mode == VK_PRESENT_MODE_FIFO_KHR && on_line(j.set) &&
             present_ahead_wanted(true, j.set->made + 1, dev.swap_spare.load(std::memory_order_relaxed)) &&
-            (s.first = fifo_catch_up(j.set->made, j.set->due, slot, left, fifo_refresh, now_ns())))
+            (s.first = fifo_catch_up(j.set->made, j.set->due, slot, left, fifo_refresh, now_ns(), j.set->hand_due_ns)))
             s.shown -= s.first, stat.caught += s.first;
         s.step = interval / std::max(s.shown, 1);
         if (s.auto_timed) menu_note_frame(true, 0);   // (the overlay's game rate: Auto counts each game frame, given a refresh or not)
@@ -1200,20 +1345,25 @@ void display_main() {
         // as it came (as_came): one that waited, for images or for the display thread, had its copies behind more of the
         // game's work the later the set before was shown, so the delay grew with its own lateness (at 4x a set waited for
         // the images of the one before once the delay passed 3/4 of a game frame, and the delay went up to a whole one).
-        // Not from a set after a long game frame either (over 1.5 smoothed ones: its first frame's time came early by the
-        // difference, which is not the GPU's)
+        // Not from a set after a long game frame either, on the game's timeline or in the hand-overs (pace_feeds)
         if (s.line) {
             stat.by_time++;
             stat.early += s.early;
             stat.waited += !s.as_came;
+            if (j.set->lag_ns >= 0)
+                stat.clocked++, stat.lag_ns += j.set->lag_ns, stat.lag_max = std::max(stat.lag_max, j.set->lag_ns);
+            else
+                stat.below += j.set->below_cap;
             if (first && s.as_came) {
                 const int64_t at = s.ready_at ? s.ready_at : now_ns();
                 stat.ready++;
                 stat.ready_ns += at - j.at;
-                if (j.set->span_ns * 2 <= j.set->frame_ns * 3)
-                    fg.late_ns.store(pace_delay(fg.late_ns.load(std::memory_order_relaxed),
-                                                j.set->extra_ns + (at - j.set->due[0]) + 1000000, j.set->frame_ns),
-                                     std::memory_order_relaxed);
+                if (pace_feeds(j.set->span_ns, j.set->frame_ns, j.set->hand_span_ns, j.set->hand_frame_ns)) {
+                    const int64_t extra = pace_delay(fg.late_ns.load(std::memory_order_relaxed),
+                                                     j.set->extra_ns + (at - j.set->due[0]) + 1000000, j.set->frame_ns);
+                    stat.capped += extra >= j.set->frame_ns;
+                    fg.late_ns.store(extra, std::memory_order_relaxed);
+                }
             }
         }
         const bool timed = s.timed;
@@ -1265,7 +1415,7 @@ void display_main() {
                 // (NVIDIA Reflex: the set's game frame is presented as the game frame it was made at, made frames as none)
                 reflex_present_frame = (timed ? j.set->game[f] : f == j.set->made) ? j.set->reflex_id : 0;
                 antilag_present_frame = (timed ? j.set->game[f] : f == j.set->made) ? j.set->antilag_id : 0;
-                present_image(j.set->frame[f].image, fg.w, fg.h, nullptr, j.set->frame[f].view);
+                present_image(j.set->frame[f].image, fg.w, fg.h, nullptr, j.set->frame[f].view, false, true, fg.color_format);
             }
             fg_latency_note(j.at, t, timed ? j.set->game[f] : f == j.set->made, j.set->reflex_id,
                             s.ahead ? s.pending[k].swapchain : VK_NULL_HANDLE, s.ahead ? s.pending[k].swapchain_generation : 0);   // (RX_VK_FG_LATENCY_LOG)
@@ -1320,9 +1470,16 @@ bool fsr_given = false;
 int framegen_capped(int framegen, int dlss_most) {
     return framegen >= 2 && dlss_most > 0 ? std::min(framegen, dlss_most + 1) : framegen;
 }
-int framegen_now() { return framegen_capped(opts.framegen, dlss_fg_most()); }
+int framegen_now() {
+    if (dlssg_active()) return 0;   // (NVIDIA Streamline makes the frames and shows them, vk_dlssg.cpp: none are this file's)
+    return framegen_capped(opts.framegen, dlss_fg_most());
+}
 
 FgMaker framegen_maker() {
+    if (dlssg_active()) {   // (NVIDIA Streamline's DLSS-G, vk_dlssg.cpp: its own word on whether it makes them now)
+        const int making = dlssg_making();
+        return making == 1 ? FgMaker::Dlss : making == 2 ? FgMaker::DlssPaused : FgMaker::None;
+    }
     // (none recorded for half a second: Frame generation off, or the window's presents without it)
     if (now_ns() - maker_at.load(std::memory_order_relaxed) > 500000000) return FgMaker::None;
     const int b = maker_count[(int)FgMaker::BuiltIn].load(std::memory_order_relaxed);
@@ -1420,7 +1577,8 @@ static void release_when_off() {
 
 bool framegen_on() {
     static const int allow = !getenv("RX_VK_FRAMEGEN") || atoi(getenv("RX_VK_FRAMEGEN")) != 0;
-    const bool wanted = framegen_wanted(opts.framegen, allow) && !dev.offscreen && !fg.failed;
+    // (longshot: off while NVIDIA Streamline makes DLSS FG's frames, vk_dlssg.cpp)
+    const bool wanted = framegen_wanted(opts.framegen, allow) && !dev.offscreen && !fg.failed && !dlssg_active();
 #ifdef __PROSPERO__
     if (wanted) memory_level_tick();
     if (!wanted || memory_level.load(std::memory_order_relaxed) >= 2) {
@@ -1513,7 +1671,7 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
     if (pq && !scale.pq_tried) {
         scale.pq_tried = true;
         const VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        if (!make_pipe(scale.pipe_pq, BUILTIN_SPV_ARGS(FG_SCALE_PQ_COMP_SPV), {S, I, S}, 20))
+        if (!make_pipe(scale.pipe_pq, BUILTIN_SPV_ARGS(FG_SCALE_PQ_COMP_SPV), {S, I, S}, 36))
             logf("vk: the 10-bit window scaling pass could not be made: Native HDR's picture is shown unscaled");
     }
     if (pq && !scale.pipe_pq.pipe) return VK_NULL_HANDLE;
@@ -1523,45 +1681,44 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
     }
     const VkFormat format = pq ? VK_FORMAT_A2B10G10R10_UNORM_PACK32 : VK_FORMAT_R8G8B8A8_UNORM;
     const Pipe& pipe = pq ? scale.pipe_pq : scale.pipe;
-    // (the game draws into part of its window textures, 2048 x 1152 of 2560 x 1440 here: the filter was given the whole texture, and the
-    // picture came out in the top left corner of the window with black around it. The crop first, then the filter)
-    if (source.x || source.y || source.w != sw || source.h != sh) {
-        const uint32_t cw = source.w, ch = source.h;
-        if (scale.cropped_w != cw || scale.cropped_h != ch) {
-            {
-                std::lock_guard qk(dev.present_mu);
-                device_wait_idle_locked();
-            }
-            drop_img(scale.cropped);
-            scale.cropped_w = scale.cropped_h = 0;
-            if (!make_img(scale.cropped, cw, ch, format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
-                drop_img(scale.cropped);
-                return VK_NULL_HANDLE;
-            }
-            scale.cropped_w = cw, scale.cropped_h = ch;
-            to_general(cmd, scale.cropped.image);
-        }
-        if (pq) {   // (the bits as they are: a blit converts from the image's own format, which is not always the picture's
-                    // (vk_texture.cpp format_class shares images by class); a copy keeps the game's 10-bit codes either way)
-            VkImageCopy c{};
-            c.srcSubresource = c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            c.srcOffset = {(int)source.x, (int)source.y, 0};
-            c.extent = {cw, ch, 1};
-            vkCmdCopyImage(cmd, image, VK_IMAGE_LAYOUT_GENERAL, scale.cropped.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
-        } else {
-            VkImageBlit b{};
-            b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            b.srcOffsets[0] = {(int)source.x, (int)source.y, 0};
-            b.srcOffsets[1] = {(int)(source.x + cw), (int)(source.y + ch), 1};
-            b.dstOffsets[1] = {(int)cw, (int)ch, 1};
-            vkCmdBlitImage(cmd, image, VK_IMAGE_LAYOUT_GENERAL, scale.cropped.image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
-        }
-        full_barrier(cmd);
-        src = scale.cropped.view;
-    }
     // With no window effect, the CRT itself maps the finished game image to the output pixel grid.
-    // Avoid an otherwise redundant full-size scale image and dispatch.
-    if (!scaling) return record_crt(cmd, src, source.w, source.h, dw, dh, scale.output_view);
+    // CRT downsample has no crop UVs, so materialize scale.cropped only on this CRT-only cropped route.
+    if (!scaling) {
+        if (source.x || source.y || source.w != sw || source.h != sh) {
+            const uint32_t cw = source.w, ch = source.h;
+            if (scale.cropped_w != cw || scale.cropped_h != ch) {
+                {
+                    std::lock_guard qk(dev.present_mu);
+                    device_wait_idle_locked();
+                }
+                drop_img(scale.cropped);
+                scale.cropped_w = scale.cropped_h = 0;
+                if (!make_img(scale.cropped, cw, ch, format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+                    drop_img(scale.cropped);
+                    return VK_NULL_HANDLE;
+                }
+                scale.cropped_w = cw, scale.cropped_h = ch;
+                to_general(cmd, scale.cropped.image);
+            }
+            if (pq) {
+                VkImageCopy c{};
+                c.srcSubresource = c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                c.srcOffset = {(int)source.x, (int)source.y, 0};
+                c.extent = {cw, ch, 1};
+                vkCmdCopyImage(cmd, image, VK_IMAGE_LAYOUT_GENERAL, scale.cropped.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+            } else {
+                VkImageBlit b{};
+                b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                b.srcOffsets[0] = {(int)source.x, (int)source.y, 0};
+                b.srcOffsets[1] = {(int)(source.x + cw), (int)(source.y + ch), 1};
+                b.dstOffsets[1] = {(int)cw, (int)ch, 1};
+                vkCmdBlitImage(cmd, image, VK_IMAGE_LAYOUT_GENERAL, scale.cropped.image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
+            }
+            full_barrier(cmd);
+            src = scale.cropped.view;
+        }
+        return record_crt(cmd, src, source.w, source.h, dw, dh, scale.output_view);
+    }
     if (scale.scaled_w != dw || scale.scaled_h != dh) {
         {
             std::lock_guard qk(dev.present_mu);   // (the queue is idle only while nothing else submits to it)
@@ -1579,7 +1736,9 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
         scale.scaled_w = dw, scale.scaled_h = dh;
         to_general(cmd, scale.scaled.image);
     }
-    struct { int mode; float sharp; float x0, x1; int side; } pc{opts.upscale, opts.sharpness / 100.0f, wide.x0, 1.0f - wide.x0, wide.side};
+    struct { int mode; float sharp; float x0, x1; int side; int crop[4]; } pc{
+        opts.upscale, opts.sharpness / 100.0f, wide.x0, 1.0f - wide.x0, wide.side,
+        {(int)source.x, (int)source.y, (int)source.w, (int)source.h}};
     if (wide.side == 1) {   // (the blurred sides: first the picture at 1/8, each pixel the mean of its 8 x 8, which they blur)
         // (the checked source rectangle, as the crop above: the picture src now holds)
         const uint32_t smw = std::max(1u, source.w / 8), smh = std::max(1u, source.h / 8);
@@ -1704,20 +1863,24 @@ namespace {
 struct HudState {
     std::mutex mu;   // (framegen_hud_before is called from the replay's workers)
     bool init = false, failed = false;
+    Pipe mask_pq;
+    bool mask_pq_failed = false;
+    VkFormat source_format = VK_FORMAT_UNDEFINED;
     Pipe mask;
     // (the picture after the upscale, and as presented: its format and size; two of each, this frame's at k and the frame
     // before's at k ^ 1, for the HUD layer's fit: prev says the frame before's are there and its pair)
     Img before[2], after[2];
     int k = 0;
     bool prev = false;
-    Pipe fit_pipe, over_pipe;
+    Pipe fit_pipe, over_pipe, fit_pipe_rgba8, over_pipe_rgba8;
     bool layer_failed = false;
+    bool layer_hdr = false;
     Img fit;     // (the HUD layer's fit, kept from frame to frame: the crop's size, RGBA16F)
-    Img layer;   // (the HUD's colour and how see-through it is, the crop's size, RGBA16F: fg_hud_layer.comp)
+    Img layer;   // (the HUD's colour and how see-through it is, the crop's size, RGBA8 in SDR / RGBA16F in HDR)
     bool layered = false;   // (this present's layer made: fsr3fi_frames lays the HUD over the made frames with it)
     uint64_t layers = 0;    // (presents with it: the 600-present line)
-    Img source;          // (the interpolation source: the frame's crop, RGBA8, the HUD's alpha 0)
-    Img hudless;         // (the same crop of the picture before the HUD, RGBA8: FSR 3.1's HUD-less colour)
+    Img source;          // (the interpolation source: the frame's crop in fg.color_format, the HUD's alpha 0)
+    Img hudless;         // (the same crop of the picture before the HUD, FSR 3.1's HUD-less colour)
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t pw = 0, ph = 0, sw = 0, sh = 0;
     VkImage picture = VK_NULL_HANDLE;   // (the picture copied: framegen_hud_before's, its image)
@@ -1777,27 +1940,43 @@ bool hudless_wanted(bool native_pq) {
     return on;
 }
 
+VkFormat hud_layer_format(bool hdr_active) {
+    return hdr_active ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+}
+
 /// The HUD layer of this present (hud.layer, shaders/fg_hud_layer.comp), from this frame's pictures and the frame before's:
 /// how see-through the HUD is where it is known. False: none (the HUD laid over the made frames whole, as presented)
-bool hud_layer(VkCommandBuffer cmd, int x0, int y0, uint32_t w, uint32_t h) {
+bool hud_layer(VkCommandBuffer cmd, int x0, int y0, uint32_t w, uint32_t h, bool hdr_layer) {
     if (hud.layer_failed || !hud_layer_wanted()) return false;
     const VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    if (!hud.fit_pipe.pipe && (!make_pipe(hud.fit_pipe, BUILTIN_SPV_ARGS(FG_HUD_LAYER_COMP_SPV), {S, S, S, S, I, I}, 20) ||
-                               !make_pipe(hud.over_pipe, BUILTIN_SPV_ARGS(FG_HUD_COMPOSITE_COMP_SPV), {I, S, S}, 12))) {
-        hud.layer_failed = true;
-        logf("vk: fsr3fi: the HUD layer's pipelines were not made: the HUD laid over the made frames as presented");
-        return false;
+    Pipe& fit_pipe = hdr_layer ? hud.fit_pipe : hud.fit_pipe_rgba8;
+    Pipe& over_pipe = hdr_layer ? hud.over_pipe : hud.over_pipe_rgba8;
+    if (!fit_pipe.pipe) {
+        const bool ok = hdr_layer
+                            ? make_pipe(fit_pipe, BUILTIN_SPV_ARGS(FG_HUD_LAYER_COMP_SPV), {S, S, S, S, I, I}, 20) &&
+                                  make_pipe(over_pipe, BUILTIN_SPV_ARGS(FG_HUD_COMPOSITE_COMP_SPV), {I, S, S}, 12)
+                            : make_pipe(fit_pipe, BUILTIN_SPV_ARGS(FG_HUD_LAYER_RGBA8_COMP_SPV), {S, S, S, S, I, I}, 20) &&
+                                  make_pipe(over_pipe, BUILTIN_SPV_ARGS(FG_HUD_COMPOSITE_RGBA8_COMP_SPV), {I, S, S}, 12);
+        if (!ok) {
+            drop_pipe(fit_pipe);
+            drop_pipe(over_pipe);
+            hud.layer_failed = true;
+            logf("vk: fsr3fi: the HUD layer's pipelines were not made: the HUD laid over the made frames as presented");
+            return false;
+        }
     }
+    if (hud.layer.image && hud.layer_hdr != hdr_layer) hud_retire(hud.layer);
+    hud.layer_hdr = hdr_layer;
     const VkImageUsageFlags rw = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     if (!hud_image(cmd, hud.fit, w, h, VK_FORMAT_R16G16B16A16_SFLOAT, rw) ||
-        !hud_image(cmd, hud.layer, w, h, VK_FORMAT_R16G16B16A16_SFLOAT, rw)) {
+        !hud_image(cmd, hud.layer, w, h, hud_layer_format(hdr_layer), rw)) {
         hud.layer_failed = true;
         logf("vk: fsr3fi: the HUD layer's images (%ux%u) were not made: the HUD laid over the made frames as presented", w, h);
         return false;
     }
     const int k = hud.k, j = hud.prev ? k ^ 1 : k;   // (no frame before: this frame's bound in its place, not read)
     const int32_t pc[5] = {x0, y0, (int32_t)w, (int32_t)h, hud.prev ? 1 : 0};
-    pass(cmd, hud.fit_pipe,
+    pass(cmd, fit_pipe,
          {{hud.before[k].view, fg.nearest},
           {hud.after[k].view, fg.nearest},
           {hud.before[j].view, fg.nearest},
@@ -1833,14 +2012,23 @@ bool hud_source(VkCommandBuffer cmd, int cur, uint32_t sw, uint32_t sh, int x0, 
             return hud.prev = false;
         }
     }
-    if (hud.sw != w || hud.sh != h) {   // (the layer's fit is the crop's: started again)
+    if (pq && hud.mask_pq_failed) return hud.prev = false;
+    if (pq && !hud.mask_pq.pipe) {
+        const VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        if (!make_pipe(hud.mask_pq, BUILTIN_SPV_ARGS(FG_HUD_PQ_COMP_SPV), {S, S, S, I, I}, 20)) {
+            hud.mask_pq_failed = true;
+            logf("vk: fsr3fi: the 10-bit HUD mask pipeline was not made; using the 10-bit frame without a HUD mask");
+            return hud.prev = false;
+        }
+    }
+    if (hud.sw != w || hud.sh != h || hud.source_format != fg.color_format) {   // (the layer's fit is the crop's: started again)
         hud_retire(hud.source), hud_retire(hud.hudless), hud_retire(hud.fit), hud_retire(hud.layer);
-        hud.sw = w, hud.sh = h, hud.prev = false;
+        hud.sw = w, hud.sh = h, hud.source_format = fg.color_format, hud.prev = false;
     }
     const VkImageUsageFlags rw = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     if (!hud_image(cmd, hud.after[k], sw, sh, hud.format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT) ||
-        !hud_image(cmd, hud.source, w, h, VK_FORMAT_R8G8B8A8_UNORM, rw | VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ||
-        !hud_image(cmd, hud.hudless, w, h, VK_FORMAT_R8G8B8A8_UNORM, rw | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+        !hud_image(cmd, hud.source, w, h, fg.color_format, rw | VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ||
+        !hud_image(cmd, hud.hudless, w, h, fg.color_format, rw | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
         hud.failed = true;
         logf("vk: fsr3fi: the HUD mask's images (%ux%u) were not made: the HUD guessed", w, h);
         return hud.prev = false;
@@ -1852,7 +2040,7 @@ bool hud_source(VkCommandBuffer cmd, int cur, uint32_t sw, uint32_t sh, int x0, 
     full_barrier(cmd);
     // (pq: the native HDR picture, already encoded as the frame is; else linear, sRGB-encoded under the HUD: fg_hud.comp)
     const int32_t pc[5] = {x0, y0, (int32_t)w, (int32_t)h, pq ? 1 : 0};
-    pass(cmd, hud.mask,
+    pass(cmd, pq ? hud.mask_pq : hud.mask,
          {{fg.frames[cur].view, fg.nearest},
           {hud.before[k].view, fg.nearest},
           {hud.after[k].view, fg.nearest},
@@ -1864,7 +2052,7 @@ bool hud_source(VkCommandBuffer cmd, int cur, uint32_t sw, uint32_t sh, int x0, 
         logf("vk: fsr3fi: the HUD marked for it: what the game drew over its picture after the upscale (%ux%u, format %d)",
              sw, sh, (int)hud.format);
     }
-    hud.layered = hudless_wanted(pq) && hud_layer(cmd, x0, y0, w, h);
+    hud.layered = hudless_wanted(pq) && hud_layer(cmd, x0, y0, w, h, pq || dev.hdr || opts.hdr != 0);
     // (a fit uses the preceding pair only if its layer ran; a Native HDR capture must not feed the next sRGB fit)
     hud.prev = hud.layered;
     hud.k ^= 1;
@@ -1938,7 +2126,7 @@ int fsr3fi_frames(VkCommandBuffer cmd, OutSet& set, int cur, uint32_t uw, uint32
         in.color = hud.source.view, in.color_image = hud.source.image;
         in.hud_mask = true;
     }
-    in.color_format = VK_FORMAT_R8G8B8A8_UNORM;   // (ensure_size, for fg.frames)
+    in.color_format = fg.color_format;
     in.native_pq = native_pq;
     in.max_luminance = native_pq ? (float)std::clamp(opts.hdr_peak, 400, 10000) : 1.0f;
     in.width = uw, in.height = uh;
@@ -1963,8 +2151,9 @@ int fsr3fi_frames(VkCommandBuffer cmd, OutSet& set, int cur, uint32_t uw, uint32
     if (layered) {   // (this frame's HUD over each made frame's own scene: shaders/fg_hud_composite.comp)
         full_barrier(cmd);
         const int32_t pc[3] = {(int32_t)uw, (int32_t)uh, native_pq ? 1 : 0};
+        const Pipe& over = hud.layer_hdr ? hud.over_pipe : hud.over_pipe_rgba8;
         for (int i = 0; i < count; i++)
-            pass(cmd, hud.over_pipe,
+            pass(cmd, over,
                  {{set.frame[slot[i]].view, VK_NULL_HANDLE}, {fg.frames[cur].view, fg.nearest}, {hud.layer.view, fg.nearest}},
                  uw, uh, pc, sizeof pc);
     }
@@ -1978,10 +2167,21 @@ int fsr3fi_frames(VkCommandBuffer cmd, OutSet& set, int cur, uint32_t uw, uint32
     return count;
 }
 
-bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t sh, const int crop[4], bool native_pq) {
+bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t sh, const int crop[4], bool native_pq,
+                     int64_t game_at, int64_t game_wait) {
     const PresentSourceRect source = present_source_rect(sw, sh, crop);
     const int x0 = (int)source.x, y0 = (int)source.y, w = (int)source.w, h = (int)source.h;
-    if (!src || w <= 0 || h <= 0 || !init() || !ensure_size(cmd, (uint32_t)w, (uint32_t)h)) return false;
+    const VkFormat color_format = native_pq ? VK_FORMAT_A2B10G10R10_UNORM_PACK32 : VK_FORMAT_R8G8B8A8_UNORM;
+    if (!src || w <= 0 || h <= 0 || !init()) return false;
+    if (native_pq && !init_pq_framegen()) {
+        // Finish older sets before the caller presents this frame directly. Do not blend across the fallback.
+        drain_framegen_sets();
+        fg.have_prev = false;
+        return false;
+    }
+    if (!ensure_size(cmd, (uint32_t)w, (uint32_t)h, color_format)) return false;
+    const Pipe& copy_pipe = native_pq ? fg.copy_pq : fg.copy;
+    const Pipe& synth_pipe = native_pq ? fg.synth_pq : fg.synth;
     if (!fg.thread_started) {
         fg.thread_started = true;
         std::thread(display_main).detach();
@@ -1991,6 +2191,11 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     if (fg.last_at && !gap)
         fg.game_ns = fg.game_ns ? (fg.game_ns * 7 + (now - fg.last_at)) / 8 : now - fg.last_at;
     fg.last_at = now;
+    // (a fixed multiplier's sets: at the game's own presents, the render thread's smoothed lag later (fixed_clock), from
+    // the game frame before's place there; below the game's cap at their hand-over)
+    static const char* clock_env = getenv("RX_VK_FG_GAME_CLOCK");
+    static const bool clock_off = clock_env && env_value_off(clock_env);
+    const ClockPlace place = fixed_clock(fg.clock, game_at, game_wait, now, gap, clock_off);
     OutSet* set;
     {
         std::unique_lock lk(fg.mu);
@@ -2012,7 +2217,7 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     const uint32_t qw = (uw + 3) / 4, qh = (uh + 3) / 4, cw = (qw + 3) / 4, ch = (qh + 3) / 4;
     full_barrier(cmd);
     const int32_t pc[4] = {x0, y0, w, h};
-    pass(cmd, fg.copy, {{src, fg.nearest}, {fg.frames[cur].view, VK_NULL_HANDLE}}, uw, uh, pc, sizeof pc);
+    pass(cmd, copy_pipe, {{src, fg.nearest}, {fg.frames[cur].view, VK_NULL_HANDLE}}, uw, uh, pc, sizeof pc);
     pass(cmd, fg.luma, {{fg.frames[cur].view, fg.nearest}, {fg.lumas[cur].view, VK_NULL_HANDLE}}, qw, qh);
 #ifdef LONGSHOT_LSFG
     const bool lsfg_mid = lsfg_feed(cmd, cur, blend);   // (Lossless Scaling's halfway frame, where it is on)
@@ -2080,7 +2285,7 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
                                     {fg.flows[0].view, VK_NULL_HANDLE}}, cw, ch);
                 pass(cmd, fg.median, {{fg.flows[0].view, fg.nearest}, {fg.flows[1].view, VK_NULL_HANDLE}}, cw, ch);
             }
-            pass(cmd, fg.synth, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
+            pass(cmd, synth_pipe, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
                                  {fg.flows[1].view, fg.nearest}, {set->frame[k].view, VK_NULL_HANDLE}},
                  uw, uh, &t[k], 4);
         }
@@ -2101,7 +2306,8 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         VkImage outs[kMaxMult];
         VkImageView views[kMaxMult];
         for (int k = 0; k < m - 1; k++) outs[k] = set->frame[k].image, views[k] = set->frame[k].view;
-        set->made = dlss_fg_frames(cmd, fg.frames[cur].image, fg.frames[cur].view, uw, uh, m - 1, outs, views, blend, sequence);
+        set->made = dlss_fg_frames(cmd, fg.frames[cur].image, fg.frames[cur].view, color_format,
+                                   uw, uh, m - 1, outs, views, blend, sequence);
     }
     FgMaker maker = set->made ? FgMaker::Dlss : FgMaker::None;
     // (longshot) DLSS FG chosen, on a temporal Upscaler, and no picture from it for this set (the game's own menus, movies and
@@ -2144,7 +2350,7 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         pass(cmd, fg.median, {{fg.flows[0].view, fg.nearest}, {fg.flows[1].view, VK_NULL_HANDLE}}, cw, ch);
         for (int k = 1; k < m; k++) {
             const float t = (float)k / (float)m;
-            pass(cmd, fg.synth, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
+            pass(cmd, synth_pipe, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
                                  {fg.flows[1].view, fg.nearest}, {set->frame[k - 1].view, VK_NULL_HANDLE}},
                  uw, uh, &t, 4);
         }
@@ -2152,17 +2358,24 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         maker = FgMaker::BuiltIn;
     }
     note_maker(maker);
-    // (longshot) The set's times on the game's own timeline (fixed_dues): each frame at its place between the two game
-    // frames, its lead (pace_lead) and the GPU's delay (pace_delay) later. display_main shows the set at them
-    // (fixed_on_timeline; under FIFO one a refresh at most, fifo_slot). Without a frame before it (the first, a hitch) or a
-    // made frame, none
-    if (blend && set->made > 0 && fg.game_ns > 0) {
+    // (longshot) The set's times on the game's own timeline (fixed_dues, from its presents: fixed_clock): each frame at its
+    // place between the two game frames, its lead (pace_lead) and the GPU's delay (pace_delay) later. display_main shows the
+    // set at them (fixed_on_timeline; under FIFO one a refresh at most, fifo_slot). Without a frame before it (the first, a
+    // hitch, a place far from the one before) or a made frame, none
+    if (blend && place.timed && set->made > 0 && fg.clock.frame > 0) {
         const int64_t extra = fg.late_ns.load(std::memory_order_relaxed);
-        fixed_dues(before, now, set->made, pace_lead(fg.game_ns, set->made) + extra, set->due);
+        fixed_dues(place.before, place.at, set->made, pace_lead(fg.clock.frame, set->made) + extra, set->due);
         for (int k = 0; k <= set->made; k++) set->game[k] = k == set->made;
-        set->frame_ns = fg.game_ns;
-        set->span_ns = now - before;
+        set->frame_ns = fg.clock.frame;
+        set->span_ns = place.at - place.before;
+        set->hand_span_ns = now - before;
+        set->hand_frame_ns = fg.game_ns;
+        set->lag_ns = place.lag;
+        set->below_cap = place.lag < 0 && fg.clock.held;
         set->extra_ns = extra;
+        // (its game frame due before its hand-over, the place that far behind it: FIFO's catch-up holds it to where the
+        // hand-over puts it. Never at the hand-over itself, RX_VK_FG_GAME_CLOCK=0: a lead and a delay after it)
+        set->hand_due_ns = fixed_hand_due(set->due[set->made], place.at, now);
         set->by_time = true;
     }
     const VkImageCopy c{{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0},

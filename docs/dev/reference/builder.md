@@ -513,6 +513,19 @@ another clang made them stale, and they said only hot or not of a function.
   `cold` (laid out apart from the code that runs); the hottest, those that hold 95 % of the counted runs (at most
   4,000), in `lifted_hot_*.ll` units built at `RX_HOT_OPT`; the functions it saw never run in `lifted_cold_*.ll` units
   built at `RX_COLD_OPT` (`-O0`). The profile is in the lift's key: a new profile lifts again.
+- **Hot-cold splitting** (on by default, `LONGSHOT_HOT_SPLIT=0` off; `longshot-builder dev lift` reads the switch, `--no-hot-split` over it): in the
+  hot units a branch whose block ran but that the profile never saw taken is weighted 0 (else it has no weights), or 1
+  when it goes to a block that ran through another edge (a join, which must not look cold), and the hot units are
+  compiled with `-hot-cold-split` for blocks behind a weight of 0 alone (`-hotcoldsplit-cold-probability-denom`,
+  `build_compile::hotsplit`). A region of blocks that never ran becomes a `cold` function of its own
+  (`f_<entry>.cold.<n>`) where LLVM can take it out (one way in, few live values); block placement puts the rest after
+  the blocks that ran. A function that calls the host's setjmp is written `noinline`, which the splitting leaves whole.
+  The functions the edits change and those of `LONGSHOT_HOT_SPLIT_SKIP` get no new zero weights; in every function
+  of a hot unit a side that was taken or goes to a block that ran is kept from a probability LLVM takes for cold, and
+  the first branch of a split function's later piece (`passes::split` makes that block at the function's entry
+  address, so the counts there are not its own) has no weights. The flags are the whole unit's, so LLVM can still move
+  out a region of a left-out function at a call of a `cold` helper. The lift's key file says the switch (`hot_split skip ...`), and a `longshot-builder compile` on its
+  own refuses a lift made with it otherwise.
 - **Recorded**: [the build](build.md#record-the-guest-profile).
 
 ## What it decodes
@@ -541,6 +554,22 @@ FTZ clear) is the exact result unless the result is a NaN or, with FPCR.FZ, an o
 check is a NaN result or any subnormal (FZ or not: rare, and it keeps the check to an `is.fpclass` per value). Then (a
 branch weighted unlikely) the exact semantics run instead, in a helper written once per unit (`internal`, `noinline`,
 `cold`), taking the operands and FPCR. The semantics check counts both paths and fails unless both ran.
+
+By default (`LONGSHOT_FP_NAN_MID=0` turns it off: [build switches](build.md#build-switches)), the slow path of an add,
+subtract, multiply, divide, FMULX or fused multiply-add in a hot unit has a middle path (`nan_mid` in
+`crates/sem/src/fpfast.rs`, after `simplify`): where no operand lane and no lane of the fast value is subnormal, every
+flush of the exact semantics is the identity, so their value is the NaN choice applied to the host's operation, inline;
+only a subnormal lane takes the helper. A vector with a NaN in one lane (the cloth keeps one in its fourth) so takes a
+few instructions instead of the call. The test reads its values through an empty `asm` so that LLVM keeps it apart
+from the fast path's own classifications, which stay merged (the slow path's code can still make a function save more
+callee-saved registers on Windows: 14 of the 1,470 hot functions at `-march=native` on a Zen 3); the middle path's code
+is the hot units' only (about the size of the fast path again in a float-heavy unit; their compile takes about a third
+longer). The log counts the fast paths given one, of the functions given it. The switch is in the hot units' keys
+alone (with the skip list's entries among each one's functions; a hot unit with all of them on the list keeps its key
+without the option) and in the lift's whole key; the other units' keys do not move. The semantics check runs
+fixed NaN cases without it, with it and with a wrong test (the operands' lanes untested), which must fail under FZ, and
+counts the middle path's runs (`--fp-nan-mid` runs all of it so; `--march x86-64-v2` or `v3` compiles for the shipped
+targets).
 
 ## Building and checking the builder
 

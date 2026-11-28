@@ -1,3 +1,4 @@
+// fg_synth.comp sha256 c9709e6ce9051467818b2bfd28f9bd4849e5d0e6d65bd73d455afdff21beccfd (tests/test_framegen_hdr.py --write: glslangValidator -V --target-env vulkan1.2 --vn FG_SYNTH_COMP_SPV)
 	// 1116.6.0
 	 #pragma once
 const uint32_t FG_SYNTH_COMP_SPV[] = {

@@ -118,6 +118,7 @@ void hos_wide_ui_size(Ctx *c, uint64_t pane) { note(3, pane, c); }
 void hos_wide_ui_bg(Ctx *c) { note(4, c->x[8], c); }
 void hos_wide_ui_bg_draw(Ctx *c) { note(5, c->x[1], c); }
 void hos_wide_ui_built(Ctx *c, uint64_t layout) { note(6, layout, c); }
+void hos_wide_ui_list_setup(Ctx *c, uint64_t engine) { note(8, engine, c); }
 int hos_camera_trace_enabled(void) { return 0; }
 void hos_log(const char *fmt, ...) { (void)fmt; note(7, 0, NULL); }
 /* (the title card's sites, game/oot_wide_sites.c's too, are tests/test_title_card_sites.py's: here only what they link to) */

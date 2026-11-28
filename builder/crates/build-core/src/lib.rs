@@ -17,6 +17,7 @@
 pub mod channel;
 pub mod child;
 pub mod fsx;
+pub mod game_layout;
 pub mod jobs;
 pub mod key;
 pub mod lock;

@@ -108,10 +108,18 @@ def check_sites():
                      r"mkwvk::cxx_escape::escaped\(\"mkwvk_init\", e\);", init):
         problems.append("vk_main.cpp: mkwvk_init does not catch around init_body")
     body = block(main, "static const MkwVkRenderer* init_body(const MkwVkHost* h) {")
-    for needle in ("cxx_escape::g_hooks.log =", "cxx_escape::g_hooks.out_of_memory =", "cxx_escape::g_hooks.fatal =",
-                   'logf("vk: FATAL: %s", why);', "std::_Exit(3);", "guard_renderer(table);"):
+    # (the FATAL line and the exit code 3 are vk_replay.cpp's replay_fatal, through fatal_end: one end, Streamline's too)
+    for needle in ("cxx_escape::g_hooks.log =", "cxx_escape::g_hooks.out_of_memory =", "cxx_escape::g_hooks.fatal = fatal_end;",
+                   "guard_renderer(table);"):
         if needle not in body:
             problems.append("vk_main.cpp init_body: no " + needle)
+    replay = read("gpu/vk/vk_replay.cpp")
+    fatal = block(replay, "[[noreturn]] void replay_fatal(const char* why) {")
+    if "void fatal_end(const char* why) { replay_fatal(why); }" not in replay:
+        problems.append("vk_replay.cpp: fatal_end is not replay_fatal")
+    for needle in ('logf("vk: FATAL: %s", why);', "std::_Exit(3);"):
+        if needle not in fatal:
+            problems.append("vk_replay.cpp replay_fatal: no " + needle)
     if "guard_renderer(table);" in body:
         if body.index("host = &host_storage;") > body.index("cxx_escape::g_hooks.out_of_memory ="):
             problems.append("vk_main.cpp init_body: the hooks are set before the host is kept")
@@ -119,7 +127,6 @@ def check_sites():
             problems.append("vk_main.cpp init_body: the table is guarded before it is filled")
     if "host->out_of_memory(what)" not in body[body.index("cxx_escape::g_hooks.out_of_memory ="):]:
         problems.append("vk_main.cpp init_body: the out-of-memory hook is not the host's out_of_memory")
-    replay = read("gpu/vk/vk_replay.cpp")
     for name, fn in (("presenter", "presenter_loop"), ("replay", "replay_thread_main"), ("order", "sync_watch")):
         if '::mkwvk::cxx_escape::spawn_needed("%s", %s);' % (name, fn) not in replay:
             problems.append("vk_replay.cpp: the %s thread (%s) is not started through spawn_needed" % (name, fn))

@@ -4,11 +4,16 @@
 // takes the last frame back along t of its motion and the new frame forward along 1 - t; only when those two agree: a
 // vector that is wrong for this pixel (Link's edge against the bright haze, what the block did not hold) brought in
 // unrelated light, seen as white flashes and flicker between the game's frames, so there too it is the plain blend.
+#ifdef FG_NATIVE_PQ
+#define FG_COLOR_FORMAT rgb10_a2
+#else
+#define FG_COLOR_FORMAT rgba8
+#endif
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(binding = 0) uniform sampler2D fa;
 layout(binding = 1) uniform sampler2D fb;
 layout(binding = 2) uniform sampler2D flow;
-layout(binding = 3, rgba8) uniform writeonly image2D dst;
+layout(binding = 3, FG_COLOR_FORMAT) uniform writeonly image2D dst;
 layout(push_constant) uniform P { float t; } pc;
 vec2 fl(ivec2 q) { return texelFetch(flow, clamp(q, ivec2(0), textureSize(flow, 0) - 1), 0).xy; }
 float gap(vec3 x, vec3 y) { const vec3 d = abs(x - y); return max(d.r, max(d.g, d.b)); }

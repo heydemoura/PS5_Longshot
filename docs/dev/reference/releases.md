@@ -240,8 +240,7 @@ page only.
 
 ## Signing
 
-CI signs `SHA256SUMS` with the release key (ECDSA P-256, the organization secret `RELEASE_SIGNING_KEY_SEALED`, opened
-only on the server's runner: [CI](ci.md#secrets-only-our-runners-can-open)), then checks
+CI signs `SHA256SUMS` with the release key (ECDSA P-256, a secret of MagicBeanAdmin/Release: [CI](ci.md#secrets)), then checks
 the signature against the public keys the launcher trusts (Longshot's [release_keys.json](../../../scripts/release_keys.json),
 the launcher's `Core/ReleaseTrust.cs`): a key the launcher doesn't trust stops the release in CI. The launcher checks
 the signature, then each file it downloads against `SHA256SUMS`, and a file it made from a delta against the

@@ -4,7 +4,9 @@
 # dlss fetches the SDK at its pinned release, SHA-256 checked, without DLSS's runtime: NVIDIA's license is accepted for that run
 # alone (--accept-nvidia-license), and nothing of it is uploaded or cached.
 # AMD FSR 4 (--upscaler fsr4: AMD's MIT headers, nothing downloaded) is built in the same run: both engines share
-# vk_temporal.cpp.
+# vk_temporal.cpp. So is NVIDIA DLSS Frame Generation through NVIDIA Streamline (LONGSHOT_SL_SDK: vk_dlssg.cpp and
+# vk_dlssg_layer.cpp), its SDK fetched the same way by scripts/fetch.py streamline --build-only: its headers and licenses,
+# not its runtime.
 # It runs on the Linux runner (there is no Windows one, docs/dev/reference/ci.md): RX_TARGET=windows, with llvm-mingw's Linux
 # build of tools.lock's release (scripts/longshot_builder.py llvm-mingw --host linux) and a Linux longshot-builder (scripts/longshot_builder.py,
 # the pinned Rust), as a Windows player's build makes the back end.
@@ -27,7 +29,7 @@ defaults:
 
 jobs:
   vulkan-dlss:
-    name: Windows Vulkan back end with NVIDIA DLSS and AMD FSR 4 (llvm-mingw, link check)
+    name: Windows Vulkan back end with NVIDIA DLSS, DLSS FG through Streamline and AMD FSR 4 (llvm-mingw, link check)
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -71,18 +73,23 @@ jobs:
           echo "RX_CPM=$RUNNER_TEMP/win-tools/tools/cpm" >> "$GITHUB_ENV"
       - name: NVIDIA's DLSS SDK (headers and nvsdk_ngx_s.lib)
         run: python -I scripts/fetch.py dlss --platform windows --build-only --accept-nvidia-license "$RUNNER_TEMP/ngx-sdk"
+      - name: NVIDIA Streamline's SDK (headers)
+        run: python -I scripts/fetch.py streamline --build-only --accept-nvidia-license "$RUNNER_TEMP/sl-sdk"
       # (the back end alone (compile --only renderer), with both upscalers asked for: longshot-builder's compile says each in its notes)
-      - name: longshot_vk.dll with NVIDIA DLSS and AMD FSR 4
+      - name: longshot_vk.dll with NVIDIA DLSS, DLSS FG through Streamline and AMD FSR 4
         env:
           RX_RELEASE: '1'
+          LONGSHOT_SL_SDK: ${{ runner.temp }}/sl-sdk
         run: |
           "$RUNNER_TEMP/longshot-builder" compile --only renderer --work "$RUNNER_TEMP/vk-work" --store "$RUNNER_TEMP/vk-store" --root "$PWD" \
             --jobs "$(nproc)" --upscaler dlss,fsr4 --ngx-sdk "$RUNNER_TEMP/ngx-sdk" | tee "$RUNNER_TEMP/vk-build.log"
           test "${PIPESTATUS[0]}" -eq 0
           grep -q "the Vulkan back end: with NVIDIA DLSS" "$RUNNER_TEMP/vk-build.log"
           grep -q "the Vulkan back end: with AMD FSR 4" "$RUNNER_TEMP/vk-build.log"
+          grep -q "the Vulkan back end: with NVIDIA Streamline's DLSS Frame Generation" "$RUNNER_TEMP/vk-build.log"
       # (what it loads is only Windows' own: the system DLLs and the UCRT's api-ms-win-crt-*. NVIDIA's runtime, nvngx_dlss.dll,
-      # is loaded by NGX at run time from the game folder's ngx folder, and its core, _nvngx.dll, from the driver's)
+      # is loaded by NGX at run time from the game folder's ngx folder, and its core, _nvngx.dll, from the driver's;
+      # Streamline's, sl.interposer.dll and the plugins, at run time from beside longshot.exe, its signature checked first)
       - name: Imports
         run: |
           dll="$RUNNER_TEMP/vk-work/build/longshot_vk.dll"

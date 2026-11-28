@@ -613,17 +613,20 @@ HLE(_ZN2nn3nfp5MountERKNS0_12DeviceHandleENS0_9ModelTypeENS0_11MountTargetE) {
     RET(ok ? 0 : NFP_WRONG_STATE);
 }
 /* ModelInfo (0x40): the tag's model as it is on it (page 21 and page 22's first three bytes: the character, its variant, the
-   figure's type, the model's number, the series) */
+   figure's type, the model's number, the series), in the SDK's order: the character id (three bytes), the series, the model's
+   number, the figure's type. The tag keeps the type before the number and the series after it. */
 HLE(_ZN2nn3nfp12GetModelInfoEPNS0_9ModelInfoERKNS0_12DeviceHandleE) {
     AcquireSRWLockShared(&nfc_lk);
     const int ok = dev_state == ST_MOUNTED;
     if (ok && ARG(0)) {
         uint8_t *m = GP(ARG(0));
         memset(m, 0, 0x40);
-        memcpy(m, tag + 0x54, 7);
+        memcpy(m, tag + 0x54, 3);   /* (the character id: its two bytes and the variant) */
+        m[3] = tag[0x5a];           /* (the series) */
         /* The tag stores the model number big endian; ModelInfo returns a native u16. */
         m[4] = tag[0x59];
         m[5] = tag[0x58];
+        m[6] = tag[0x57];           /* (the figure's type) */
     }
     ReleaseSRWLockShared(&nfc_lk);
     RET(ok ? 0 : NFP_WRONG_STATE);

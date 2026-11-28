@@ -172,15 +172,18 @@ checks every file's SHA-256, and asks you to accept the vendor's license first (
 | `python -I scripts/fetch.py dlss [--platform linux\|windows]` | NVIDIA's DLSS SDK, in your development folder's `sdk/ngx-<platform>`, where `dev.py`'s builds take it; for other builds, `LONGSHOT_NGX_SDK=<sdk folder>` |
 | `python -I scripts/fetch.py fsr [--game <game folder>]` | AMD's FSR 4 runtime (Windows); build with `--upscaler fsr4` |
 | `python -I scripts/fetch.py xess [--game <game folder>]` | Intel's `libxess.dll` (Windows) |
+| `python -I scripts/fetch.py streamline [--game <game folder>]` | NVIDIA Streamline's SDK (Windows), for DLSS Frame Generation through Streamline, in your development folder's `sdk/sl`; build with `LONGSHOT_SL_SDK=<sdk folder>` (no build takes it by itself). `--game` copies its runtime beside that folder's `longshot.exe`, unless a runtime file of another release is there: that one is left alone, nothing is copied, and the output says which |
 
 Each takes another folder as its last argument. A player's build needs none of this: `longshot-builder --upscaler ...
 --accept-licenses ...` downloads the same pinned files itself ([the upscalers' runtimes](reference/build.md#the-upscalers-runtimes)).
 `dev.py`'s builds take DLSS when they find an NGX SDK, and FSR 4 with `--fsr`.
 
-Never share a game folder built with the DLSS SDK. On Windows, never put NGX's core (`_nvngx.dll`) beside the game.
+Never share a game folder built with the DLSS SDK or with Streamline's. On Windows, never put NGX's core (`_nvngx.dll`)
+beside the game.
 A change to the pinned DLSS release updates `scripts/fetch.py` (`DLSS_COMMIT` and its table), `tests/test_ngx_sdk.py`
 and the release named in the Longshot Launcher's license text (`App/ViewModels/SettingsStepViewModel.cs` in
-MagicBeanDev/LongshotLauncher).
+MagicBeanDev/LongshotLauncher). A change to the pinned Streamline release updates `scripts/sl_sdk.py` (`VERSION`, the
+zip's SHA-256 and its tables) and `tests/test_sl_sdk.py`.
 
 ## 4. Build a game folder from your dump
 

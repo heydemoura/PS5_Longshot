@@ -4,7 +4,7 @@
 # (scripts/check_host_compile.py, with llvm-mingw); the renderer built alone for Linux and Windows, without and with AMD
 # FSR 4, when the change touches it (longshot-builder compile --only renderer); tests/run_all.py's game-free checks, in
 # 2 parts (the shader recompiler's SPIR-V fixtures among them); the website's build and checks, whose dist/ is the pull
-# request's preview (website.yml). The title and the description are pr-description.yml's. No game data is involved.
+# request's preview (MagicBeanAdmin/Release's longshot-website-preview.yml). The title and the description are pr-description.yml's. No game data is involved.
 # There is no Windows runner: what only Windows can check is in docs/dev/reference/releases.md, "Windows tester".
 #
 # The jobs that need tools run in a CI image (scripts/linux/checks.Dockerfile, its tools installed by
@@ -672,7 +672,7 @@ jobs:
 
   # (on every change, not only website/ ones: the site reads docs/ and the repository's files, so other changes can break
   # it. No secrets here. A pull request's built site (dist/) is kept as the artifact website-dist-<head commit>, which
-  # website.yml's preview uploads as files, from main's code: the site is built once)
+  # MagicBeanAdmin/Release's longshot-website-preview.yml uploads as files, from its own code: the site is built once)
   website:
     name: Website build and checks
     needs: changes

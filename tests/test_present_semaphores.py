@@ -19,7 +19,7 @@ a = p.parse_args()
 source = a.source.resolve()
 main = (source/'gpu/vk/vk_main.cpp').read_text()
 replay = (source/'gpu/vk/vk_replay.cpp').read_text()
-start = replay.index('void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view, bool source_srgb, bool allow_scale, OutputTrialSource trial) {')
+start = replay.index('void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view,\n                              bool source_srgb, bool allow_scale, OutputTrialSource trial, VkFormat framegen_format) {')
 # Read the complete top-level function; capture dependencies can grow its text.
 present = replay[start:replay.index('\n}', start) + 2]
 # (present ahead, #1702: the present itself is present_image's end, present_out, which present_commit also runs; its wait
@@ -204,12 +204,17 @@ struct PendingPresent {
     uint64_t swapchain, swapchain_generation;
     uint64_t reflex_frame = ~0ull;   // (NVIDIA Reflex: the frame it shows; vk_reflex.h reflex_present_frame)
     uint64_t antilag_frame = ~0ull;  // (AMD Anti-Lag 2: the same; vk_antilag.h antilag_present_frame)
+    uint64_t done = 0;   // (its copy's fence)
+    bool game = false;   // (RX_VK_PRESENT_PROBE: its set's game frame)
+    uint64_t set = 0;    // (RX_VK_PRESENT_PROBE: its set)
 };
 thread_local uint64_t reflex_present_frame = ~0ull;   // (vk_reflex.cpp: the frame the present shows, kept around present_out)
 thread_local uint64_t antilag_present_frame = ~0ull;  // (vk_antilag.cpp: the same for AMD Anti-Lag 2)
 PendingPresent* present_defer_into=nullptr;
+struct { uint64_t copy_fence = 0; int game = -1; uint64_t set = 0; } probe;   // (RX_VK_PRESENT_PROBE's: the presented image's copy and frame)
 unsigned committed=0, after_acquire=0;
 bool present_out(uint32_t, std::unique_lock<std::mutex>&) {++committed; return true;}
+void dlssg_before_present(bool) {}   // (vk_dlssg.cpp: NVIDIA Streamline's own, nothing without it)
 ''' + commit + r'''
 void acquire_with_result(VkResult res) {
 ''' + acquire_loss + r'''

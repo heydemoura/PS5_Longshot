@@ -111,7 +111,9 @@ python -I scripts/dev.py packs run [--tree <checkout>] -- <longshot-builder args
   (DLSS, from that SDK), `LONGSHOT_FSR=1` (FSR 4), `LONGSHOT_XESS_SDK` (XeSS). `LONGSHOT_FFX_SDK` beside `LONGSHOT_FSR=1`,
   and `LONGSHOT_XESS_SDK`, say the vendor's license was accepted when `scripts/fetch.py` fetched it: the base passes
   `--accept-licenses amd` or `intel`, and longshot-builder puts its own pinned copy of the runtime in the game folder;
-  `LONGSHOT_NGX_SDK` goes to it as `--ngx-sdk`. A base's packs build with the base's, so build a new base to change them.
+  `LONGSHOT_NGX_SDK` goes to it as `--ngx-sdk`. `LONGSHOT_SL_SDK` (NVIDIA Streamline, `scripts/fetch.py streamline`)
+  beside DLSS on Windows builds DLSS Frame Generation through Streamline ([upscalers](reference/upscalers.md#dlss-fg-through-streamline)).
+  A base's packs build with the base's, so build a new base to change them.
 - A pack makes a runtime prepare its shaders again when its build's `translator_stamp` (in the game folder's
   `longshot_version.txt`, written by longshot-builder) is not its base's.
 - `warm` plays a pack-less runtime and copies the caches it grew back into the base, so no runtime compiles pipelines
@@ -187,9 +189,16 @@ screen, so a screenshot or a stream says which change it is (default: the job's 
 | `timing-cpu` | A measured build | GPU runs on the other CPUs |
 | `profile` | A profile recorded in the game | As `timing` |
 
+Every job gets the queue's own NVIDIA shader cache, `queue/nvcache/` in the development folder (`LONGSHOT_QUEUE_NV_CACHE`;
+a `__GL_SHADER_DISK_CACHE_PATH` you set is kept). NVIDIA files its cache by the program's name alone, so without it a
+build's shader preparation and the queue's runs would fill and evict the cache of the game you play on this PC.
+The queue-managed cache allows NVIDIA's cleanup and defaults to a 10 GiB limit (`__GL_SHADER_DISK_CACHE_SIZE` can
+override it). If its folder cannot be created, the job stops instead of using the player's cache.
+
 - **Measure with `timing`, run everything else with `shared`.** Keep each GPU job short: a long batch holds the queue.
 - **A timed run says when the PC was busy.** While it measures, the queue samples every 2 s what the run's own processes
-  stalled on (CPU, memory and disk: its job's cgroup), the other CPUs' use, builds outside the queue and jobs beside it.
+  stalled on (CPU, memory and disk: its job's systemd scope, the whole PC's without one), the other CPUs' use, builds
+  outside the queue and jobs beside it.
   The PC swapping is recorded but no noise by itself: a game holding 18 GB swaps the rest of a 32 GB PC out. A run past any
   limit (`NOISY` in `scripts/devtools/jobqueue.py`) is marked NOISY in `dev.py queue history`, and `dev.py ab` adds a
   **Noisy:** line naming it, judged on its measured stretch only (`--noise FILE` gives a caller the samples). Run a noisy
@@ -233,6 +242,11 @@ the whole suite's stand-in. Ruff (`ruff.toml`: pyflakes and a few error rules, 1
 `main`, else `origin/main`), `--strict`, `--no-skip` (also the checks a test skips on this OS), `--list`. **A skip is not a pass**: read the table. C++ checks
 compile with `-Werror`; when you change C++ that a check compiles, run them with both compilers (`CXX=g++ ...`, then
 `CXX=clang++ ...`). Before a pull request, run the whole suite.
+
+The checks' compiles are cached by what they compile (the preprocessed source, the flags, the compiler), in one folder
+every clone and worktree on the PC shares, so a second run, or a run in another worktree, compiles only what changed;
+the run's last lines count the hits. `LONGSHOT_CHECK_CACHE=<dir>` moves the cache, and `LONGSHOT_CHECK_CACHE=0` turns
+it off (`tests/check_cache.py` says what it keys on and what it leaves alone).
 
 `tests/run_vulkan_fixtures.py` runs write-back, copy and aspect/crop cases on Mesa's software Vulkan driver (lavapipe)
 with validation. It needs the loader, headers, `vulkaninfo`, lavapipe and the validation layer, and is CPU Vulkan, not

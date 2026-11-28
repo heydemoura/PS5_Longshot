@@ -84,7 +84,9 @@ pub fn sha256_text(text: &str) -> String {
     build_core::key::to_hex(&sha2::Sha256::digest(text.as_bytes()))
 }
 
-/// A test's own empty folder (`<target>/test-scratch/build-driver-<name>-<pid>`).
+/// A test's own empty folder (`<target>/test-scratch/build-driver-<name>-<pid>`), spelled as `std::path::absolute`
+/// spells it: the form the code under test gives a folder it was handed (a profile's, `--profile`'s), so a test that
+/// compares the two compares one spelling (Windows drops the `..` and writes `\`; Unix keeps them).
 #[cfg(test)]
 pub(crate) fn scratch(name: &str) -> std::path::PathBuf {
     // (under the target folder, on the disk: the system's temporary folder may be memory, and these hold game-folder
@@ -92,6 +94,7 @@ pub(crate) fn scratch(name: &str) -> std::path::PathBuf {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
     let target = std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| root.join("target"), |t| root.join(t));
     let d = target.join("test-scratch").join(format!("build-driver-{name}-{}", std::process::id()));
+    let d = std::path::absolute(&d).unwrap_or(d);
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).unwrap();
     d

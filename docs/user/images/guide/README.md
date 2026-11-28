@@ -13,6 +13,8 @@ source hashes. All six launcher images are UI-only captures built from Launcher 
 The current Graphics image was captured from `e78aa33d63fc1598631b320ba8739594848e368e` (main 8aa5ab87, nightly 798,
 with the website's settings-page fix), when #2383's Dynamic resolution row replaced Render resolution's Auto in the
 pictured rows.
+
+Source review against `34f862d293f9b99b14e2fd53ac5b7e0948d6e7e0`: `gpu/vk/vk_framegen.h` gives `framegen_record` the game's present time and wait, for frame generation's pacing. It does not change the pictured Graphics controls or the guide, so the existing image is retained. No new capture was made.
 The [fullscreen-monitor source review](source-review-fullscreen-monitor.md) records the nightly 680 comparison and
 historical rc.8 comparisons. Earlier images remain in repository history.
 

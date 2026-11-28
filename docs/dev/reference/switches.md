@@ -14,10 +14,12 @@ switches are in [profiling](profiling.md). When to add a switch and how to choos
 At start the game takes switches from, in order:
 
 1. **The environment.** A name already set when the game starts wins.
-2. **`longshot_env.txt`** beside `image.bin`, or the file `HOS_ENV_FILE=<path>` names instead. A line for a name the
-   environment already set is left out, and the log says so.
+2. **One switches file.** An explicit `HOS_ENV_FILE` selects that file alone. Otherwise the game reads
+   `<profile>/longshot_env.txt` when present, falling back to `config/longshot_env.txt` in an organized build or
+   `longshot_env.txt` at the root of an older build when the profile has no file or the game starts without a profile. An empty profile file overrides the build file.
+   The log identifies lines skipped because the environment already set their values.
 
-Settings from the Insert menu live in a separate file, [`longshot_options.ini`](#the-options-file). A `player` switch that
+Settings from the Insert menu live in the profile's [`settings.ini`](#the-options-file). A `player` switch that
 stands in for a menu row overrides it for that run only; the options file keeps the player's own value.
 
 ### longshot_env.txt
@@ -131,6 +133,12 @@ The switches players are pointed to (`RX_VK_ASTC_RGBA8`, `RX_VK_MESH_NOCULL` on 
 Scripted input, screenshots, frame dumps and crash switches are in [developing](../developing.md#run-the-game-for-a-test).
 Upscaler switches are in [upscalers](upscalers.md#switches).
 
+### Game-free checks
+
+| Switch | What it does |
+|---|---|
+| `LONGSHOT_CHECK_CACHE=<folder>\|0` | Where `tests/run_all.py` keeps compiled checks, shared across worktrees. Unset: `%LOCALAPPDATA%\Longshot\check-cache` on Windows when available, else `$XDG_CACHE_HOME/longshot-checks` or `~/.cache/longshot-checks`. Set a folder to move it, or `0` to turn it off. |
+
 ### Switches for test runs
 
 | Switch | What it does |
@@ -179,7 +187,7 @@ These override a menu row for the run only (kind `player`).
 | `RX_VK_DLSS=0/1/2`, `RX_VK_FSR4=0/1/2`, `RX_VK_XESS=0/1/2`, `RX_VK_FSR=0/1` | Upscaler: `0` never, `1` the upscaler, `2` its native AA |
 | `RX_VK_FSR4_MODEL=auto\|lite` | The FSR 4 network for one run: Auto lets AMD pick, Lite forces the INT8 Lite provider |
 | `RX_VK_FSR4_STANDIN=0` | No FSR 4 on a GPU AMD's library lists no FSR 4 model for (by default the INT8 Lite provider stands in there) |
-| `RX_VK_FRAMEGEN=0`, `RX_VK_FRAMEGEN_MULT=2..8`, `RX_VK_DLSS_FG=0/1`, `RX_VK_FSR_FG=0/1` | Frame generation (`RX_VK_FRAMEGEN=0` keeps it off whatever the menu says) |
+| `RX_VK_FRAMEGEN=0`, `RX_VK_FRAMEGEN_MULT=2..8`, `RX_VK_DLSS_FG=0/1`, `RX_VK_FSR_FG=0/1`, `RX_VK_DLSSG=0` | Frame generation (`RX_VK_FRAMEGEN=0` keeps it off whatever the menu says; `RX_VK_DLSSG=0` keeps DLSS FG on NGX in a build with NVIDIA Streamline: [upscalers](upscalers.md#dlss-fg-through-streamline)) |
 | `RX_VK_ASYNC=0/1`, `RX_VK_RECORDER=sync\|defer\|thread` | Threaded rendering: the render thread, the recorder (the parallel replay is gone: [threads.md](threads.md)) |
 | `RX_VK_COMPILE_SHADERS=most\|all` | Compile shaders |
 | `RX_VK_NO_INTEL_SERIAL=1/0` | Intel shader compiles: Side by side, One at a time ([below](#intels-compiler-on-windows)) |

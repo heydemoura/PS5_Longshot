@@ -130,6 +130,7 @@ bool screen_size(uint32_t* w, uint32_t* h) {
 bool host_screen_size(uint32_t* w, uint32_t* h) { return screen_size(w, h); }
 std::vector<display_modes::Size> screen_modes() { return {}; }
 int upscaler() { return opts.dlss; } // authored available engine; no backend/GPU call
+int upscaler_row() { return upscaler(); }   // (no Streamline here: nothing waits for the restart)
 uint64_t vram; // the card's video memory, as device_vram_bytes gives it (0: not known)
 uint64_t device_vram_bytes() { return vram; }
 std::vector<std::string> gpu_device_names{"Authored GPU"};

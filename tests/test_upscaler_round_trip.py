@@ -85,6 +85,7 @@ std::atomic<int> grass_distance_now{0};   // (vk_menu.cpp: the Grass distance ro
 /* ROW */
 unsigned available = (1u << ur::kUpscalers) - 1;
 int upscaler() { return available & ur::bit(opts.dlss) ? opts.dlss : (int)ur::GAME; }
+int upscaler_row() { return upscaler(); }   // (no Streamline here: nothing waits for the restart)
 unsigned upscalers_available() { return available; }
 bool row_fixed(const int*) { return false; }
 struct Out { uint32_t w, h; };

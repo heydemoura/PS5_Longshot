@@ -16,8 +16,9 @@ inline std::array<uint32_t, 8> mma_order_a{0, 1, 2, 3, 4, 5, 6, 7};
 inline std::array<uint32_t, 4> mma_order_b{0, 1, 2, 3};
 inline std::array<uint32_t, 4> mma_order_c{0, 1, 2, 3};
 inline bool mma_software = false;   // (HMMA_nx2 in software: emit_spirv_warp.cpp, RX_VK_MMA_SOFTWARE=1)
-// (longshot) and in which form (mma_software.h SoftwareMmaForm: 0 the loop, 1 unrolled, 2 unrolled with the GPU's f16 rounding),
-// chosen by vk_coopmat.cpp's self-test; and whether its quad broadcasts may be used (the device has quad operations in every stage)
+// (longshot) and in which form (mma_software.h SoftwareMmaForm: 0 the loop, 1 unrolled, 2 unrolled with the GPU's f16 rounding,
+// 3 that with f16 pair dot products), chosen by vk_coopmat.cpp's self-test; and whether its quad broadcasts may be used (the device
+// has quad operations in every stage)
 inline uint32_t mma_software_form = 0;
 inline bool mma_software_quad = false;
 // (longshot, AMD RDNA 3/4) HMMA_nx2 on 16x16x16 f16 cooperative matrices: the console's fragments are staged through a
@@ -38,6 +39,14 @@ inline uint32_t mma_wmma16_shared_limit = 0;
 // REQUIRE_FULL_SUBGROUPS (vk_draw.cpp pin_subgroup), so no subgroup has lanes missing; without it no program uses the tiles
 inline bool mma_wmma16_full_subgroups = false;
 inline uint32_t mma_wmma16_max_subgroups = 0;
+// (longshot) B through a workgroup memory tile per subgroup instead of shuffles (mma_software.h SoftwareMmaStagedB), in compute
+// programs whose 32-lane subgroups are full: 0 never, else the device's maxComputeSharedMemorySize, which the program's own
+// workgroup memory and the tiles must fit (vk_coopmat.cpp's self-test, RX_VK_MMA_STAGE_B)
+inline uint32_t mma_software_staged_b = 0;
+// (with it) the device's computeFullSubgroups (vk_coopmat.cpp choose_staged_b, as mma_wmma16_full_subgroups): a workgroup X width
+// that is a multiple of 32 then has REQUIRE_FULL_SUBGROUPS (vk_draw.cpp pin_subgroup), so SubgroupId * 16 stays within the tiles
+// and no lane of a subgroup is missing at its barriers; without it no program stages B
+inline bool mma_software_full_subgroups = false;
 // (amd-fix) float colour outputs carry no NaN or infinity to their target (EmitSetFragColor): one NaN texel spreads
 // through bloom/blur/downsample averages into glowing blocks (OoT's flowers on AMD, Longshot issue 606). On for every
 // card since v2.0.6 (vk_coopmat.cpp coopmat_init); RX_VK_NAN_GUARD=0 turns it off. Idea from NX2navi patch 0027.

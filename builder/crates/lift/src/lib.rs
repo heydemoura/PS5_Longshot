@@ -548,5 +548,8 @@ impl edits::Emit for Builder<'_, '_> {
 
 pub mod whole;
 
+/// The float slow paths' middle path (sem's), for the dev commands that lift without [`whole`].
+pub use sem::{NanMidStats, nan_mid, nan_mid_broken};
+
 #[cfg(test)]
 mod tests;

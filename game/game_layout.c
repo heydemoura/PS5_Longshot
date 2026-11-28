@@ -103,7 +103,7 @@ void hos_game_layout(void) {
     if (!n) return;
     game[n] = 0;   /* (the game folder, with its separator) */
     if (snprintf(cache, sizeof cache, "%scache" SEP_S, game) >= (int)sizeof cache ||
-        snprintf(logs, sizeof logs, "%slogs" SEP_S, game) >= (int)sizeof logs ||
+        snprintf(logs, sizeof logs, "%s%slogs" SEP_S, game, hos_organized_build() ? "diagnostics/" : "") >= (int)sizeof logs ||
         snprintf(prompts, sizeof prompts, "%scache" SEP_S "prompts", game) >= (int)sizeof prompts)
         return;
     CreateDirectoryA(cache, NULL);

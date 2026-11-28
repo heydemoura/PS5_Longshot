@@ -45,6 +45,11 @@ DEFINE_BINARY(OpIAddCarry, spv::Op::OpIAddCarry)
 DEFINE_BINARY(OpVectorTimesScalar, spv::Op::OpVectorTimesScalar)
 DEFINE_BINARY(OpDot, spv::Op::OpDot)
 
+Id Module::OpFDot2MixAcc32VALVE(Id result_type, Id vector_1, Id vector_2, Id accumulator) {
+    code->Reserve(6);
+    return *code << OpId{static_cast<spv::Op>(6916), result_type} << vector_1 << vector_2 << accumulator << EndOp{};
+}
+
 Id Module::OpCooperativeMatrixMulAddKHR(Id result_type, Id a, Id b, Id c) {
     code->Reserve(6);
     return *code << OpId{spv::Op::OpCooperativeMatrixMulAddKHR, result_type} << a << b << c << EndOp{};

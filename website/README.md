@@ -2,7 +2,8 @@
 
 Astro/Starlight front page and player documentation for Longshot by Team MagicBean.
 The game build is independent of this directory. Production deploys from main through
-`.forgejo/workflows/website.yml`; pull-request previews require that workflow's review gate.
+MagicBeanAdmin/Release's `longshot-website.yml` (after a push to `main`, and hourly); a pull request's preview is its
+`longshot-website-preview.yml`, for a branch of this repository or a fork's with the label `preview`.
 
 ## Local preview
 

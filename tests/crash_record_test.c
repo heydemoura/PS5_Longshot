@@ -141,6 +141,7 @@ void hos_log_flush(void) {}
 static void hos_ab_end(void) {}   /* (host/hos_ab.c: no A/B here) */
 void hos_pad_speaker_shutdown(void) {}
 void hos_sdl_vibration_shutdown(void) {}
+static void game_close_log(void) {}   /* (game/game.h: no game here) */
 static void log_flush(void) {}
 void hos_backtrace(void) {}
 void hos_hostcall_stats(void) {}

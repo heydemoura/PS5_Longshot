@@ -12,6 +12,7 @@
      and the standard handles it was started with when it was given a stderr (a run's log.txt), inherited alone;
      then this one exits. */
 #include "hos.h"
+#include "../game/game.h"   /* (the game's hook this file calls: its last log lines) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -194,6 +195,7 @@ void hos_close_finish(void) {
     hos_sdl_vibration_shutdown();
     hos_log("stop: close work done (a file the game was writing waited for, at most 3 s)");
     hos_ab_end();   /* (longshot) HOS_AB: the sides' sums in the log (host/hos_ab.c) */
+    game_close_log();   /* (longshot) the game's last log lines (game/game.h): the cloth's HOS_CLOTH_DECLINES counts */
     hos_log_flush();
     void hos_crash_clean_end(void);
     hos_crash_clean_end();

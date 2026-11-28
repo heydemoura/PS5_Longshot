@@ -113,7 +113,7 @@ pub fn install(src: &Path, carried: &Carried, fs: &Path, progress: &dyn Fn(f64))
             build_core::fsx::remove_tree(&dest)?;
         }
         build_driver::sources::link_dir(&dir, &dest)?;
-        let _ = std::fs::write(dir.join(build_driver::sources::USED), b"");
+        build_driver::storage::mark_used(&dir);
         progress((i as f64 + 1.0) / n);
     }
     Ok((downloaded, said))

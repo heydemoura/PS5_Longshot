@@ -374,6 +374,17 @@ pub(crate) fn verify(f: &Function) -> Result<(), VerifyError> {
     for (_, h) in f.helpers() {
         verify_helper(h).map_err(|e| VerifyError { function: format!("{} (helper {})", f.name(), e.function), ..e })?;
     }
+    // (a module writes each name once: within the function, one name is one body, the middle paths' helpers too)
+    let mut named: HashMap<&str, &Helper> = HashMap::new();
+    for (_, h) in f.helpers() {
+        for m in h.mid.iter().flat_map(|m| [&m.test, &m.value]).chain([h]) {
+            let seen = *named.entry(m.name.as_str()).or_insert(m);
+            if seen.params != m.params || seen.body != m.body || seen.result != m.result {
+                let what = format!("two helpers named {} compute differently", m.name);
+                return Err(VerifyError { function: f.name(), block: f.start, what });
+            }
+        }
+    }
     Ok(())
 }
 
@@ -393,6 +404,34 @@ fn verify_helper(h: &Helper) -> Result<(), VerifyError> {
     }
     if !f.block(f.start).insts.contains(&h.result) || f.ty(h.result).is_none() {
         return Err(fail(format!("the result {} is no value of the body", h.result)));
+    }
+    let Some(mid) = &h.mid else { return Ok(()) };
+    if mid.test.name == mid.value.name {
+        return Err(fail(format!("its middle path's test and value are both named {}", mid.test.name)));
+    }
+    // (a middle path: its test of the parameters but FPCR and the fast value, its value of the parameters)
+    let (fpcr_less, ret) = (&h.params[..h.params.len().saturating_sub(1)], h.ret());
+    let test_params: Vec<Type> = fpcr_less.iter().copied().chain([ret]).collect();
+    for (m, params, want) in [(&mid.test, &test_params, Type::I1), (&mid.value, &h.params, ret)] {
+        if m.mid.is_some() {
+            return Err(fail(format!("its middle path {} has a middle path", m.name)));
+        }
+        if m.name == h.name || !m.name.starts_with("lifter.fp.mid.") {
+            return Err(fail(format!("its middle path is named {} (a lifter.fp.mid. name of its own)", m.name)));
+        }
+        // (its body first: its result's type is read below; and no lookup: it is written inline, reading no memory)
+        verify_helper(m)?;
+        if m.body.blocks().any(|(_, b)| b.insts.iter().any(|&v| matches!(m.body.inst(v).op, Op::Lookup(..)))) {
+            return Err(fail(format!("its middle path {} reads memory (a lookup)", m.name)));
+        }
+        if &m.params != params || m.ret() != want {
+            return Err(fail(format!(
+                "its middle path {} is ({:?}) -> {}, not ({params:?}) -> {want}",
+                m.name,
+                m.params,
+                m.ret()
+            )));
+        }
     }
     Ok(())
 }
@@ -618,7 +657,87 @@ mod tests {
             body.push(body.start, op);
         }
         body.terminate(body.start, Term::Return);
-        Helper { name: "h".into(), params: vec![ty], body, result: p }
+        Helper { name: "h".into(), params: vec![ty], body, result: p, mid: None }
+    }
+
+    /// A helper of `params` whose body returns a constant of `ret` (or its parameter `ret_param`), named `name`.
+    fn helper_of(name: &str, params: &[Type], ret: Type, ret_param: Option<u8>) -> Helper {
+        let mut body = Function::new(0);
+        let ps: Vec<Value> =
+            params.iter().enumerate().map(|(i, &ty)| body.push(body.start, Op::Param { index: i as u8, ty })).collect();
+        let result = match ret_param {
+            Some(i) => ps[usize::from(i)],
+            None => body.push(body.start, Op::Const { ty: ret, value: 0 }),
+        };
+        body.terminate(body.start, Term::Return);
+        Helper { name: name.into(), params: params.to_vec(), body, result, mid: None }
+    }
+
+    #[test]
+    fn checks_middle_paths() {
+        // (a float helper of (f32, f32, i64) -> f32; its test of (f32, f32, the fast f32) -> i1, its value of its own
+        // parameters)
+        let (f, i64t, i1) = (Type::F32, Type::I64, Type::I1);
+        let with = |test: Helper, value: Helper| {
+            let mut h = helper_of("lifter.fp.add.f32.f32.i64", &[f, f, i64t], f, Some(0));
+            h.mid = Some(Box::new(Mid { test, value }));
+            let mut g = Function::new(0x1000);
+            let id = g.add_helper(h);
+            let b = g.start;
+            let v = g.push(b, Op::Get(Loc::V(0)));
+            let x = g.push(b, Op::Bitcast(Type::I128, v));
+            let x = g.push(b, Op::Cast(Cast::Trunc, Type::I32, x));
+            let x = g.push(b, Op::Bitcast(f, x));
+            let fpcr = g.push(b, Op::Get(Loc::Fpcr));
+            let nan = g.push(b, Op::FCmp(FPred::Uno, x, x));
+            g.push(b, Op::Checked { fast: x, slow: nan, helper: id, args: vec![x, x, fpcr] });
+            g.terminate(b, Term::Return);
+            g.verify()
+        };
+        let test = || helper_of("lifter.fp.mid.sub.f32.f32.f32", &[f, f, f], i1, None);
+        let value = || helper_of("lifter.fp.mid.add.f32.f32.i64", &[f, f, i64t], f, Some(1));
+        with(test(), value()).unwrap();
+        let e = with(helper_of("lifter.fp.mid.sub.f32.f32.f32", &[f, f, i64t], i1, None), value()).unwrap_err();
+        assert!(e.what.contains("is ([F32, F32, I64]) -> i1, not ([F32, F32, F32]) -> i1"), "{e}");
+        let e = with(test(), helper_of("lifter.fp.mid.add.f32.f32.i64", &[f, f, i64t], i1, None)).unwrap_err();
+        assert!(e.what.contains("-> i1, not"), "{e}");
+        let e = with(test(), helper_of("lifter.fp.add.f32.f32.i64", &[f, f, i64t], f, Some(0))).unwrap_err();
+        assert!(e.what.contains("a lifter.fp.mid. name of its own"), "{e}");
+        let mut nested = value();
+        nested.mid = Some(Box::new(Mid { test: test(), value: value() }));
+        assert!(with(test(), nested).unwrap_err().what.contains("has a middle path"));
+        let mut impure = value();
+        impure.body = Function::new(0);
+        let p = impure.body.push(impure.body.start, Op::Param { index: 1, ty: f });
+        impure.body.push(impure.body.start, Op::Get(Loc::X(0)));
+        impure.body.terminate(impure.body.start, Term::Return);
+        impure.result = p;
+        assert!(with(test(), impure).unwrap_err().what.contains("whose ops are pure"));
+        // (two middle paths whose tests share a name but not a body: one would be written for both, so refused)
+        let mut g = Function::new(0x1000);
+        for (name, k) in [("lifter.fp.add.f32.f32.i64", 0), ("lifter.fp.sub.f32.f32.i64", 1)] {
+            let mut h = helper_of(name, &[f, f, i64t], f, Some(0));
+            let mut t = helper_of("lifter.fp.mid.subnormal.f32.f32.f32", &[f, f, f], i1, None);
+            let one = t.body.push(t.body.start, Op::Const { ty: i1, value: k });
+            t.result = one;
+            let v = helper_of(&format!("lifter.fp.mid.{name}"), &[f, f, i64t], f, Some(1));
+            h.mid = Some(Box::new(Mid { test: t, value: v }));
+            g.add_helper(h);
+        }
+        g.terminate(g.start, Term::Return);
+        assert!(g.verify().unwrap_err().what.contains("compute differently"));
+        // (the test and the value of one name: one helper in a module, so refused)
+        let same = helper_of("lifter.fp.mid.add.f32.f32.i64", &[f, f, f], i1, None);
+        assert!(with(same, value()).unwrap_err().what.contains("both named"));
+        // (a lookup in a middle path: refused, the writer writes them inline and reading no memory)
+        let mut reads = value();
+        let fpcr = reads.body.push(reads.body.start, Op::Param { index: 2, ty: Type::I64 });
+        reads.body.push(reads.body.start, Op::Lookup(Table::AesSbox, fpcr));
+        assert!(with(test(), reads).unwrap_err().what.contains("reads memory"));
+        // (a body whose result is no value of it: an error, not a panic reading the result's type)
+        let mut lost = value();
+        lost.result = Value(99);
+        assert!(with(test(), lost).unwrap_err().what.contains("is no value of the body"));
     }
 
     #[test]

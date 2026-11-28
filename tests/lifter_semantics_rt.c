@@ -10,7 +10,7 @@
 
 uint8_t a64_dirty[1u << 27];   /* (llvm::Options::default's dirty_pages: untouched pages cost nothing) */
 int trapped;
-uint64_t lifter_fast_checks, lifter_slow_checks;   /* (longshot-builder dev words --count-checks: the float fast paths' runs) */
+uint64_t lifter_fast_checks, lifter_slow_checks, lifter_mid_checks;   /* (longshot-builder dev words --count-checks: the float fast paths' runs, slow ones, middle paths) */
 
 void a64_trap(void *c, uint64_t pc, uint32_t word) { (void)c; (void)pc; (void)word; trapped = 1; }
 void a64_svc(void *c, uint32_t imm) { (void)c; (void)imm; trapped = 2; }

@@ -42,6 +42,7 @@ void record_actual(VkCommandBuffer command,VkImage src,uint32_t sw,uint32_t sh,c
     struct { VkCommandBuffer cmd; } f{command};
     VkImageView view=VK_NULL_HANDLE;
     const bool allow_scale=true, source_srgb=false;
+    [[maybe_unused]] const VkFormat framegen_format=VK_FORMAT_UNDEFINED;
     const uint32_t index=0;
 // @PRODUCTION_PRESENT@
 }

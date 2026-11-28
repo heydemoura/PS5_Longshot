@@ -1,15 +1,15 @@
-"""GetModelInfo converts the tag's big-endian model number to the SDK's native u16.
+"""GetModelInfo returns the tag's model in the SDK's field order, its big-endian model number as a native u16.
 
 Compile the real HLE function from host/nn_nfp.c with stand-ins for guest memory and
-locking. Synthetic model blocks exercise unequal bytes in both orders, zero and
-equal bytes; the other fields, reserved bytes, output bounds, tag contents and
-unmounted states must stay correct. No tag dumps, keys or game files are used.
+locking. Synthetic model blocks in the tag's order (character, variant, figure type,
+model number, series) exercise unequal bytes in both orders, zero and equal bytes; the
+character id, series, number and type, reserved bytes, output bounds, tag contents and
+unmounted states must all stay correct. No tag dumps, keys or game files are used.
 
     python -I -B tests/test_nfc_model_info.py   (needs a C compiler; CC overrides it)
 """
 import os
 from pathlib import Path
-import shlex
 import shutil
 import subprocess
 import sys
@@ -18,6 +18,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
+from compiler_command import parse_compiler
 from srccut import block
 
 FIXTURE = r"""
@@ -68,7 +69,15 @@ int main(void) {
             printf("FAIL case %u: model number 0x%04x, expected 0x%04x\n", i, number, expected);
             fails++;
         }
-        if (result || acquired != 1 || released != 1 || memcmp(out, cases[i], 4) || out[6] != cases[i][6]) fails++;
+        if (result || acquired != 1 || released != 1) fails++;
+        if (memcmp(out, cases[i], 3) || out[3] != cases[i][6] || out[4] != cases[i][5] || out[5] != cases[i][4] ||
+            out[6] != cases[i][3]) {
+            printf("FAIL case %u: ModelInfo %02x %02x %02x %02x %02x %02x %02x, expected character %02x %02x %02x,"
+                   " series %02x, number %02x %02x, type %02x\n",
+                   i, out[0], out[1], out[2], out[3], out[4], out[5], out[6],
+                   cases[i][0], cases[i][1], cases[i][2], cases[i][6], cases[i][5], cases[i][4], cases[i][3]);
+            fails++;
+        }
         for (unsigned k = 7; k < 64; k++) if (out[k]) fails++;
         for (unsigned k = 0; k < sizeof guarded; k++)
             if ((k < 8 || k >= 72) && guarded[k] != 0xa5) fails++;
@@ -90,7 +99,7 @@ int main(void) {
 
 class NfcModelInfo(unittest.TestCase):
     def test_model_number_and_output_contract(self):
-        compiler = shlex.split(os.environ.get("CC", ""))
+        compiler = parse_compiler(os.environ.get("CC", ""))
         if not compiler:
             found = shutil.which("gcc") or shutil.which("clang")
             if not found:

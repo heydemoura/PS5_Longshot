@@ -53,6 +53,7 @@ void hos_wide_ui_size(Ctx *c, uint64_t pane);
 void hos_wide_ui_bg(Ctx *c);
 void hos_wide_ui_bg_draw(Ctx *c);
 void hos_wide_ui_built(Ctx *c, uint64_t layout);
+void hos_wide_ui_list_setup(Ctx *c, uint64_t engine);
 void hos_wide_title_prepare(Ctx *c, uint64_t picture, uint64_t pane, uint64_t params, uint64_t alloc, uint64_t align,
                             uint64_t out, void (*allocate)(Ctx *));
 int hos_wide_title_draw(Ctx *c, void (*draw)(Ctx *));
@@ -378,5 +379,12 @@ int hos_site_ui_title_reset(Ctx *A64_NOESC c) {
 /* ui.layoutBuilt (after add x0, x19, #0x10: a layout's panes built, f_81545d60 returned): a list widened as it is built */
 int hos_site_ui_layout_built(Ctx *A64_NOESC c) {
     hos_wide_ui_built(c, c->x[19]);
+    return 0;
+}
+
+/* ui.listSetup (after mov x19, x0 in f_8151eb00: a list's engine about to count its item slots by its pane's width): a list
+   kept at the screen's width widened before it counts them */
+int hos_site_ui_list_setup(Ctx *A64_NOESC c) {
+    hos_wide_ui_list_setup(c, c->x[19]);
     return 0;
 }

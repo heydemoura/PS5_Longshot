@@ -19,6 +19,7 @@
 
 pub mod compile;
 pub mod generated;
+pub mod hotsplit;
 pub mod key;
 pub mod link;
 pub mod options;
@@ -317,7 +318,7 @@ fn anchors(o: &Options, tc: &toolchain::Toolchain, p: &plan::Plan) -> key::Ancho
         a.add("spirv", sp);
         a.add("vma", vma);
     }
-    for (name, dir) in [("ffmpeg_windows", &p.ffmpeg_windows), ("dav1d", &p.dav1d), ("ngx", &p.ngx)] {
+    for (name, dir) in [("ffmpeg_windows", &p.ffmpeg_windows), ("dav1d", &p.dav1d), ("ngx", &p.ngx), ("sl", &p.sl)] {
         if let Some(d) = dir {
             a.add(name, d);
         }

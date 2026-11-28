@@ -1414,6 +1414,9 @@ void destroy_buffer_later(VkBuffer buffer, VmaAllocation alloc) {
     cap_gone_cv.notify_one();
 }
 void cap_buf_free(VkBuffer buffer, VmaAllocation alloc, void* map, uint64_t size, bool from_worker = false) {
+    std::array<FreeBuf, 12> displaced;
+    size_t displaced_n = 0;
+    bool kept = false;
     {
         std::lock_guard lk(cap_free_mu);
         if (from_worker && cap_shutting_down.load()) return;
@@ -1421,13 +1424,43 @@ void cap_buf_free(VkBuffer buffer, VmaAllocation alloc, void* map, uint64_t size
         const uint64_t limit = std::min<uint64_t>(cap_spare_max(), (pressure ? 32ull : 768ull) << 20);
         const uint64_t pending = cap_reserved_bytes - (from_worker ? size : 0);
         const int workers = cap_prewarm_busy - (from_worker ? 1 : 0);
+        // Completed submissions must be able to change the spare pool's size mix.
+        // Otherwise twelve small spares (or cold large ones filling the byte limit)
+        // reject every return of a newly needed class: it is allocated every submit.
+        // Duplicate size classes are displaced first, oldest-returned on a tie.
+        // Count the incoming buffer too: it can replace its own class's last spare.
+        // Reservations stay promised to workers;
+        // speculative prewarming never displaces a buffer a real submission returned.
+        if (!from_worker && size <= (256ull << 20) && workers < 12 &&
+            pending <= limit && size <= limit - pending) {
+            while (!cap_free.empty() && (cap_free.size() + workers >= 12 ||
+                                        cap_free_bytes > limit - pending - size)) {
+                size_t victim = 0, most = 0;
+                for (size_t i = 0; i < cap_free.size(); ++i) {
+                    const uint64_t cls = cap_free[i].size;
+                    size_t copies = cls == size;
+                    for (const FreeBuf& f : cap_free) copies += f.size == cls;
+                    if (copies > most) victim = i, most = copies;
+                }
+                displaced[displaced_n++] = cap_free[victim];
+                cap_free_bytes -= cap_free[victim].size;
+                cap_free.erase(cap_free.begin() + (ptrdiff_t)victim);
+            }
+        }
         if (!(from_worker && pressure) && cap_free.size() + workers < 12 && size <= (256ull << 20) &&
             cap_free_bytes + size + pending <= limit) {
             cap_free.push_back({buffer, alloc, map, size});
             cap_free_bytes += size;
-            return;
+            kept = true;
         }
     }
+    // Even the synchronous kill-switch path must not destroy under cap_free_mu.
+    for (size_t i = 0; i < displaced_n; ++i) {
+        const FreeBuf& f = displaced[i];
+        if (cap_free_async_on() && !cap_shutting_down.load()) destroy_buffer_later(f.buffer, f.alloc);
+        else destroy_buffer(f.buffer, f.alloc);
+    }
+    if (kept) return;
     if (cap_free_async_on() && !cap_shutting_down.load()) return destroy_buffer_later(buffer, alloc);
     destroy_buffer(buffer, alloc);
 }

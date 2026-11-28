@@ -847,7 +847,11 @@ impl Record {
         let mut k = build_core::key::Key::new();
         k.text("level", level.name()).text("driver", driver);
         for name in key_files(windows) {
-            let path = folder.join(name);
+            let path = if name.starts_with("longshot_vk.") {
+                folder.join(name)
+            } else {
+                build_core::game_layout::data(folder).join(name)
+            };
             let meta = std::fs::metadata(&path).ok()?;
             let time = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
             let size = meta.len();

@@ -21,8 +21,33 @@ The float operations have a fast path (the host's IEEE operation) and a slow one
 builder/crates/sem/src/fpfast.rs). The functions count how often each ran (`words --count-checks`), and the check fails
 unless both did: the NaN-rich and subnormal-rich lanes, with FZ at random, send many runs down the slow path.
 
+A slow path of FPAdd, FPSub, FPMul, FPDiv, FPMulX or FPMulAdd may have a middle path (a lift's hot units have it by
+default, LONGSHOT_FP_NAN_MID=0 turns it off; the other units never; `dev words --fp-nan-mid`): where no operand lane and
+no lane of the fast value is subnormal, the NaN choice inline instead of the helper. `--fp-nan-mid` lifts every word and
+sequence so, and the check then fails unless the middle path and the helper both ran (`lifter_mid_checks`, the third
+counter). Whatever it says, fixed NaN cases (nan_cases: one quiet NaN lane beside finite ones, NaNs in both operands, a
+signalling NaN behind a quiet one, invalid operations of no NaN, a subnormal beside a NaN lane, a subnormal result;
+scalars of each precision, vectors of two and four lanes, by element, fused) are lifted in modules of their own and run
+under every FPCR of FZ and DN: without the middle path, with it (both must match Unicorn, and each other state for
+state, and the second must have run the fast path, the middle path and the helper) and with its wrong test
+(`--fp-nan-mid-broken`: the operands' lanes untested), which must differ: the negative control.
+
+`--hot-flags` compiles the words as a hot unit is compiled with the hot split on (the default; LONGSHOT_HOT_SPLIT=0
+turns it off): at the hot units' -O2 with the build's -ffp-contract=off and the hot units' flags
+(builder/crates/build-compile/src/hotsplit.rs), plus a splitting threshold of HOT_SPLIT_THRESHOLD so that every region
+LLVM takes for cold moves out, however small: a float's slow path
+(its helper is `cold`) is then a call of an outlined cold function and back. The check fails unless the module has
+outlined functions. `--hot-split` (with `--hot-flags`) also lifts them as the switch makes a hot unit (`words
+--hot-split`), so that `--hot-flags` alone and `--hot-split` compare the writer's two modes at the same compile. (A
+word's function has no branch with profile counts, so the writer's weights are not reached here: the lifted code with
+them is run in builder/crates/longshot-builder/tests/hot_split.rs.) Both apply to the NaN cases' modules too, so that
+`--fp-nan-mid --hot-flags --hot-split` runs the middle path as a build's hot unit has it. `--march` compiles the lifted
+code for that CPU level (x86-64-v2, x86-64-v3: the shipped builds' targets; none: clang's default), as a player's build
+is.
+
     python -I tests/test_lifter_semantics.py --cargo <cargo> --cxx <clang++> [--words N] [--trials N]
-                                             [--sequences N] [--seed N]
+                                             [--sequences N] [--seed N] [--fp-nan-mid] [--hot-flags [--hot-split]]
+                                             [--march LEVEL]
 
 Not compared, because there the lifter follows the host model rather than the architecture (or Unicorn models what the
 Switch does not): pointer authentication and its hints (the identity here: PAC*, AUT*, XPAC*, LDRAA, LDRAB, HINT), the
@@ -50,6 +75,7 @@ import collections
 import ctypes
 import os
 import random
+import re
 import struct
 import subprocess
 import sys
@@ -64,10 +90,12 @@ CODE = 0x80000000          # (the words' addresses: f_<CODE + 4 i>)
 SEQ_CODE = 0x90000000      # (the sequences' addresses: f_<SEQ_CODE + SEQ_STRIDE k>)
 SEQ_STRIDE = 0x40
 SEQ_MAX = 8                # (words in a sequence: 2 to this)
+NAN_CODE = 0x9C000000      # (the fixed NaN cases' words: f_<NAN_CODE + 4 i>)
 PAGE = 0x20000000          # (the memory the accesses use, mapped in both)
 PAGE_SIZE = 0x40000
 BASE_AT = PAGE + 0x10000   # (where a base register points: offsets reach -0x1000 .. +0x10000 from it)
 CTX_SIZE = 864
+HOT_SPLIT_THRESHOLD = -100   # (--hot-flags: LLVM's -hotcoldsplit-threshold, its default 2: here every cold region moves)
 NZCV_AT = 264
 VREG_AT = 272
 TPIDR_AT = 784
@@ -313,6 +341,76 @@ def edge_cases(rng):
     return cases
 
 
+# (the fixed NaN cases' values, by name, in each precision: quiet NaNs of two payloads and signs, signalling ones, the
+# infinities and zeros, a subnormal and the smallest normals, a big number whose product with the subnormal is normal)
+NAN_VALUES = {
+    32: {"one": 0x3F800000, "two": 0x40000000, "half": 0x3F000000, "-three": 0xC0400000, "four": 0x40800000,
+         "1.5": 0x3FC00000, "qa": 0x7FC12345, "qb": 0xFFC54321, "sa": 0x7F812345, "sb": 0xFF800ABC, "inf": 0x7F800000,
+         "-inf": 0xFF800000, "0": 0, "-0": 0x80000000, "sub": 0x00200000, "min": 0x00800000, "2min": 0x01000000,
+         "big": 0x71800000},
+    64: {"one": 0x3FF0000000000000, "two": 0x4000000000000000, "half": 0x3FE0000000000000,
+         "-three": 0xC008000000000000, "four": 0x4010000000000000, "1.5": 0x3FF8000000000000,
+         "qa": 0x7FF8000000012345, "qb": 0xFFF8000000054321, "sa": 0x7FF0000000012345, "sb": 0xFFF0000000000ABC,
+         "inf": 0x7FF0000000000000, "-inf": 0xFFF0000000000000, "0": 0, "-0": 1 << 63, "sub": 1 << 50,
+         "min": 1 << 52, "2min": 2 << 52, "big": 1623 << 52},
+    16: {"one": 0x3C00, "two": 0x4000, "half": 0x3800, "-three": 0xC200, "four": 0x4400, "1.5": 0x3E00, "qa": 0x7E12,
+         "qb": 0xFE34, "sa": 0x7C12, "sb": 0xFC34, "inf": 0x7C00, "-inf": 0xFC00, "0": 0, "-0": 0x8000, "sub": 0x0200,
+         "min": 0x0400, "2min": 0x0800, "big": 0x6400},
+}
+# (each case: the four lanes of the first operand (V1), the second (V2) and the addend (V0 and V3); a vector of two
+# lanes, a scalar take the first ones)
+NAN_CASES = [
+    ("one quiet NaN lane", ["1.5", "two", "-three", "qa"], ["two", "half", "four", "one"], ["one"] * 4),
+    ("finite lanes only", ["one", "two", "half", "four"], ["two", "two", "-three", "1.5"], ["one", "half", "0", "-0"]),
+    ("NaNs in both operands", ["qa", "one", "qa", "two"], ["qb", "qb", "one", "qb"], ["qb", "one", "qa", "one"]),
+    ("a signalling NaN behind a quiet one", ["qa", "qa", "one", "qa"], ["sb", "one", "sb", "sb"],
+     ["one", "sa", "one", "qb"]),
+    ("the second lane's NaN alone", ["1.5", "one", "two", "four"], ["two", "qb", "one", "-three"], ["one"] * 4),
+    ("the first operand's second lane NaN alone", ["1.5", "qa", "two", "four"], ["two", "one", "one", "-three"],
+     ["one"] * 4),
+    ("invalid operations of no NaN", ["inf", "inf", "inf", "0"], ["0", "-inf", "inf", "0"],
+     ["qa", "one", "-inf", "one"]),
+    ("zeros of each sign", ["-0", "one", "qa", "-0"], ["-0", "-0", "one", "four"], ["0", "-0", "-0", "one"]),
+    ("a subnormal operand beside a NaN lane", ["qa", "sub", "sub", "2min"], ["one", "big", "min", "sub"],
+     ["one", "0", "0", "one"]),
+    ("a subnormal operand in the first lane", ["sub", "qa", "one", "one"], ["big", "one", "one", "one"],
+     ["0", "one", "one", "one"]),
+    ("a subnormal result beside a NaN lane", ["qa", "min", "half", "one"], ["one", "half", "min", "one"],
+     ["one", "0", "0", "one"]),
+]
+# (the words: Rd 0, Rn 1, Rm 2, Ra 3 (the accumulating forms' addend is V0), with their mnemonic and precision; every
+# kind with a middle path: add, subtract, multiply, divide, FMULX, the fused forms; by element too)
+NAN_WORDS = [
+    (0x4E22D420, "fadd v0.4s", 32), (0x4EA2D420, "fsub v0.4s", 32), (0x6E22DC20, "fmul v0.4s", 32),
+    (0x6E22FC20, "fdiv v0.4s", 32), (0x4E22DC20, "fmulx v0.4s", 32), (0x4E22CC20, "fmla v0.4s", 32),
+    (0x4EA2CC20, "fmls v0.4s", 32), (0x4FA29020, "fmul v0.4s", 32), (0x4FA21020, "fmla v0.4s", 32),
+    (0x4E62D420, "fadd v0.2d", 64), (0x4EE2D420, "fsub v0.2d", 64), (0x6E62DC20, "fmul v0.2d", 64),
+    (0x6E62FC20, "fdiv v0.2d", 64), (0x4E62DC20, "fmulx v0.2d", 64), (0x4E62CC20, "fmla v0.2d", 64),
+    (0x0E22D420, "fadd v0.2s", 32), (0x2E22DC20, "fmul v0.2s", 32),
+    (0x1E222820, "fadd s0", 32), (0x1E223820, "fsub s0", 32), (0x1E220820, "fmul s0", 32), (0x1E221820, "fdiv s0", 32),
+    (0x1E228820, "fnmul s0", 32), (0x5E22DC20, "fmulx s0", 32), (0x1F020C20, "fmadd s0", 32),
+    (0x1F028C20, "fmsub s0", 32), (0x1F220C20, "fnmadd s0", 32),
+    (0x1E622820, "fadd d0", 64), (0x1E620820, "fmul d0", 64), (0x1E621820, "fdiv d0", 64), (0x1F420C20, "fmadd d0", 64),
+    (0x1EE22820, "fadd h0", 16), (0x1EE20820, "fmul h0", 16),
+]
+
+
+def nan_lanes(names, bits):
+    """A V register of the named values, as many lanes as `bits` gives 128 bits (the four names again past four)"""
+    vals = NAN_VALUES[bits]
+    return sum(vals[names[k % 4]] << (bits * k) for k in range(128 // bits))
+
+
+def nan_cases():
+    """The fixed NaN cases: (word, its text, case name, V registers given)"""
+    out = []
+    for w, text, bits in NAN_WORDS:
+        for name, a, b, addend in NAN_CASES:
+            out.append((w, text, name, {1: nan_lanes(a, bits), 2: nan_lanes(b, bits), 0: nan_lanes(addend, bits),
+                                        3: nan_lanes(addend, bits)}))
+    return out
+
+
 def small_signed_minmax(mnemonic, size):
     """LDSMAX* / LDSMIN* of a byte, halfword or word: Unicorn's are unsigned (see the docstring)"""
     return mnemonic.startswith(("ldsmax", "ldsmin")) and (size or 0) < 8
@@ -326,23 +424,62 @@ def sequences(rng, rows, count):
     return [[rng.choice(pool) for _ in range(rng.randint(2, SEQ_MAX))] for _ in range(count)]
 
 
-def build(a, tmp, word_list, seq_words):
+def hot_split_flags():
+    """The hot units' flags with the hot split on, the default (build_compile::hotsplit::flags)"""
+    path = os.path.join(ROOT, "builder", "crates", "build-compile", "src", "hotsplit.rs")
+    with open(path, encoding="utf-8") as f:
+        m = re.search(r"^    \[(\"-mllvm\"[^\]]*)\]\s*\.map\(String::from\)", f.read(), re.M)
+    if not m:
+        raise SystemExit("test_lifter_semantics: %s has no flags' array before .map(String::from)" % path)
+    return re.findall(r'"([^"]+)"', m.group(1))
+
+
+def compile_flags(a):
+    """How the module is compiled: -O1 (the lifted units' level), or as a hot unit with --hot-flags (its level, the
+    build's -ffp-contract=off, the hot split's flags)"""
+    flags = ["-O1"]
+    if a.hot_flags:
+        flags = ["-O2", "-ffp-contract=off"] + hot_split_flags()
+        flags += ["-mllvm", "-hotcoldsplit-threshold=%d" % HOT_SPLIT_THRESHOLD]
+    return flags + (["-march=" + a.march] if a.march else [])
+
+
+def build(a, tmp, word_list, seq_words, flags=(), name="words", pc=CODE):
+    """The module of `word_list` (from `pc`) and `seq_words` (from SEQ_CODE), lifted with `dev words`'s `flags`
+    (and --hot-split's), compiled (compile_flags) and loaded; and the count of fast paths given a middle path (None:
+    not asked)"""
     lifter = os.path.join(ROOT, "builder")
     subprocess.run([a.cargo, "build", "--locked", "--release", "-q", "-p", "longshot-builder"], cwd=lifter, check=True)
     exe = os.path.join(os.environ.get("CARGO_TARGET_DIR", os.path.join(ROOT, "target")), "release", "longshot-builder")
-    words_in, seq_in, ll, listing = (os.path.join(tmp, n) for n in ("words.txt", "seq.txt", "words.ll", "list.txt"))
+    words_in, seq_in, ll, listing = (os.path.join(tmp, name + n) for n in (".txt", ".seq.txt", ".ll", ".list.txt"))
     with open(words_in, "w") as f:
         f.write("".join("%08x\n" % w for w in word_list))
     with open(seq_in, "w") as f:
         f.write("".join("%x %s\n" % (SEQ_CODE + SEQ_STRIDE * k, " ".join("%08x" % w for w in ws))
                         for k, ws in enumerate(seq_words)))
-    subprocess.run([exe, "dev", "words", "--in", words_in, "--pc", "%x" % CODE, "--out", ll, "--list", listing,
-                    "--seq", seq_in, "--count-checks"], check=True)
-    so = os.path.join(tmp, "words.so")
+    hot = ["--hot-split"] if a.hot_split else []
+    out = subprocess.run([exe, "dev", "words", "--in", words_in, "--pc", "%x" % pc, "--out", ll, "--list", listing,
+                          "--seq", seq_in, "--count-checks"] + list(flags) + hot, check=True, stdout=subprocess.PIPE,
+                         text=True)
+    print(out.stdout, end="")
+    given = None
+    for line in out.stdout.splitlines():
+        if "fp nan mid: " in line:
+            given = int(line.split("fp nan mid: ")[1].split()[0])
+    so, obj = os.path.join(tmp, name + ".so"), os.path.join(tmp, name + ".o")
     rt = os.path.join(ROOT, "tests", "lifter_semantics_rt.c")
-    subprocess.run([a.cxx, "-shared", "-fPIC", "-O1", "-mcx16", "-Wno-override-module", "-x", "ir", ll, "-x", "c", rt,
-                    "-o", so], check=True)
-    return ctypes.CDLL(so)
+    subprocess.run([a.cxx, "-c", "-fPIC", "-mcx16", "-Wno-override-module"] + compile_flags(a) + ["-x", "ir", ll,
+                    "-o", obj], check=True)
+    with open(obj, "rb") as f:
+        outlined = len(set(re.findall(rb"f_[0-9a-f]+\.cold\.[0-9]+", f.read())))
+    print("test_lifter_semantics: compiled %s %s: %d outlined cold functions" % (
+        name, " ".join(compile_flags(a)), outlined))
+    if a.hot_flags and outlined == 0:
+        raise SystemExit("test_lifter_semantics: --hot-flags, but no region moved out: the check would prove nothing")
+    if not a.hot_flags and outlined:
+        raise SystemExit("test_lifter_semantics: cold functions outlined without --hot-flags")
+    subprocess.run([a.cxx, "-shared", "-fPIC", "-O1", "-mcx16", obj, "-x", "c", rt, "-o", so], check=True)
+    return ctypes.CDLL(so), given
 
 
 def lift_listing(a, tmp, word_list):
@@ -395,6 +532,7 @@ class Checker:
         self.qregs = [getattr(A, "UC_ARM64_REG_Q%d" % n) for n in range(32)]
         self.checks = ctypes.c_uint64.in_dll(lib, "lifter_fast_checks")
         self.slow_checks = ctypes.c_uint64.in_dll(lib, "lifter_slow_checks")
+        self.mid_checks = ctypes.c_uint64.in_dll(lib, "lifter_mid_checks")
         self.dirty = (ctypes.c_uint8 * (1 << 27)).in_dll(lib, "a64_dirty")
         self.outside = False   # (set by the watch: an access left the page)
         self.watch = None
@@ -452,7 +590,7 @@ class Checker:
         lib.window_write(ctypes.c_uint64(PAGE), st["page"], ctypes.c_uint64(PAGE_SIZE))
         ctypes.c_int.in_dll(lib, "trapped").value = 0
         ctypes.memset(ctypes.addressof(self.dirty) + DIRTY_FIRST, 0, DIRTY_PAGES)
-        self.checks.value = self.slow_checks.value = 0
+        self.checks.value = self.slow_checks.value = self.mid_checks.value = 0
         fn(ctypes.addressof(ctx))
         f = struct.unpack_from("<4B", ctx, NZCV_AT)
         page = ctypes.create_string_buffer(PAGE_SIZE)
@@ -463,7 +601,7 @@ class Checker:
                 "qc": struct.unpack_from("<Q", ctx, FPSR_AT)[0] & FPSR_QC,
                 "tpidr": struct.unpack_from("<Q", ctx, TPIDR_AT)[0], "page": page.raw,
                 "marked": bytes(self.dirty[DIRTY_FIRST:DIRTY_FIRST + DIRTY_PAGES]),
-                "runs": self.checks.value, "slow": self.slow_checks.value}
+                "runs": self.checks.value, "slow": self.slow_checks.value, "mid": self.mid_checks.value}
 
 
 def differences(st, ours, theirs, check_marks):
@@ -501,7 +639,16 @@ def main():
     ap.add_argument("--trials", type=int, default=3, help="random states per word (3)")
     ap.add_argument("--sequences", type=int, default=4000, help="random sequences of words (4000)")
     ap.add_argument("--seed", type=int, default=20261122)
+    ap.add_argument("--fp-nan-mid", action="store_true",
+                    help="lift with the float slow paths' middle path (as a build's hot units)")
+    ap.add_argument("--hot-flags", action="store_true",
+                    help="compile as the build compiles a hot unit (the hot split on), every cold region outlined")
+    ap.add_argument("--hot-split", action="store_true",
+                    help="with --hot-flags: lift as the build makes a hot unit (the hot split on) too")
+    ap.add_argument("--march", default="", help="compile the lifted code for this CPU level (x86-64-v2, x86-64-v3)")
     a = ap.parse_args()
+    if a.hot_split and not a.hot_flags:
+        ap.error("--hot-split compares with --hot-flags at the same compile: give both")
     if "clang" not in os.path.basename(a.cxx):
         print("test_lifter_semantics: skipped, %s is no clang (the lifted code is LLVM IR)" % a.cxx)
         return 0
@@ -521,7 +668,26 @@ def main():
             len(not_lifted), " ".join("%08x" % w for w in not_lifted[:10])))
         return 1
     seqs = sequences(rng, [r for r in rows if r[0] < len(word_list) - len(edge_words)], a.sequences)
-    lib = build(a, tmp, word_list, [[r[1] for r in s] for s in seqs])
+    lib, given = build(a, tmp, word_list, [[r[1] for r in s] for s in seqs], ["--fp-nan-mid"] if a.fp_nan_mid else [])
+    if a.fp_nan_mid and not given:
+        print("test_lifter_semantics: --fp-nan-mid, and no fast path has a middle path")
+        return 1
+    # (the fixed NaN cases (from NAN_CODE) in modules of their own: without the middle path, with it, and with its
+    # wrong test, the negative control)
+    cases = nan_cases()
+    nan_words = [w for w, *_ in NAN_WORDS]
+    plain, _ = build(a, tmp, nan_words, [], [], "nan-plain", NAN_CODE)
+    mid, mid_given = build(a, tmp, nan_words, [], ["--fp-nan-mid"], "nan-mid", NAN_CODE)
+    broken, _ = build(a, tmp, nan_words, [], ["--fp-nan-mid-broken"], "nan-broken", NAN_CODE)
+    if mid_given != len(nan_words):
+        print("test_lifter_semantics: %s of the %d NaN case words have a middle path" % (mid_given, len(nan_words)))
+        return 1
+    with open(os.path.join(tmp, "nan-mid.list.txt")) as f:
+        nan_texts = {int(i): text for i, _, _, _, _, _, text in (line.rstrip("\n").split(" ", 6) for line in f)}
+    for i, (w, want, _) in enumerate(NAN_WORDS):
+        if not nan_texts.get(i, "").startswith(want):
+            print("test_lifter_semantics: NaN case word %08x is %r, not %r" % (w, nan_texts.get(i), want))
+            return 1
     if lib.map_window(ctypes.c_uint64(PAGE), ctypes.c_uint64(PAGE_SIZE)) != 0:
         print("test_lifter_semantics: could not map the window page at the host base")
         return 1
@@ -535,6 +701,8 @@ def main():
         uc.mem_write(CODE + 4 * i, struct.pack("<I", w))
     for k, s in enumerate(seqs):
         uc.mem_write(SEQ_CODE + SEQ_STRIDE * k, b"".join(struct.pack("<I", r[1]) for r in s))
+    uc.mem_map(NAN_CODE, 0x1000)
+    uc.mem_write(NAN_CODE, b"".join(struct.pack("<I", w) for w in nan_words))
     check = Checker(lib, uc, A)
 
     failures = collections.defaultdict(list)
@@ -548,6 +716,7 @@ def main():
         t = paths[bool(st["fpcr"] & FPCR_FZ)]
         t["runs"] += ours["runs"]
         t["slow"] += ours["slow"]
+        t["mid"] += ours["mid"]
         by_mnemonic[mnemonic]["runs"] += ours["runs"]
         by_mnemonic[mnemonic]["slow"] += ours["slow"]
 
@@ -635,14 +804,65 @@ def main():
     print("test_lifter_semantics: %d runs compared over %d words, %d words left out, %d emulator faults" % (
         compared, len(rows) - skipped - len(edge_at), skipped, emulator_faults))
     print("test_lifter_semantics: %d fixed edge states compared over %d words" % (edge_compared, len(edge_at)))
+
+    # The fixed NaN cases, each under every FPCR of FZ and DN: without the middle path and with it, each against
+    # Unicorn and the two against each other state for state; the broken test's module must differ somewhere.
+    def same_state(x, y):
+        return all(x[k] == y[k] for k in ("x", "sp", "nzcv", "v", "qc", "tpidr", "page"))
+    plain_check, mid_check, broken_check = Checker(plain, uc, A), Checker(mid, uc, A), Checker(broken, uc, A)
+    nan_paths = {name: collections.Counter() for name in ("plain", "mid")}
+    nan_compared = broken_differ = broken_differ_fz_clear = 0
+    for w, text, case, given_v in cases:
+        start = NAN_CODE + 4 * nan_words.index(w)
+        for fpcr in (0, FPCR_FZ, FPCR_DN, FPCR_FZ | FPCR_DN):
+            st = random_state(rng)
+            st["fpcr"] = fpcr
+            for n, value in given_v.items():
+                st["v"][n] = value
+            what = "%08x %s, %s (fpcr %#x)" % (w, text, case, fpcr)
+            theirs = check.theirs(st, start, 1)
+            if theirs is None:
+                failures["NaN case"].append("%s: Unicorn faulted" % what)
+                continue
+            off, on = plain_check.ours(st, start), mid_check.ours(st, start)
+            nan_compared += 1
+            for name, ours in (("plain", off), ("mid", on)):
+                t = nan_paths[name]
+                t["runs"] += ours["runs"]
+                t["slow"] += ours["slow"]
+                t["mid"] += ours["mid"]
+                diffs = differences(st, ours, theirs, False)
+                if diffs:
+                    failures["NaN case, " + ("with" if name == "mid" else "without") + " the middle path"].append(
+                        "%s: %s" % (what, "; ".join(diffs[:4])))
+            if not same_state(off, on):
+                failures["NaN case, the middle path"].append("%s: not the state the lift without it leaves" % what)
+            if not same_state(off, broken_check.ours(st, start)):
+                broken_differ += 1
+                broken_differ_fz_clear += not fpcr & FPCR_FZ
+    t = nan_paths["mid"]
+    if not (t["runs"] > t["slow"] and t["mid"] and t["slow"] > t["mid"]):
+        failures["NaN case, the middle path"].append(
+            "%d fast paths, %d slow, %d of them the middle path: the fast path, the middle path and the helper must "
+            "all run" % (t["runs"], t["slow"], t["mid"]))
+    if nan_paths["plain"]["mid"]:
+        failures["NaN case, without the middle path"].append("%d middle paths ran" % nan_paths["plain"]["mid"])
+    if not broken_differ or broken_differ_fz_clear:
+        failures["the broken middle path"].append(
+            "%d runs differ, %d of them with FZ clear: it must differ, and only under FZ" % (
+                broken_differ, broken_differ_fz_clear))
+    print("test_lifter_semantics: %d runs of %d fixed NaN cases compared; with the middle path their fast paths ran %d "
+          "times, %d slow, %d of them the middle path; its broken test differed in %d runs" % (
+              nan_compared, len(cases), t["runs"], t["slow"], t["mid"], broken_differ))
     print("test_lifter_semantics: %d runs of %d sequences compared (%d left the page or faulted in Unicorn)" % (
         seq_compared, len(seqs), seq_outside))
     if faulted:
         print("test_lifter_semantics: Unicorn faulted on %s" % ", ".join("%s %d" % kv for kv in faulted.most_common(12)))
     for fz in (False, True):
         t = paths[fz]
-        print("test_lifter_semantics: FZ %s: %d float fast paths ran, %d took the slow path (%.1f%%)" % (
-            "set" if fz else "clear", t["runs"], t["slow"], 100.0 * t["slow"] / max(1, t["runs"])))
+        print("test_lifter_semantics: FZ %s: %d float fast paths ran, %d took the slow path (%.1f%%), %d of them the "
+              "middle path" % ("set" if fz else "clear", t["runs"], t["slow"], 100.0 * t["slow"] / max(1, t["runs"]),
+                               t["mid"]))
     one_path = sorted(m for m, t in by_mnemonic.items() if t["runs"] and t["slow"] in (0, t["runs"]))
     print("test_lifter_semantics: %d mnemonics ran fast paths, %d of them only one of the two%s" % (
         sum(1 for t in by_mnemonic.values() if t["runs"]), len(one_path),
@@ -664,6 +884,10 @@ def main():
         if t["slow"] == 0 or t["slow"] == t["runs"]:
             print("test_lifter_semantics: with FZ %s, %d of %d fast paths took the slow path: both must run" % (
                 "set" if fz else "clear", t["slow"], t["runs"]))
+            return 1
+        if a.fp_nan_mid and not (t["mid"] and t["slow"] > t["mid"]):
+            print("test_lifter_semantics: with FZ %s, %d of %d slow paths took the middle path: it and the helper must "
+                  "both run" % ("set" if fz else "clear", t["mid"], t["slow"]))
             return 1
     print("test_lifter_semantics: ok")
     return 0

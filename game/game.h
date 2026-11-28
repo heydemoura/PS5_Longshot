@@ -29,6 +29,9 @@ void hos_discord_start(void);               /* the Discord status (discord_rpc.c
 void hos_mods_init(const char *image_path); /* the mods that are on (mods.c) */
 void hos_cheats_init(void);                 /* the cheats of the mods that are on (cheats.c) */
 
+/* ---- the end (host/hos_relaunch.c) */
+void game_close_log(void);                  /* the game's last log lines at a close, before the log's flush (oot_tools.c) */
+
 /* ---- the frame */
 /* game_phase_run (phases.h, host/nn_vi.c at the window acquire): a frame phase's callbacks */
 void hos_cheats_frame(void);                /* (host/nn_vi.c, each present) the cheats' writes (cheats.c) */

@@ -164,7 +164,7 @@ def check_paths():
             "shown_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32" not in native or "tex->format" in native:
         sys.exit("FAIL: do_present does not tell Native HDR by the format the game presents alone")
     # (Native: never the game's image blitted in its image's format; the shot's scale pass told it is PQ as well)
-    image = function(replay, "void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view, bool source_srgb, bool allow_scale, OutputTrialSource trial) {")
+    image = function(replay, "void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view,\n                              bool source_srgb, bool allow_scale, OutputTrialSource trial, VkFormat framegen_format) {")
     if "} else if (src && !native_pq) {" not in image or \
             "framegen_scale(f.cmd, view, src, sw, sh, crop, rect.w, rect.h, native_pq)" not in image:
         sys.exit("FAIL: present_image can blit Native HDR's picture from its image, or scales it as SDR")

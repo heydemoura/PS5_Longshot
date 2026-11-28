@@ -312,12 +312,17 @@ fn used_of(d: &Path, marks: &[&str]) -> SystemTime {
     marks.iter().filter_map(|m| time_of(&d.join(m))).max().or_else(|| time_of(d)).unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
-/// `path`'s use marked now: its [`crate::sources::USED`] mark when it is a folder, its own time when a file (best
-/// effort: an unmarked entry is only older).
+/// `path`'s use marked now: its [`crate::sources::USED`] mark when it is a folder (made if missing), its own time when
+/// a file (best effort: an unmarked entry is only older). The mark is written empty and its time set too: on Windows
+/// the write leaves an empty file's time as it was, and on Unix setting a time needs the file's owner, where the write
+/// (another user's mark in a shared cache) needs only write access.
 pub fn mark_used(path: &Path) {
-    if path.is_dir() {
-        let _ = std::fs::write(path.join(crate::sources::USED), b"");
-    } else if let Ok(f) = std::fs::File::options().write(true).open(path) {
+    let file = if path.is_dir() {
+        std::fs::File::options().create(true).truncate(true).write(true).open(path.join(crate::sources::USED))
+    } else {
+        std::fs::File::options().write(true).open(path)
+    };
+    if let Ok(f) = file {
         let _ = f.set_modified(SystemTime::now());
     }
 }
@@ -762,6 +767,28 @@ mod tests {
         assert!(d.join("cache/work/game-1").is_dir());
         assert!(d.join("cache/tools/clang-1234").is_dir() && d.join("cache/runtimes/00ff-x.dll").is_file());
         drop(lock);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_use_marks_a_folder_and_a_file_now_each_time() {
+        let d = crate::scratch("storage-mark-used");
+        let (dir, file) = (d.join("tools-x"), d.join("runtime.dll"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&file, b"x").unwrap();
+        mark_used(&dir);
+        let mark = dir.join(crate::sources::USED);
+        assert!(mark.is_file(), "the first use makes the mark");
+        // (each used a month ago, then used again: its time is now, the mark's (empty, as it was) too)
+        let month = SystemTime::now() - Duration::from_secs(30 * 86_400);
+        for p in [&mark, &file] {
+            std::fs::File::options().write(true).open(p).unwrap().set_modified(month).unwrap();
+        }
+        mark_used(&dir);
+        mark_used(&file);
+        for (p, t) in [(&mark, used_of(&dir, &[crate::sources::USED])), (&file, time_of(&file).unwrap())] {
+            assert!(t.elapsed().unwrap_or_default() < Duration::from_secs(3600), "{} still a month old", p.display());
+        }
         std::fs::remove_dir_all(&d).unwrap();
     }
 }

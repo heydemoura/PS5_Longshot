@@ -17,6 +17,7 @@ DRIVER = r"""
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <string>
 #include "gpu/vk/display_modes.h"
@@ -33,7 +34,18 @@ static std::string names(const std::vector<Shape>& v) {
     return s;
 }
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "override") {
+        // (an explicit HOS_WIDE_MAX_PX is the budget for a native output too: run with HOS_WIDE_MAX_PX=8294400)
+        unsigned w = 0, h = 0;
+        assert(hos_wide_max_px() == 8294400.0);
+        hos_wide_picture(7680, 2160, 7680.0 / 2160.0, hos_wide_max_px(), &w, &h);
+        std::printf("override 7680x2160: %ux%u\n", w, h);
+        assert((uint64_t)w * h <= 8294400ull && !(w == 7680 && h == 2160));   // (capped, not kept)
+        assert(w % 8 == 0 && std::abs((double)w / h - 7680.0 / 2160.0) < 0.02 * 7680.0 / 2160.0);   // (the shape kept)
+        std::puts("PASS: an explicit HOS_WIDE_MAX_PX caps a native output");
+        return 0;
+    }
     // (a 21:9 monitor's list as Windows gives it: every refresh rate again, a portrait mode, odd sizes, sizes too small)
     const std::vector<Size> modes = parse_list(
         "640x480,800x600,1024x768,1280x720,1280x1024,1366x768,1600x900,1680x1050,1920x1080,1920x1080,1920x1200,"
@@ -41,7 +53,7 @@ int main() {
     assert(modes.size() == 21);   // ("junk" skipped)
     const std::vector<Size> v = offered(modes);
     // (each side down to 8: 1366x768 1360x768, 1600x900 1600x896; the portrait one narrower than 5:4, 320x240 too small,
-    // 7680x4320 more than 5120x2880's pixels; each once, by width then height)
+    // 7680x4320 more than 7680x2160's pixels; 7680x2160 itself is a size the game takes; each once, by width then height)
     const std::string got = sizes(v);
     std::printf("offered: %s\n", got.c_str());
     assert(got == "640x480 720x576 800x600 1024x768 1280x720 1280x1024 1360x768 1600x896 1680x1048 1920x1080 1920x1200 "
@@ -95,6 +107,18 @@ int main() {
     assert(!hos_output_own_shape(2048, 1152) && !hos_output_own_shape(0, 0));
     assert(hos_output_own_shape(2560, 1080) && hos_output_own_shape(1920, 1200) && hos_output_own_shape(1024, 768));
     assert(hos_output_own_shape(5120, 1440) && hos_output_own_shape(5760, 1080));
+    assert(hos_output_size_valid(7680, 2160) && !hos_output_size_valid(7680, 4320));
+    {
+        unsigned w = 0, h = 0;
+        hos_wide_picture(7680, 2160, 7680.0 / 2160.0, hos_wide_max_px(), &w, &h);
+        assert(w == 7680 && h == 2160);   // (native 32:9, not 6256x1760)
+        hos_wide_picture(3840, 2160, 32.0 / 9.0, hos_wide_max_px(), &w, &h);
+        assert(w == 6256 && h == 1760);   // (a 16:9 2160 output widened to 32:9 stays on the old budget)
+        // (any valid output already of the picture's shape keeps its pixels past the default budget: a custom 5120x2800,
+        // 14.3 million pixels, was scaled to 5120x2160's pixels before)
+        hos_wide_picture(5120, 2800, 5120.0 / 2800.0, hos_wide_max_px(), &w, &h);
+        assert(w == 5120 && h == 2800);
+    }
     // (the picture of a size of its own shape is that size: hos_main.c's hos_wide_size at the output's height and ratio)
     for (Size x : v) {
         if (!hos_output_own_shape(x.w, x.h)) continue;
@@ -120,7 +144,11 @@ def main():
         src.write_text(DRIVER, encoding="utf-8")
         subprocess.run([args.cxx, "-std=c++17", "-Wall", "-Wextra", "-Werror", "-D_CRT_SECURE_NO_WARNINGS", "-I", str(ROOT), str(src), "-o", str(exe)],
                        check=True)
-        subprocess.run([str(exe)], check=True)
+        # (the budget is the default one: HOS_WIDE_MAX_PX, if the caller has it set, is not the fixture's)
+        env = {k: v for k, v in os.environ.items() if k != "HOS_WIDE_MAX_PX"}
+        subprocess.run([str(exe)], check=True, env=env)
+        # (an explicit override is its own case: it caps a native output too)
+        subprocess.run([str(exe), "override"], check=True, env=dict(env, HOS_WIDE_MAX_PX="8294400"))
 
 
 if __name__ == "__main__":

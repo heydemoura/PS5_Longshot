@@ -15,8 +15,13 @@ namespace mkwvk {
 
 struct Texture;
 
+/// (longshot) The Upscaler row's value as the renderer runs it: the row's (opts.dlss), or under Streamline, while a change of
+/// it to another Upscaler than DLSS or DLAA waits for the restart, the one before (vk_dlssg.h dlssg_upscaler). What the
+/// engines, FSR 3.1's choice, the output preview and the perf report read; the row, the options file and the restart read
+/// the setting
+int temporal_row();
 /// What the Upscaler row runs now on this chain (upscaler_rows.h: GAME, DLSS, DLAA, FSR3, FSR4, FSR4_AA): the row's choice
-/// (opts.dlss), or RX_VK_DLSS=1 / 2 or RX_VK_FSR4=1 / 2 over it; GAME when the chosen engine cannot run here. AMD FSR 3.1
+/// as it runs (temporal_row), or RX_VK_DLSS=1 / 2 or RX_VK_FSR4=1 / 2 over it; GAME when the chosen engine cannot run here. AMD FSR 3.1
 /// (RX_VK_FSR=1, or the row's FSR 3.1 with neither switch above set) is FSR3 here, an engine of this chain with the skinned
 /// draws' motion (vk_fsr3.h fsr3_on_chain); with RX_VK_FSR3_CHAIN=0 it upscales with its own inputs and this is GAME then
 int temporal_mode();
@@ -70,7 +75,7 @@ void temporal_note_skinned_draw(const SkinnedDraw& k);
 int temporal_hidden_mesh_mode();
 /// (longshot) Whether `depth` is the depth target of the scene the chain has taken in this frame (its camera's)
 bool temporal_scene_depth_is(const Texture* depth);
-VkImageView temporal_reshade_depth(uint32_t width, uint32_t height);
+VkImageView temporal_reshade_depth(VkCommandBuffer cmd, uint32_t width, uint32_t height);
 
 /// (longshot) NVIDIA DLAA before the game's bloom and tone map (pre_bloom.h has where and why): with DLAA and the
 /// Upscaler's DLAA before the bloom row on only (RX_VK_DLSS_PRE_BLOOM over it); off, DLAA stays at the gameplay upscale.

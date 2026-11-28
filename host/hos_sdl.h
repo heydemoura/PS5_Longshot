@@ -40,6 +40,9 @@ void hos_sdl_icon(void *window, const char *png);   /* (SDL 3.4's PNG loader: no
    events, an input method's window; SDL2 has it on from the start, SDL3 off), the clipboard's text (UTF-8, NULL when none;
    given back with hos_sdl_free) */
 void hos_sdl_text_input(void *window, int on);
+/* (longshot) the cursor over the game's window shown or hidden (SDL3's SDL_ShowCursor and SDL_HideCursor, SDL2's
+   SDL_ShowCursor(1 or 0); nothing in an SDL without them). Main thread */
+void hos_sdl_cursor(int shown);
 char *hos_sdl_clipboard(void);
 void hos_sdl_free(void *p);
 

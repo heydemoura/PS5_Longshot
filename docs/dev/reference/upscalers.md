@@ -23,7 +23,12 @@ so new engines are added at the end.
 No vendor library ships with Longshot. Each engine reports why it cannot run (`dlss_why`, `fsr4_why`, `xess_why`), and
 the menu offers only the engines that can.
 
-AMD FSR 4's layers are unrolled and built into a pipeline cache of their own, `cache/longshot_fsr4_pipelines.bin`
+Eligible AMD FSR 4 passes with constant weight tables are unrolled subject to headroom and size limits. On FSR 4.1.2, the
+shader set it was checked against, the expanded unroller folds the network's layers and the postpass; another FSR 4 version
+keeps the previous unroller, for the layers only. A compact folded build wants 1 GiB of memory to spare on AMD's older
+Windows shader compiler (RDNA 1 and 2), where its compile memory was measured, and 8 GiB everywhere else. A layer whose
+plain twin could not be made is left rolled on every configuration. They are built into a
+pipeline cache of their own, `cache/longshot_fsr4_pipelines.bin`
 (`own_cache` in `vk_fsr4.cpp`), apart from the translator's, whose files a new translator drops: an update keeps it.
 `RX_VK_PCACHE_LOAD=0` neither reads nor saves it.
 
@@ -48,8 +53,12 @@ files for a developer ([setup](../setup.md#upscaler-sdks-optional)). How players
 | DLSS | `dlss`: DLSS v310.9.16; built in from NVIDIA's SDK (`LONGSHOT_NGX_SDK` overrides it, and nothing of NVIDIA's is downloaded) | `nvngx_dlss`, `nvngx_dlssg` in `ngx/` | `RX_VK_DLSS_DIR`, the game folder's `ngx`, then `%LOCALAPPDATA%\Longshot\ngx` (Windows) or `$XDG_DATA_HOME/longshot/ngx`, else `~/.local/share/longshot/ngx` (Linux). NGX takes the newest runtime it finds across them |
 | FSR 4 | `fsr4`: built in from AMD's MIT headers in `third_party/fidelityfx` | Windows: FSR SDK v2.4.0 (FSR 4.1.2), `amd_fidelityfx_loader_vk.dll` and `amd_fidelityfx_upscaler_vk.dll`, with `LICENSE-AMD-FSR-SDK.md`, beside the game | `RX_VK_FSR_DIR`, the executable's folder (`bin`), then the game folder |
 | XeSS | `xess` (in every Windows build) | Windows: `libxess.dll` 2.0.2.68 (78 MB), with Intel's license and notices, beside the game | `RX_VK_XESS_DIR`, the executable's folder, then the game folder |
+| DLSS FG through Streamline | `dlss` on Windows, with a developer's `LONGSHOT_SL_SDK=<sdk folder>` (`scripts/fetch.py streamline --accept-nvidia-license`: NVIDIA Streamline 2.14.16); the builder downloads nothing of it | Nothing: `scripts/fetch.py streamline --game <game folder>` puts Streamline's runtime (`sl.interposer.dll`, `sl.common.dll`, `sl.dlss_g.dll`, `sl.reflex.dll`, `sl.pcl.dll`, `nvngx_dlssg.dll`, `NvLowLatencyVk.dll`) beside `longshot.exe` | Beside `longshot.exe` only, and only `sl.interposer.dll` with NVIDIA's signature ([below](#dlss-fg-through-streamline)) |
 
 - A vendor DLL in the game folder that is not the pinned one (a newer one put there by hand) is left alone.
+- A build without Streamline's SDK compiles none of it (`vk_dlssg.cpp` and `vk_dlssg_layer.cpp` are stubs): a game
+  folder that has Streamline's runtime beside `longshot.exe` then runs as without it. Streamline has no Linux runtime.
+  No launcher builds with it yet: a player's build has no way to ask for it.
 
 - `longshot-builder update` keeps the folder's upscalers; `--upscaler` given to it changes them (`--upscaler none` takes
   them out).
@@ -207,13 +216,13 @@ drawing from another share adds to the samplers the game biases below 0 (`upscal
 
 | Upscaler | Added bias |
 |---|---|
-| DLSS, DLAA | `log2(share / 0.75) + offset`, offset -1: NVIDIA's guide, the output's detail and one mip step finer, which DLSS resolves over its frames (Quality -1.17, Performance -1.58, DLAA -0.58, Auto -1) |
-| FSR 3.1, FSR 4, XeSS | `log2(share / 0.75)` below 75%; 0 at Auto and above |
-| The game's own, Off, FSR 4's and XeSS's native AA | 0 |
+| DLSS, DLAA, FSR 3.1, FSR 4, FSR 4 Native AA | `log2(share / 0.75) + offset`, offset -1: NVIDIA's DLSS guide and AMD's FSR 3.1 / FSR 4 specification, the output's detail and one mip step finer, resolved over frames (Quality -1.17, Performance -1.58, Native AA / 100% -0.58, Auto -1) |
+| XeSS | `log2(share / 0.75)` below 75%; 0 at Auto and above |
+| The game's own, Off, XeSS Native AA | 0 |
 
 The bias is part of every sampler's key: the Upscaler, Render resolution and Quality preset rows make the samplers
-again. `RX_VK_UPSCALE_LOD_BIAS=0` adds none; `RX_VK_DLSS_LOD_OFFSET=<steps>` sets DLSS's offset for a run (clamped to
--3..0; `0` gives DLSS the render size's own detail).
+again. `RX_VK_UPSCALE_LOD_BIAS=0` adds none; `RX_VK_DLSS_LOD_OFFSET=<steps>` sets the DLSS / FSR offset for a run (clamped to
+-3..0; `0` gives the render size's own detail).
 
 ## Resources and failures
 
@@ -242,6 +251,10 @@ who makes the frames. `framegen_record` in [`vk_framegen.cpp`](../../../gpu/vk/v
 
 With DLSS FG chosen and no upscaler picture (the game's menus, movies, loading screens), the set is shown as the game's
 frame alone (`dlss_fg_holds`, `FgMaker::DlssPaused`), not handed to another maker.
+
+The shared frame-generation history and output images use `RGB10A2` for Native HDR (PQ) and `RGBA8` for SDR input.
+The format follows the frames through generation and presentation. A format change drains the pending sets and restarts
+interpolation history. If the device cannot use the 10-bit storage images, Longshot presents the original HDR frames.
 
 FSR 3.1 interpolation ([`vk_fsr3fi.cpp`](../../../gpu/vk/vk_fsr3fi.cpp)) is AMD's passes compiled from patched copies
 of the SDK headers (`FI_PATCHES` in `scripts/shaders.py`; `third_party/` is unchanged). The patches read each made
@@ -275,6 +288,164 @@ The game draws its HUD into the same picture as the scene, after the gameplay up
    the HUD as pixels unchanged while the scene moves. `RX_VK_FSR_FG_HUD=0` runs AMD's passes unpatched, the HUD moving
    with the scene.
 
+### DLSS FG through Streamline
+
+In a Windows build with NVIDIA Streamline's SDK, DLSS FG's frames are made and presented by Streamline's DLSS-G plugin
+([`vk_dlssg.cpp`](../../../gpu/vk/vk_dlssg.cpp)) instead of NGX's DLSS-G called from `framegen_record`. There is no row
+for it: the Frame generation rows choose it.
+
+**When it starts.** Streamline hooks the instance, the device, the swapchain and the present (manual hooking), so
+`dlssg_load` runs before Vulkan is loaded (`load_global`) and decides from the rows as saved in `longshot_options.ini`
+([`dlssg_rules.h`](../../../gpu/vk/dlssg_rules.h)): Frame generation Fixed, Frame generation by DLSS FG and the Upscaler
+DLSS or DLAA (`kStreamlineUpscalers`; `RX_VK_DLSS`, `RX_VK_FSR4`, `RX_VK_XESS` and `RX_VK_FSR` over the row, in
+`temporal_mode`'s order). With another Upscaler the frames are made as without Streamline: NGX's DLSS-G where that
+Upscaler's engine runs, else the renderer's own frame generation. FSR 3.1 and XeSS, which run on an NVIDIA GPU, so do
+without Streamline's pacing: a choice, to extend `kStreamlineUpscalers` if one of them should have it. Started with FSR 4
+on an NVIDIA GPU, Streamline gave up, and its DLSS-G plugin still presented every frame through a swapchain of
+its own: the present call took 0.9 ms instead of 0.09, and the frames reached the screen less evenly and about 3 ms later. `RX_VK_DLSSG=0`,
+`RX_VK_DLSS=0`, `RX_VK_DLSS_FG=0`, `RX_VK_FRAMEGEN=0` and `--prepare-shaders` each keep it off. Then, in order:
+Streamline's files beside `longshot.exe`, an NVIDIA adapter (DXGI), NVIDIA's signature on `sl.interposer.dll`, `slInit`, and `slIsFeatureSupported` for DLSS-G. Any no leaves the run exactly as a build
+without Streamline. When it started, `sl.interposer.dll`'s `vkGetInstanceProcAddr` is the renderer's loader for the
+whole run.
+
+| State | `dlssg_loaded()` | `dlssg_active()` | What runs |
+|---|---|---|---|
+| Not started | no | no | NGX's DLSS-G and the renderer's own frame generation, as without Streamline |
+| Running | yes | yes | Streamline's DLSS-G and Reflex. `framegen_now()` is 0, `framegen_on()`, `fsr3fi::frames_wanted()` and `vk_reflex.cpp`'s own Reflex are off, NGX's DLSS-G is not asked, every present is made on the render thread (`present_thread_on`) |
+| Gave up | yes | no | Streamline said no for the GPU the renderer chose (`dlssg_device`), its plugins did not load (`dlssg_device_made`), or the rows ask DLSS FG while the Upscaler row's engine does not run here (DLSS or DLAA without its runtime) (`temporal_wanted()` false on a game frame with the Insert menu closed, `dlssg_before_present`: its runtime or DLL missing, NGX's answer). The renderer as without it, over Streamline's loader, which passes every call on; but every present stays on the render thread for the run (`present_thread_on` is settled once, on `dlssg_loaded()`) |
+
+**A restart.** A change of the rows that brings Streamline in, or takes its frames away (Auto, Built-in FG or FSR 3.1
+FG while it runs: no other frames can be made beside it), applies at the next start. The Frame generation by row
+carries it (`dlssg_restart_needed` is its restart value), so closing the menu asks, and its line says what the restart
+changes. Frame generation Off needs none. Once Streamline's loader is the renderer's (Running or Gave up), the
+Upscaler row's change to another Upscaler than DLSS or DLAA waits for the restart too: DLSS goes on until then
+(`dlssg_upscaler`, which `temporal_row` asks in place of the row for `temporal_mode`, `temporal_off`, `fsr3_chosen`,
+the preview and the report), and the row says After restart (`upscaler_waits` is its restart value). Changed to FSR 4
+at once, Streamline gave up and its DLSS-G plugin still presented every frame. A change between DLSS and DLAA, or any
+change without Streamline, is at once.
+
+**Each frame.** `dlssg_sleep` after a present (the next frame's token, Reflex's sleep, the simulation-start marker);
+`dlssg_inputs` from the temporal chain once its engine drew (depth and motion tagged, the camera's constants);
+`dlssg_hold` before a game frame's present, after its acquire and its copy's submit (with Threaded rendering Off the
+present is the game's own thread's, and nothing is held: no hold, no toggle); `dlssg_before_present`, which turns DLSS-G
+on for a game frame with inputs and off for the Insert menu, the window's own presents, 60 game frames without inputs,
+or rows that no longer ask, and gives up when the Upscaler row's engine does not run. The
+other latency markers come from `vk_reflex.cpp`'s hooks. NGX starts once in a process, and under Streamline that start
+is `sl.common`'s: `dlssg_load` gives Streamline the folders `vk_dlss.cpp` names for DLSS's runtime, or DLSS itself
+fails with 0xbad00004.
+
+**Reflex's frame limit.** While DLSS-G makes frames, Streamline's Reflex holds the frames shown, the made ones with the
+game's, to `refresh - refresh² / 3600` (`frame_limit_us`, from the display's refresh): 116 fps at 120 Hz, 138 at 144,
+224 at 240, as NVIDIA's driver caps them under G-SYNC with V-Sync. It is set with V-Sync On and Auto, and none with the
+menu's V-Sync Off (`menu_vsync() == 2`), as the driver sets none without V-Sync: the renderer cannot tell a G-SYNC or
+FreeSync display from one that is not (`vk_reflex.cpp` `fifo_min_interval_us`), so the menu decides, not VRR. The
+game's frames are that divided by the multiplier: at 2x, 58 fps at 120 Hz, 29.5 at 60 Hz; under the game's 60 fps cap
+from about 124 Hz down at 2x, and at 165 Hz at 3x (52 fps). Measured at 2x on a 48-240 Hz VRR display: at 240 Hz the
+limit never binds; at 60 Hz with V-Sync On or Auto it keeps the game frames 27 ms from present to screen, where main's
+FIFO queue reaches 133 ms; with V-Sync Off it held the game at 29.5 fps where main renders 60, hence none there. Auto
+under Streamline is mailbox, not FIFO (`fg_fifo` needs `swapchain_dlssg()`, which is NGX's DLSS-G), so the limit keys on
+the menu rather than the present mode. A fixed-refresh screen was not measured.
+
+**The exit.** `mkwvk_close_asked` calls `dlssg_shutdown` whenever Streamline's loader is the renderer's: no call let in
+any more, a Reflex sleep under way waited for, the present lock and the queue's taken and kept, the device idle, DLSS-G
+off, `slShutdown`. Each wait is 2 s at most; past it Streamline is left as it is. Left to the process's end, the plugin
+tears down in its DLL detach after its threads are gone, an access violation at every exit. A fatal end cannot wait
+for that shutdown (it comes from any thread, perhaps under those locks): the renderer's (`replay_fatal`: a lost
+device, a C++ exception out of the renderer) writes its FATAL line and the log out, then, when Streamline's loader is
+the renderer's, writes the performance summary's last (the renderer's `atexit` writes it at the detach) and ends the
+process before the DLLs' detach, with its exit code 3. Left to the detach, the game showed an access violation in the
+plugin's teardown after the FATAL line, logged as a crash, and a crash's exit code in place of 3. The host's own FATAL
+and its out-of-memory stop still end through the detach.
+
+#### The driver's two metering laws
+
+NVIDIA's driver shows a DLSS-G batch (the made frame, then the game's) by a schedule of its own (`VK_NV_present_metering`,
+set by the plugin). At 2x with the game at 60 fps it follows one of two schedules, called laws here: under L1 the frames
+reach the screen at even intervals, under L2 at uneven ones. The game cannot choose, but a gap between two frames on
+the screen a few milliseconds longer than the game's frame makes the driver choose again. The pacing in
+[`dlssg_pace.h`](../../../gpu/vk/dlssg_pace.h) rests on that. Its three numbers are constants there, each with a switch:
+
+| Part | Constant, switch | What it does |
+|---|---|---|
+| The hold | `kHoldUs`, `RX_VK_DLSSG_HOLD` | A game frame's present goes to Streamline that long after the game's own present of it (the present job's `game_at`, which `do_present` hands to the hold), not when the renderer finished: the render time's variation no longer reaches the screen. Scaled with the game's frame above 60 fps. Not held while the game does not reach its cap, or when the present is late already |
+| The grid | `kGridUs`, `RX_VK_DLSSG_HOLD_GRID` | While the game's own presents stay near a line fitted through its last 60, the hold counts from the line instead of the present: the game's own jitter is taken out too |
+| The toggle | `toggle_for_floor`, `kToggleUs`, `RX_VK_DLSSG_TOGGLE` | When the reader below reads L2, one present is held that long, which leaves the screen gap that makes the driver choose again. Only at 2x with the game near 60 fps (`toggle_fits`), a second apart at least. How long: [from the screen's VRR floor](#the-toggles-hold-from-the-screen) |
+
+The reader ([`dlssg_law.h`](../../../gpu/vk/dlssg_law.h)) tells the laws apart from when the presents reach the screen:
+per half second, from each batch, the time between the first present's call of one batch and `first_pixel_out` of the
+next batch's second present; a spread (p90 less the median) over the band's threshold (below) is L2. It asks after two
+L2 half seconds in a row, abstains unless it read at least 10 of its last 20 half seconds, reads only batches of two,
+and bounds its asks: after three holds that changed nothing it keeps quiet, each time twice as long, until it reads
+three L1 half seconds with no L2 between them, and never asks more than six times a minute. With VRR off the driver has
+no such laws and the reader stays quiet.
+
+#### The toggle's hold from the screen
+
+The driver chooses again when the screen goes without a new frame about as long as the longest frame the screen's VRR
+holds, 1 / its floor: from 20.46 to 20.55 ms on a 48-240 Hz screen, just under 1 / 48 Hz (20.83 ms). A hold of 22 ms there changed
+the law each time (15 of 15); 24 ms left gaps up to 27.5 ms on the screen, and holds that changed nothing left 28 to
+29 ms. So the hold follows the floor: 1 / floor + 1167 µs, the margin 22 ms had at 48 Hz (`toggle_for_floor`).
+
+At each swapchain made (`dlssg_swapchain_made`, from `create_swapchain`) the floor is read from the EDID of the
+window's screen: Windows' display path for the window's monitor, then the monitor's device node and its `EDID` value
+(`QueryDisplayConfig`, cfgmgr32; no rights asked). On HDMI only, and only from the HDMI Forum's block in the CTA-861
+extension ([`edid_vrr.h`](../../../gpu/vk/edid_vrr.h)): a screen with its VRR turned off in its own menu gives a floor
+of 0 there while its range limits still say 30 Hz. The log says it once per change (`the toggle's hold 22.0 ms, from
+<screen>'s VRR floor (HDMI, 48-240 Hz in its EDID)`, or why it took the default).
+
+Pitfalls:
+
+- Only a 48 Hz floor was measured. The rule is used for floors of 40 to 52 Hz (20.4 to 26.2 ms) and 22 ms elsewhere,
+  on DisplayPort (its ranges are not read), and where the EDID is not read; `RX_VK_DLSSG_TOGGLE=<us>` sets the hold
+  by hand. By the rule, 22 ms is too short for a floor under 40 Hz (1 / 30 Hz is 33 ms): whether it changes the law
+  there is not known either way, and the reader's bounds cap what holds that change nothing cost (three, then quiet
+  for 30 s, doubled each time).
+- The floor is read when a swapchain is made, not when the window moves: a window dragged to another screen with no
+  new swapchain keeps the first screen's hold until one is made (a resize, a mode change).
+- The default comes from the screen and is still no `hw` rule of [device policy](architecture.md#device-policy): its
+  facts are the GPU's and the PC's, learned once before the device is made, and the screen is the window's, which
+  changes during a run. It is read where the refresh is (`display_refresh_mhz`), at the swapchain.
+- The laws were seen at the driver's default settings; with other settings the driver may keep L1, and the toggle
+  then never fires.
+
+Which frame `first_pixel_out` follows is the driver's state, not the game's: the batch before's made frame (that time
+near 6.6 ms under L1) or its game frame, shown 8.3 ms later (near 14 to 15 ms). One PC showed both with the same build
+(RTX 4090, driver 621.24): the game frame after VRR was turned off and on, and again the next morning; the made frame
+after a restart. The reader has a band for each, 5.5 to 9 ms with L2 over 0.20 ms, and 11.5 to 17 ms with L2
+over 0.50 ms, which takes only batches a 60 fps frame apart (at 40 fps the time falls in it too). It reads each half
+second in the band most of its values fall in, and asks only on two L2 half seconds of the same band. The log says
+which frame it follows (`the driver's present timing follows ...`), and once after 30 s unread (`the driver's metering
+law has not been read for 30 s`).
+
+The times come from Longshot's own Vulkan layer ([`vk_dlssg_layer.cpp`](../../../gpu/vk/vk_dlssg_layer.cpp)). Streamline's
+interposer passes the game's instance layers to the loader, so a layer the game names sits between the plugin and the
+driver and sees the plugin's presents, which the game does not. The layer is `longshot_vk.dll` itself: its manifest is
+written at the start in `longshot_vk_layer` beside the DLL and its folder given to the loader in `VK_ADD_LAYER_PATH`.
+
+**The layer's rule: it reads and passes on.** It asks for each present's times (`VK_EXT_present_timing`, a
+`VkPresentTimingsInfoEXT` put ahead of the present's own chain) and never delays, reorders or removes a present, nor
+changes a structure the plugin hands the driver. Only the game's own presents are held, in `dlssg_hold`.
+
+Pitfalls:
+
+- The layer is named only while Streamline is active. When the loader does not list it, the manifest cannot be written
+  (a read-only game folder) or the instance fails with it, the game starts without it: no reader, no toggle, the hold
+  and the grid as they are. The same on a driver without `VK_EXT_present_timing`, `VK_KHR_present_id2` or calibrated
+  timestamps (`dlssg_layer_device_extensions`).
+- The toggle and the reader's bands are for 2x at 60 fps. At 3x and 4x (RTX 50) and at other frame rates the toggle
+  holds nothing; the hold and the grid still apply. At 3x and 4x the reader takes no batches. At 2x at another frame
+  rate it can still read and ask (at 90 fps the made image's band takes some values): the game lets the ask go
+  (`k,...,0` in the layer's CSV), and the log says nothing. It says `one present held 22.0 ms` where a present is held
+  (32 times at most).
+- The NVIDIA app's DLSS override changes NGX's side: NGX takes DLSS's and DLSS-G's models from
+  `C:\ProgramData\NVIDIA\NGX\models` where it has them, with the presets the app sets, over Longshot's
+  `nvngx_dlss.dll` and `nvngx_dlssg.dll`. The log says so once. Streamline then looks for NVIDIA's version of each of
+  its plugins, and loads them only when it finds all of them. When it does not, the log says once that it keeps the
+  ones beside `longshot.exe`; `sl.log` says which it looked for.
+- `sl.log` in the game folder is Streamline's own log; its warnings and errors go to `longshot_log.txt` too.
+- `RX_VK_DLSSG_LAYER_CSV=<file>` writes every present the layer sees and every half second the reader read, for
+  measurements (its header comment lists the lines).
+
 ### Setup failures
 
 Built-in interpolation is optional. Each pipeline and image is published only when complete. A failed pipeline,
@@ -290,7 +461,12 @@ A selected menu row proves nothing. Check the log:
 - `vk: <engine>: the game's upscale runs (<reason>)` when the chain falls back (`vk: fsr3: ...` for FSR 3.1 on its own
   inputs);
 - frame generation's maker in the FPS counter and the Frame generation by row (`framegen_maker`), and DLSS-G's skip
-  reason (`dlss_fg_skip`).
+  reason (`dlss_fg_skip`);
+- for DLSS FG through Streamline, `vk: Streamline started for DLSS Frame Generation`, then `vk: Streamline DLSS Frame
+  Generation: on, 2x`; `vk: Streamline: ... DLSS Frame Generation does not go through it in this run` when it gave up;
+  `vk: Longshot's layer under Streamline: reads when DLSS FG's presents reach the screen` and `the driver's metering law
+  is read` for the layer and its reader. No `vk: Streamline` line at all: it was not started (the rows, the files, the
+  GPU or `RX_VK_DLSSG=0`).
 
 ## Switches
 
@@ -306,12 +482,15 @@ All switches are in [`switches.def`](../../../gpu/vk/switches.def) and [switches
 | `RX_VK_DLSS_DIR`, `RX_VK_FSR_DIR`, `RX_VK_XESS_DIR` | A folder looked in first for the vendor's runtime ([vendor files](#vendor-files)) |
 | `RX_VK_DLSS_DEBUG` | `motion` shows the motion vectors; `alternate` shows the game's upscale every other frame |
 | `RX_VK_DLSS_JITTER=0`, `RX_VK_FSR_JITTER=0` | No camera jitter for the temporal engines, or for FSR 3.1 |
-| `RX_VK_UPSCALE_LOD_BIAS=0`, `RX_VK_DLSS_LOD_OFFSET=<steps>` | No upscaler texture bias, or DLSS's offset ([texture LOD bias](#texture-lod-bias)) |
+| `RX_VK_UPSCALE_LOD_BIAS=0`, `RX_VK_DLSS_LOD_OFFSET=<steps>` | No upscaler texture bias, or the DLSS / FSR offset ([texture LOD bias](#texture-lod-bias)) |
 | `RX_VK_FSR4_HDR=0`, `RX_VK_XESS_HDR=0` | FSR 4 and XeSS on their LDR contexts with native HDR |
 | `RX_VK_REFLEX_LOG=1` | NVIDIA Reflex's latency timings in the log every 300 frames while Reflex is on |
 | `RX_VK_PSYCHOV35_DLSS=0` | Turn off the PsychoV35 RGBA16F route |
 | `RX_VK_FRAMEGEN=0`, `RX_VK_FRAMEGEN_MULT` | Frame generation off, or a multiplier for one run |
 | `RX_VK_DLSS_FG`, `RX_VK_FSR_FG` | Force or forbid DLSS-G or FSR 3.1 interpolation |
+| `RX_VK_DLSSG=0` | Never start Streamline: NGX's DLSS-G makes DLSS FG's frames ([Streamline](#dlss-fg-through-streamline)) |
+| `RX_VK_DLSSG_HOLD=<us>`, `RX_VK_DLSSG_HOLD_GRID=<us>`, `RX_VK_DLSSG_TOGGLE=<us>` | A/B the pacing of Streamline's presents, `0` each part off ([the laws](#the-drivers-two-metering-laws)); the toggle's hold set, in place of the one from the screen's floor. With the hold off, turn the toggle off too: the reader then reads the uneven law most of the time and asks a few times a minute, each a 28 to 31 ms screen gap |
+| `RX_VK_DLSSG_LAYER=0`, `RX_VK_DLSSG_LAYER_CSV=<file>`, `RX_VK_DLSSG_RECT=0` | Without Longshot's layer under Streamline (so no toggle); what the layer sees, in a file; DLSS-G given the whole swapchain image, bars included (as even on the RTX 4090, 0.8 ms more latency) |
 | `RX_VK_FSR_FG_HUDLESS=0`, `RX_VK_FSR_FG_HUD_LAYER=0`, `RX_VK_FSR_FG_HUD=0` | A/B the HUD handling |
 
 ## Tools and checks
@@ -319,7 +498,10 @@ All switches are in [`switches.def`](../../../gpu/vk/switches.def) and [switches
 | File | What it is |
 |---|---|
 | `scripts/shaders.py fsr3` | Compiles FSR 3.1's upscaler and interpolation passes into `gpu/vk/shaders` |
-| `scripts/fetch.py dlss\|fsr\|xess` | Fetch NVIDIA's, AMD's and Intel's SDK files for a local build ([setup](../setup.md#upscaler-sdks-optional)) |
+| `scripts/fetch.py dlss\|fsr\|xess\|streamline` | Fetch NVIDIA's, AMD's and Intel's SDK files for a local build ([setup](../setup.md#upscaler-sdks-optional)) |
+| `tests/test_dlssg.py` | Streamline's seams in the renderer, the stubs of a build without it, Reflex's frame limit, the exit with a stand-in SDK |
+| `tests/test_dlssg_pace.py` | The start rules, the hold, the grid and the law reader on made-up presents; the switches' defaults |
+| `tests/test_sl_sdk.py` | The Streamline fetch and its file tables |
 | `tests/test_temporal_history.py` | Reprojection, reset rules and every engine's reset assignment |
 | `tests/test_temporal_jitter.py` | Jitter publication, freshness and the host's per-frame cache |
 | `tests/test_dlss_feature_size.py` | DLSS creation size, input range and reuse |

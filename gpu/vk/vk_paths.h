@@ -39,7 +39,7 @@ inline DWORD game_module_path(char* buf, DWORD size) {
     if (dir - bin != 3 || _strnicmp(bin, "bin", 3) != 0) return n;
     const std::string probe = std::string(buf, (size_t)(bin - buf)) + "image.bin";
     const size_t root = (size_t)(bin - buf);
-    if (GetFileAttributesA(probe.c_str()) == INVALID_FILE_ATTRIBUTES) return n;
+    if (GetFileAttributesA(probe.c_str()) == INVALID_FILE_ATTRIBUTES && GetFileAttributesA((std::string(buf,root)+"data/image.bin").c_str()) == INVALID_FILE_ATTRIBUTES) return n;
     std::memmove(buf + root, name, std::strlen(name) + 1);
     return (DWORD)std::strlen(buf);
 }
@@ -62,6 +62,8 @@ inline std::string game_folder_path() {
     const std::string path = game_module_string();
     return path.substr(0, path.find_last_of("\\/") + 1);
 }
+inline bool organized_game() { return GetFileAttributesA((game_folder_path() + "data/image.bin").c_str()) != INVALID_FILE_ATTRIBUTES; }
+inline std::string data_file(const char* name) { return game_folder_path() + (organized_game() ? "data/" : "") + name; }
 /// <game folder>/<sub>/<name>, the folder made when it is not there (the host makes it at its start; a tool may not have)
 inline std::string game_sub_path(const char* sub, const char* name) {
     const std::string dir = game_folder_path() + sub;
@@ -92,7 +94,7 @@ inline std::string cache_path(const char* name) {
     return shared.empty() ? game_sub_path("cache", name) : shared + name;
 }
 /// <game folder>/logs/<name>: the logs and traces a run writes
-inline std::string log_path(const char* name) { return game_sub_path("logs", name); }
+inline std::string log_path(const char* name) { return game_sub_path(organized_game() ? "diagnostics/logs" : "logs", name); }
 /// The player's settings, longshot_options.ini: the host's (MkwVkHost.options_path, host/options_path.c: in the user folder
 /// --user names, else beside the game), "" when it has none (no file: every row at its default). Without the host (a tool), the
 /// game folder's. vk_main.cpp. The build's compile_shaders= stays in the game folder's file (vk_draw.cpp compile_all)

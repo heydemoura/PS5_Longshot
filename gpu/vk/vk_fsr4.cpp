@@ -42,6 +42,7 @@
 #include "menu/output.h"
 #include "upscaler_rows.h"
 #include "spirv_unroll.h"
+#include "spirv_unroll_legacy.h"
 #include "vk_gprof.h"
 #include "vk_menu.h"
 #include "vk_paths.h"
@@ -237,23 +238,26 @@ fsr4_models::KnownModule probe_models(const std::string& dir) {
 }
 #endif
 
-/// AMD's passes tuned as the library makes them (fsr4_tune.h: measured gains, outputs bit for bit AMD's on Adrenalin 26.10.1):
-/// the device functions it is handed are ours where it makes and destroys buffers, layouts, shader modules and compute
-/// pipelines, writes descriptors and records binds and dispatches. At once: the network's layers 64 lanes wide, and the
-/// weights the layers and the postpass copy into per-thread arrays (scratch memory) read from a tail of the library's storage
-/// buffer instead. Later: the smaller layers with their loops unrolled from the library's own code (spirv_unroll.h, its
-/// weights then constants in the code), built one at a time on a thread of their own and bound in place of the library's once
-/// made (about a minute each the first time, the pipeline cache after). On an RX 6700 XT at 720p -> 1440p: 8.97 ms -> 4.04 ms.
-/// RX_VK_FSR4_TUNE=0: as AMD made them. On AMD's GPUs only.
+/// AMD's passes tuned as the library makes them (fsr4_tune.h: measured gains on Adrenalin 26.10.1): the device functions it
+/// is handed are ours where it makes and destroys buffers, layouts, shader modules and compute pipelines, writes descriptors
+/// and records binds and dispatches. At once: the network's layers 64 lanes wide, and the weights the layers and the postpass
+/// copy into per-thread arrays (scratch memory) read from a tail of the library's storage buffer instead. Later, on FSR 4.1.2
+/// (expanded_unroll; another version keeps the previous unroller, for the network's layers only): every pass with constant
+/// weight tables (passes 1, 2, 4, 5, 10, 12 and the postpass) has its loops unrolled, its weight-table loads
+/// folded into immediate constants and its local scratch arrays forwarded away (spirv_unroll.h), built one at a time on a
+/// thread of their own into their own pipeline cache and bound in place of the library's once made (~0.15-0.35 s standalone /
+/// 0.33-0.69 s in-game and <60 MB each cold, milliseconds from the pipeline cache after). On an RX 6700 XT at 720p -> 1440p:
+/// 9.01 -> 3.52 ms SDR / 8.11 -> 3.33 ms HDR standalone, and 4.54 -> 3.70 ms in-game (Hyrule Field). RX_VK_FSR4_TUNE=0: as
+/// AMD made them. On AMD's GPUs only.
 /// The tail is kept per buffer: a pipeline reads it only in the buffer it was rewritten against, while that buffer lives and
 /// every binding of it seen takes the tail in (offset 0, the whole buffer). Otherwise (the buffer destroyed, a binding that
 /// leaves the tail out, or none seen through the functions watched here) AMD's own shader is built and bound in its place,
 /// and the log says so once: a slower picture, never a wrong one.
-/// The unrolling's limits are what keep it safe: unrolled whole, the larger layers (passes 4, 5, 10) came to 200,000 words
-/// and AMD's compiler took 40-55 GB of commit charge for them, three at a time, until a PC with 16 GB of RAM crashed. Now a
-/// layer is unrolled only while it stays under kUnrollWords (passes 1, 2 and 12: ~107,000 words, ~3 GB to build), one build
-/// runs at a time, only with kBuildHeadroom of memory to spare, and a build that fails is not tried again. The window closing
-/// stops them (fsr4_close): one not started does not start, the one building is waited for (10 s at most)
+/// The unrolling's limits are what keep it safe: every pass is kept under kUnrollWords (passes 1, 2, 4, 5, 10, 12 and the
+/// postpass fold down to 27,000-45,000 words), one build runs at a time, only with kCompactHeadroom (compact <=
+/// kCompactUnrollWords shaders on the compiler that was measured, build_want) or kBuildHeadroom (the rest) of memory to
+/// spare, and a build that fails is not tried again. The window closing stops them (fsr4_close): one not started does not start, the one building is waited for
+/// (10 s at most)
 namespace tune {
 std::mutex mu;
 PFN_vkCreateBuffer real_cb = nullptr;
@@ -272,6 +276,13 @@ PFN_vkCmdBindPipeline real_bind = nullptr;
 PFN_vkCmdDispatch real_dispatch = nullptr;
 PFN_vkCmdUpdateBuffer real_update = nullptr;
 PFN_vkCmdPipelineBarrier real_barrier = nullptr;
+// (the driver's functions a build_unrolled thread calls: a copy of its own, set once in prepare_device() before AMD is
+// handed device_proc, and never written again)
+struct WorkerDispatch {
+    PFN_vkCreateShaderModule csm = nullptr;
+    PFN_vkDestroyShaderModule dsm = nullptr;
+    PFN_vkDestroyPipeline dp = nullptr;
+} worker_fn;
 constexpr uint64_t kTail = 64 << 10;   // (bytes added to the library's big storage buffer: the weights of the layers and the postpass, ~32 KB)
 
 /// The library's big storage buffer (each upscale context makes one) and the tail added to it, by generation: the shaders
@@ -344,13 +355,15 @@ struct Bind {
 std::unordered_map<VkCommandBuffer, Bind> bound;
 int layers64 = 0;
 
-// (the unrolled pipelines: made by jobs, bound in the library's place; a job whose pipeline was destroyed meanwhile drops
-// what it made)
+// (the unrolled pipelines: made by jobs, bound in the library's place; each job carries a unique token so a destroyed or
+// reused handle never gets a stale build published onto it)
 std::unordered_map<VkPipeline, VkPipeline> better;
-std::unordered_set<VkPipeline> pending, cancelled;
+std::unordered_map<VkPipeline, uint64_t> pending_token;
+uint64_t next_job_token = 1;
 std::atomic<int> better_count{0};
-/// The jobs: one builds at a time (a first build is a minute of CPU and ~3 GB of the driver's memory). Never destroyed, as
-/// lib(): a job still in the driver when the process exits must not find them gone
+/// The jobs: one builds at a time (unrolled and folded, a cold build is ~0.15-0.35 s standalone / 0.33-0.69 s in-game and
+/// <60 MB of the driver's memory). Never destroyed, as lib(): a job still in the driver when the process exits must not find
+/// them gone
 struct Jobs {
     std::mutex mu;
     std::condition_variable cv;
@@ -363,8 +376,10 @@ Jobs& jobs() {
 }
 std::atomic<bool> closing{false};   // (the window closed: no job starts, the one building leaves what it made)
 std::atomic<bool> suppressed{false};   // (the new context is built with AMD's shaders: the create hooks pass through)
-constexpr size_t kUnrollWords = 120000;              // (a layer unrolled to more than this is left rolled)
-constexpr uint64_t kBuildHeadroom = 8ull << 30;     // (memory to spare before a build starts)
+constexpr size_t kUnrollWords = 120000;              // (a pass still above this after folding is left rolled)
+constexpr size_t kCompactUnrollWords = 60000;        // (folded FSR 4.1.2 passes are 27-45K words and peak <60 MB to compile)
+constexpr uint64_t kCompactHeadroom = 1ull << 30;    // (memory to spare for compact folded builds <= kCompactUnrollWords)
+constexpr uint64_t kBuildHeadroom = 8ull << 30;      // (memory to spare for larger unrolled builds > kCompactUnrollWords)
 
 bool on() {
     static const bool v = dev.policy.fsr4_tune;   // (device_policy.h: AMD's GPUs, unless the switch says off)
@@ -375,7 +390,7 @@ bool on() {
 void suppress(bool on) { suppressed.store(on, std::memory_order_relaxed); }
 /// What the system can still commit: Windows' commit charge left (RAM and page file), Linux's available memory and free swap.
 /// True when unknown
-bool build_headroom(uint64_t* avail) {
+bool build_headroom(uint64_t* avail, uint64_t want = kBuildHeadroom) {
     *avail = 0;
 #ifdef _WIN32
     MEMORYSTATUSEX m{};
@@ -394,7 +409,7 @@ bool build_headroom(uint64_t* avail) {
     fclose(f);
     *avail = (uint64_t)(mem + swap) << 10;
 #endif
-    return *avail >= kBuildHeadroom;
+    return *avail >= want;
 }
 
 /// (mu held) A buffer let go, or its handle given out again: if it was a Big, its tail with it. Its pipelines then read none
@@ -714,10 +729,24 @@ bool save_own_cache() {
     std::lock_guard lk(own_cache_save_mu);
     return own_pipeline_cache_save(own_cache(), kOwnCacheFile, &own_cache_saved);
 }
-/// A job: the layer unrolled and built with copies of its layouts; bound in the library's pipeline's place when made. Its
-/// thread counted in jobs().running from before it starts (fsr4_close waits for it)
-void build_unrolled(VkPipeline original, std::shared_ptr<const std::vector<uint32_t>> code, std::string name, VkComputePipelineCreateInfo ci,
-                    VkPipelineLayout layout, std::vector<VkDescriptorSetLayout> sets) {
+/// The subgroup lane count an unrolled pipeline asks for: 64 for wave64 network layers, else whatever the library asked for
+uint32_t unrolled_lanes(uint8_t kind, uint32_t orig_lanes) { return (kind & 1) ? 64u : orig_lanes; }
+
+// The expanded unroller takes the shader set it was checked against, FSR 4.1.2; any other version keeps the previous
+// unroller (spirv_unroll_legacy.h). Set by load()
+bool expanded_unroll = false;
+// The lower memory limit for compact builds, on the compiler it was measured on (device_policy.h). Set by load()
+bool compact_builds = false;
+/// The memory a build wants to have spare
+uint64_t build_want(bool expanded, size_t words) {
+    return expanded && compact_builds && words <= kCompactUnrollWords ? kCompactHeadroom : kBuildHeadroom;
+}
+
+/// A job: the pass unrolled and folded and built with copies of its layouts; bound in the library's pipeline's place when made.
+/// Its thread counted in jobs().running from before it starts (fsr4_close waits for it)
+void build_unrolled(VkPipeline original, uint64_t token, std::shared_ptr<const std::vector<uint32_t>> code, std::string name,
+                    VkComputePipelineCreateInfo ci, uint32_t req_lanes, VkPipelineLayout layout, std::vector<VkDescriptorSetLayout> sets,
+                    bool expanded) {
     struct Ended {
         ~Ended() {
             Jobs& j = jobs();
@@ -725,93 +754,134 @@ void build_unrolled(VkPipeline original, std::shared_ptr<const std::vector<uint3
             j.cv.notify_all();
         }
     } ended;
-    Jobs& j = jobs();
-    {
-        std::unique_lock lk(j.mu);
-        j.cv.wait(lk, [&j] { return j.slots > 0 || closing.load(); });
-        if (closing) return;   // (the window closed: not started. What it holds goes with the process)
-        j.slots--;
-    }
-    struct Slot {
-        ~Slot() {
-            Jobs& j = jobs();
-            { std::lock_guard lk(j.mu); j.slots++; }
-            j.cv.notify_all();
-        }
-    } slot;
-    const auto t0 = std::chrono::steady_clock::now();
-    std::vector<uint32_t> unrolled;
-    int left = -1;
-    const bool ok = spirv_unroll::unroll_all(code->data(), code->size(), unrolled, kUnrollWords, 64, &left) && left == 0;
-    VkPipeline made = VK_NULL_HANDLE;
-    bool cached = false;   // (taken from the cache, not compiled)
-    if (ok && !closing) {
-        VkShaderModuleCreateInfo mci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        mci.codeSize = unrolled.size() * 4, mci.pCode = unrolled.data();
+    struct Cleanup {
+        VkPipeline original;
+        uint64_t token;
+        VkPipelineLayout& layout;
+        std::vector<VkDescriptorSetLayout>& sets;
         VkShaderModule module = VK_NULL_HANDLE;
-        if (real_csm(dev.device, &mci, nullptr, &module) == VK_SUCCESS) {
-            VkPipelineShaderStageRequiredSubgroupSizeCreateInfo lanes{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
-            lanes.requiredSubgroupSize = 64;
-            ci.stage.pNext = &lanes, ci.stage.module = module, ci.stage.pName = name.c_str(), ci.layout = layout;
-            ci.stage.pSpecializationInfo = nullptr;   // (only layers without one are taken)
-            ci.basePipelineHandle = VK_NULL_HANDLE, ci.basePipelineIndex = -1;
-            ci.flags &= ~(VkPipelineCreateFlags)VK_PIPELINE_CREATE_DERIVATIVE_BIT;
-            // (through its own pipeline cache, kept across runs and updates: built once, loaded after. Asked of the caches
-            // first, with no compile: a layer built before costs nothing then, and the memory a compile wants is not asked
-            // for it. Before, a PC with less than kBuildHeadroom to spare at the first FSR 4 frame (a 16 GB one, often) ran
-            // without the unrolled layers even when their pipelines were in the caches. A failure is not tried again: the
-            // library's pipeline stays)
-            VkResult rr = VK_PIPELINE_COMPILE_REQUIRED;
-            if (dev.vk13.pipelineCreationCacheControl) {
-                VkComputePipelineCreateInfo ask = ci;
-                ask.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
-                rr = own_cache_compute_pipeline(own_cache(), &ask, &made);
-                cached = rr == VK_SUCCESS && made;
-                if (!cached) made = VK_NULL_HANDLE, rr = VK_PIPELINE_COMPILE_REQUIRED;
+        VkPipeline made = VK_NULL_HANDLE;
+        bool done = false;
+        ~Cleanup() {
+            if (done || closing) return;
+            if (module && worker_fn.dsm) worker_fn.dsm(dev.device, module, nullptr);
+            if (made && worker_fn.dp) worker_fn.dp(dev.device, made, nullptr);
+            if (layout) vkDestroyPipelineLayout(dev.device, layout, nullptr);
+            for (VkDescriptorSetLayout s : sets) vkDestroyDescriptorSetLayout(dev.device, s, nullptr);
+            std::lock_guard lk(mu);
+            auto it = pending_token.find(original);
+            if (it != pending_token.end() && it->second == token) pending_token.erase(it);
+        }
+    } cleanup{original, token, layout, sets};
+    try {
+        Jobs& j = jobs();
+        {
+            std::unique_lock lk(j.mu);
+            j.cv.wait(lk, [&j] { return j.slots > 0 || closing.load(); });
+            if (closing) return;   // (the window closed: not started. What it holds goes with the process)
+            j.slots--;
+        }
+        struct Slot {
+            ~Slot() {
+                Jobs& j = jobs();
+                { std::lock_guard lk(j.mu); j.slots++; }
+                j.cv.notify_all();
             }
-            uint64_t avail = 0;
-            if (!cached && !closing) {
-                if (build_headroom(&avail)) {
-                    rr = own_cache_compute_pipeline(own_cache(), &ci, &made);
-                } else {
-                    logf("vk: AMD FSR 4: %s: not unrolled now: %llu MB of memory to spare, %llu wanted (the next start tries again)",
-                         name.c_str(), (unsigned long long)(avail >> 20), (unsigned long long)(kBuildHeadroom >> 20));
-                    rr = VK_PIPELINE_COMPILE_REQUIRED;
+        } slot;
+        const auto t0 = std::chrono::steady_clock::now();
+        std::vector<uint32_t> unrolled;
+        int left = -1;
+        const bool ok = (expanded ? spirv_unroll::unroll_all(code->data(), code->size(), unrolled, kUnrollWords, 64, &left)
+                                  : spirv_unroll_legacy::unroll_all(code->data(), code->size(), unrolled, kUnrollWords, 64, &left)) && left == 0;
+        VkPipeline made = VK_NULL_HANDLE;
+        bool cached = false;   // (taken from the cache, not compiled)
+        if (ok && !closing) {
+            VkShaderModuleCreateInfo mci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            mci.codeSize = unrolled.size() * 4, mci.pCode = unrolled.data();
+            VkShaderModule module = VK_NULL_HANDLE;
+            if (worker_fn.csm && worker_fn.csm(dev.device, &mci, nullptr, &module) == VK_SUCCESS) {
+                cleanup.module = module;
+                VkPipelineShaderStageRequiredSubgroupSizeCreateInfo lanes{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+                lanes.requiredSubgroupSize = req_lanes;
+                ci.stage.pNext = req_lanes ? &lanes : nullptr;
+                if (req_lanes) ci.stage.flags &= ~(VkPipelineShaderStageCreateFlags)VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT;
+                ci.stage.module = module, ci.stage.pName = name.c_str(), ci.layout = layout;
+                ci.stage.pSpecializationInfo = nullptr;   // (only passes without one are taken)
+                ci.basePipelineHandle = VK_NULL_HANDLE, ci.basePipelineIndex = -1;
+                ci.flags &= ~(VkPipelineCreateFlags)VK_PIPELINE_CREATE_DERIVATIVE_BIT;
+                // (through its own pipeline cache, kept across runs and updates: built once, loaded after. Asked of the caches
+                // first, with no compile: a pass built before costs nothing then, and the memory a compile wants is not asked
+                // for it. Before, a PC with less than kBuildHeadroom to spare at the first FSR 4 frame (a 16 GB one, often) ran
+                // without the unrolled passes even when their pipelines were in the caches. A failure is not tried again: the
+                // library's pipeline stays)
+                VkResult rr = VK_PIPELINE_COMPILE_REQUIRED;
+                if (dev.vk13.pipelineCreationCacheControl) {
+                    VkComputePipelineCreateInfo ask = ci;
+                    ask.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+                    rr = own_cache_compute_pipeline(own_cache(), &ask, &made);
+                    cached = rr == VK_SUCCESS && made;
+                    if (!cached) made = VK_NULL_HANDLE, rr = VK_PIPELINE_COMPILE_REQUIRED;
                 }
+                uint64_t avail = 0;
+                if (!cached && !closing) {
+                    const uint64_t want = build_want(expanded, unrolled.size());
+                    if (build_headroom(&avail, want)) {
+                        rr = own_cache_compute_pipeline(own_cache(), &ci, &made);
+                    } else {
+                        logf("vk: AMD FSR 4: %s: not unrolled now: %llu MB of memory to spare, %llu wanted (the next start tries again)",
+                             name.c_str(), (unsigned long long)(avail >> 20), (unsigned long long)(want >> 20));
+                        rr = VK_PIPELINE_COMPILE_REQUIRED;
+                    }
+                }
+                // (the window closed while the driver built it: fsr4_close may have stopped waiting, and the process be ending.
+                // Nothing more is touched, its cache not written either: the next start finds it in the driver's own disk cache, or
+                // builds it again, and writes the file then)
+                if (closing) return;
+                if (rr != VK_SUCCESS) {
+                    made = VK_NULL_HANDLE;
+                    if (rr != VK_PIPELINE_COMPILE_REQUIRED)
+                        logf("vk: AMD FSR 4: %s: its unrolled pipeline was not built (%d): AMD's stays", name.c_str(), (int)rr);
+                }
+                cleanup.made = made;
+                if (worker_fn.dsm) worker_fn.dsm(dev.device, module, nullptr);
+                cleanup.module = VK_NULL_HANDLE;
             }
-            // (the window closed while the driver built it: fsr4_close may have stopped waiting, and the process be ending.
-            // Nothing more is touched, its cache not written either: the next start finds it in the driver's own disk cache, or
-            // builds it again, and writes the file then)
-            if (closing) return;
-            if (rr != VK_SUCCESS) {
+        }
+        if (closing) return;
+        vkDestroyPipelineLayout(dev.device, layout, nullptr);
+        layout = VK_NULL_HANDLE;
+        for (VkDescriptorSetLayout s : sets) vkDestroyDescriptorSetLayout(dev.device, s, nullptr);
+        sets.clear();
+        const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        bool published = false;
+        {
+            std::lock_guard lk(mu);
+            auto it = pending_token.find(original);
+            if (it != pending_token.end() && it->second == token) {
+                pending_token.erase(it);
+                if (made) {
+                    better[original] = made;
+                    better_count++;
+                    published = true;
+                    cleanup.made = VK_NULL_HANDLE;
+                }
+            } else if (made) {
+                if (worker_fn.dp) worker_fn.dp(dev.device, made, nullptr);
                 made = VK_NULL_HANDLE;
-                if (rr != VK_PIPELINE_COMPILE_REQUIRED)
-                    logf("vk: AMD FSR 4: %s: its unrolled pipeline was not built (%d): AMD's stays", name.c_str(), (int)rr);
+                cleanup.made = VK_NULL_HANDLE;
             }
-            real_dsm(dev.device, module, nullptr);
         }
+        cleanup.done = true;
+        // (each one kept as soon as it is built, whether or not the game closes normally)
+        if (published && !save_own_cache())
+            logf("vk: AMD FSR 4: %s: its unrolled pipeline could not be saved (the next start builds it again)", name.c_str());
+        if (published) logf("vk: AMD FSR 4: tuned %s: its loops unrolled (%zu -> %zu words), bound in its place from now (%.2f s %s)",
+                            name.c_str(), code->size(), unrolled.size(), s, cached ? "from the caches" : "to build");
+        else if (!ok) logf("vk: AMD FSR 4: %s left rolled (%d loops kept: unrolled whole it would pass %zu words, or they cannot be)",
+                           name.c_str(), left, kUnrollWords);
+    } catch (...) {
+        if (!closing) logf("vk: AMD FSR 4: %s: unroll aborted (out of memory): AMD's stays", name.c_str());
     }
-    if (closing) return;
-    vkDestroyPipelineLayout(dev.device, layout, nullptr);
-    for (VkDescriptorSetLayout s : sets) vkDestroyDescriptorSetLayout(dev.device, s, nullptr);
-    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    {
-        std::lock_guard lk(mu);
-        pending.erase(original);
-        if (cancelled.erase(original) || !made) {
-            if (made) real_dp(dev.device, made, nullptr);
-        } else {
-            better[original] = made;
-            better_count++;
-        }
-    }
-    // (each one kept as soon as it is built, whether or not the game closes normally: a build of a minute is not done again)
-    if (made && !save_own_cache())
-        logf("vk: AMD FSR 4: %s: its unrolled pipeline could not be saved (the next start builds it again)", name.c_str());
-    if (made) logf("vk: AMD FSR 4: tuned %s: its loops unrolled (%zu -> %zu words), bound in its place from now (%.1f s %s)",
-                   name.c_str(), code->size(), unrolled.size(), s, cached ? "from the caches" : "to build");
-    else if (!ok) logf("vk: AMD FSR 4: %s left rolled (%d loops kept: unrolled whole it would pass %zu words, or they cannot be)",
-                       name.c_str(), left, kUnrollWords);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL create_compute_pipelines(VkDevice d, VkPipelineCache cache, uint32_t n,
@@ -880,26 +950,46 @@ VKAPI_ATTR VkResult VKAPI_CALL create_compute_pipelines(VkDevice d, VkPipelineCa
     if (r != VK_SUCCESS) return r;
     std::lock_guard lk(mu);
     for (uint32_t i = 0; i < n; i++) {
+        const bool has_plain = (bool)plain[i];
+        const uint32_t orig_lanes = has_plain ? plain[i]->lanes : 0;
         if (kind[i] & 2) {   // (without a Plain, only when the library's own module could not be made: no fallback then)
             auto [t, added] = tail_pipes.try_emplace(p[i]);
             if (added) tail_count++;
             t->second = TailPipe{gen[i], std::move(plain[i])};
             t->second.twin_failed = !t->second.plain;
         }
-        // (a layer with weight tables, from the library's own code: unrolled, its weights become constants in the code, which
-        // is where the gain is. One without tables gains nothing: pass 3, 0.07 ms either way. Only one whose creation carried
-        // nothing else: no specialization, no other structures)
-        if (!(kind[i] & 1) || !(kind[i] & 2) || closing || ci[i].stage.pSpecializationInfo || lanes[i].pNext || ci[i].pNext) continue;
+        // (on FSR 4.1.2, every pass with constant weight tables — the layers and the postpass — from the library's own code:
+        // unrolled and folded, its weights become immediate constants and its local scratch arrays disappear; another FSR 4
+        // version keeps the previous unroller for the wave64 layers only. Passes without tables gain nothing: pass 3, 0.07 ms
+        // either way. Only one whose plain twin could be made and whose creation carried nothing else: no specialization, no
+        // other structures beyond a lane count)
+        if (!(kind[i] & 2) || (!expanded_unroll && !(kind[i] & 1)) || !has_plain || closing || ci[i].stage.pSpecializationInfo || lanes[i].pNext || ci[i].pNext) continue;
         // (copies of its layouts, made now while the library's are alive: identically defined, so compatible with its sets)
         LayoutCopy lc;
         VkPipelineLayout layout = VK_NULL_HANDLE;
         std::vector<VkDescriptorSetLayout> sets;
         if (!layout_copy_locked(ci[i].layout, &lc) || !make_layout(d, lc, &layout, &sets)) continue;
-        pending.insert(p[i]);
+        const uint64_t token = next_job_token++;
+        pending_token[p[i]] = token;
         VkComputePipelineCreateInfo job = ci[i];
         job.pNext = nullptr, job.stage.pNext = nullptr;
+        const uint32_t req_lanes = unrolled_lanes(kind[i], orig_lanes);
         { std::lock_guard jl(jobs().mu); jobs().running++; }
-        std::thread(build_unrolled, p[i], code[i], entry[i], job, layout, std::move(sets)).detach();   // (counted: fsr4_close)
+        try {
+            // (sets copied by value so catch(...) still holds every handle to destroy if thread creation throws)
+            std::thread(build_unrolled, p[i], token, code[i], entry[i], job, req_lanes, layout, sets, expanded_unroll).detach();   // (counted: fsr4_close)
+        } catch (...) {
+            {
+                Jobs& j = jobs();
+                std::lock_guard jl(j.mu);
+                j.running--;
+                j.cv.notify_all();
+            }
+            auto it = pending_token.find(p[i]);
+            if (it != pending_token.end() && it->second == token) pending_token.erase(it);
+            vkDestroyPipelineLayout(d, layout, nullptr);
+            for (VkDescriptorSetLayout s : sets) vkDestroyDescriptorSetLayout(d, s, nullptr);
+        }
     }
     static bool told_lanes = false;
     if (!told_lanes && layers64) told_lanes = true, logf("vk: AMD FSR 4: tuned: its network's layers run 64 lanes wide (%d so far)", layers64);
@@ -910,7 +1000,7 @@ VKAPI_ATTR void VKAPI_CALL destroy_pipeline(VkDevice d, VkPipeline pl, const VkA
         std::lock_guard lk(mu);
         auto b = better.find(pl);
         if (b != better.end()) real_dp(d, b->second, nullptr), better.erase(b), better_count--;
-        if (pending.count(pl)) cancelled.insert(pl);
+        pending_token.erase(pl);
         auto t = tail_pipes.find(pl);
         if (t != tail_pipes.end()) {
             if (t->second.twin) real_dp(d, t->second.twin, nullptr);
@@ -1025,6 +1115,7 @@ void prepare_device() {   // (initialized before AMD can start any tuning work)
     real_ccp = (PFN_vkCreateComputePipelines)vkGetDeviceProcAddr(dev.device, "vkCreateComputePipelines");
     real_cdsl = (PFN_vkCreateDescriptorSetLayout)vkGetDeviceProcAddr(dev.device, "vkCreateDescriptorSetLayout");
     real_cpl = (PFN_vkCreatePipelineLayout)vkGetDeviceProcAddr(dev.device, "vkCreatePipelineLayout");
+    worker_fn = {real_csm, real_dsm, real_dp};
 }
 /// The window closing (fsr4_close): no job starts from now, and the one building is waited for, 10 s at most (as the
 /// shaders' preparation is, vk_main.cpp): a driver can take longer on one pipeline, and that job then touches nothing more
@@ -1179,6 +1270,12 @@ bool load() {
         logf("vk: AMD FSR 4: model: INT8 Lite is the only one here; the FSR 4 model row is not shown");
     else if (fsr4_models::has_model(fsr4_models::MODEL_LITE))
         logf("vk: AMD FSR 4: model: Lite is hooked, and offered on AMD GPUs only; Auto");
+    tune::expanded_unroll = best[0] == 4 && best[1] == 1 && best[2] == 2;
+    tune::compact_builds = dev.policy.fsr4_compact_builds;
+    if (tune::on())
+        logf("vk: AMD FSR 4: passes unrolled by the %s unroller; a compact build wants %s of memory to spare",
+             tune::expanded_unroll ? "expanded" : "previous",
+             tune::expanded_unroll && tune::compact_builds ? "1 GiB" : "8 GiB");
     l.ok = true;
     g_why = FSR_OK;
     return true;

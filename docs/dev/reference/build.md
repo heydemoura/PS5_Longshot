@@ -421,8 +421,9 @@ with a dev mod linked in". Its status is the game's, or play's own (120 to 123);
 `game_args` go after a `--`: the builder reads none of them.
 
 `extra_mod_dirs` reach the game in **`LONGSHOT_DEV_MODS`** (`build_driver::play::DEV_MODS_VAR`, host/longshot_profile.h),
-the folders joined by the OS's path separator (`:`, `;` on Windows). This release only passes it on: the Mod API's game
-side reads it and links each folder's mod in beside the profile's, for that run alone.
+the folders joined by the OS's path separator (`:`, `;` on Windows; a folder with it in its name is refused, on Windows
+too, so the list has no quotes). This release only passes it on: the Mod API's game side reads it and links each
+folder's mod in beside the profile's, for that run alone.
 
 ### The game's channel to its builder
 
@@ -675,13 +676,16 @@ test's override: the launcher sets none of them.
 | `LONGSHOT_IR_LEVEL=<level>` | The lifted units' level (`O1`) |
 | `RX_HOT_OPT=<level>` | The guest profile's hot units' level (`O2`; `O1` for a fast build, never measured) |
 | `RX_COLD_OPT=<level>` | The level of the units of the functions the guest profile saw never run (`O0`; `O1` builds them as the rest) |
+| `LONGSHOT_HOT_SPLIT=0` | The hot units' blocks the guest profile never saw run stay where LLVM puts them, as before the splitting. On by default (unset, `1` or any word but an off one), they move out of the hot code: the lift weights each branch of the hot units that ran but was never taken 0 (1 when it goes to a block that ran through another edge; else such a branch has no weights); the compile builds the hot units with LLVM's hot-cold splitting for those regions alone ([builder](builder.md#the-guest-profile)). `LONGSHOT_HOT_SPLIT_SKIP=<entries>` (hex, comma-separated) leaves functions out, as the functions the edits change always are: they get no new zero weights (their other weights are kept from a probability that would make a block that ran cold, as every function's in a hot unit). The compile's flags are a whole hot unit's, so LLVM can still move out such a function's region at a call of a cold helper (a float's slow path). Both are in the lift's key; a `longshot-builder compile` on its own refuses a lift made with the switch otherwise. At `0`, the IR, the compile's flags and every key are as without the splitting |
 | `RX_A64_RT_O2=0` | The lift's runtime (`gen/rt`) at the lifted units' level instead of `-O2` |
+| `LONGSHOT_FP_NAN_MID=0` | The hot units' float slow paths without their middle path ([the lift](#the-lift-switches), below); `LONGSHOT_FP_NAN_MID_SKIP=<entries>` leaves those functions out of it |
 | `RX_MARCH=<level>` | The game's CPU level. Default: this PC's CPU (`-march=native`); `cpu_unknown` when clang cannot say what that is |
 | `RX_VK_PGO=gen\|<file>` | The renderer counts branches for a profile, or builds with this one. Default: `assets/profiles/longshot_vk.profdata.xz` ([recording one](../developing.md#record-the-renderers-play-profile)) |
 | `RX_RELEASE=1` | A release build: no console window, shaders prepared before the title. `build` and `update` always are; `compile` only with it |
 | `LONGSHOT_THIRD_PARTY_OBJECTS=<dir>\|0` | The prebuilt third-party objects. Default: the tools' `third_party_objects/`; `0`: compile them. With `compile --third-party-objects` (the release's set) only a folder named here is read: the objects it holds by their keys are taken into the new set as they are (the release's: the last release's set, `longshot-packager release last-objects`) |
 | `LONGSHOT_TRACY=1`, `LONGSHOT_TRACY_FIBERS=1` | A Tracy build ([profiling](profiling.md#tracy)); the game's fibers told to Tracy |
 | `--ngx-sdk <dir>` (`LONGSHOT_NGX_SDK`, for one release) | NVIDIA's NGX SDK for `--upscaler dlss`, in place of the one the builder downloads; ignored by a build that did not ask for DLSS |
+| `LONGSHOT_SL_SDK=<dir>` | A developer's NVIDIA Streamline SDK (`scripts/fetch.py streamline`), for a Windows build with `--upscaler dlss`: the renderer with DLSS Frame Generation through Streamline (`-DLONGSHOT_SL` for `vk_dlssg.cpp` and `vk_dlssg_layer.cpp` alone); its runtime goes beside `longshot.exe` by `scripts/fetch.py streamline --game`, not by the builder. Unset, without `include/sl.h`, or a build without DLSS: built without it ([upscalers](upscalers.md#dlss-fg-through-streamline)) |
 | `LONGSHOT_VERSION=<name>` | The release's name. Default: a `VERSION` or `version.txt` file at the root, else `git describe` of the version tags |
 
 **The tools**
@@ -713,8 +717,16 @@ says a mod left in an emulator's layout in its `mods/` (`mod_needs_import`), nev
 shader preparation runs the game without the builder's own environment (its `LONGSHOT_*` switches, the tools'
 libraries on the search path), but with `LONGSHOT_SHADER_STORE`, so it prepares in the store the game plays with.
 
-**The lift** keeps no unit's text by default: the compile has each made as it needs it ([the
+<a id="the-lift-switches"></a>**The lift** keeps no unit's text by default: the compile has each made as it needs it ([the
 builder](builder.md#the-units-texts)). `LONGSHOT_KEEP_IR=1` writes them to gen/ (5.7 GB), to read or compare them.
+The hot units' float slow paths have a middle path for a NaN lane with no subnormal one by default ([floating
+point](builder.md#floating-point)), and the log counts them; `LONGSHOT_FP_NAN_MID=0` (or `off`, `no`, `false`, empty)
+lifts without it, as before the middle path existed (unset, `1` or any other value: on).
+`LONGSHOT_FP_NAN_MID_SKIP=<entries>` (hex, `f_81c7f880,f_820e2520`) leaves those functions out of it (a developer's
+switch, for finding a function by halves; with the middle path off it is not read). On, the switch is in the lift's key
+and in each hot unit's key, with the entries of the list among that unit's functions (a hot unit whose functions are
+all on the list keeps its key without the option): turning it on or off moves the hot units' keys, and a change of the
+list only those of the hot units whose functions it adds or removes; no other unit's key moves.
 A function of more than 60,000 mid IR instructions is split into pieces of
 about 20,000 for the compiler (`longshot-builder dev lift --split-over N --split-piece N`; `0`: no split), and lifted units are
 compiled with two caps on LLVM's slowest passes (`-mllvm -cgpp-huge-func=1000 -grow-region-complexity-budget=1000`).
@@ -968,7 +980,7 @@ part; `dev.py paths <part>` prints one, for scripts.
 | `config/` | `dev_build.json`, `job_queue.json` | |
 | `builder-cache/` | `longshot-builder`'s per-user cache for every dev build (runtimes, sources, tools): `dev.py` sets it, so a dev build never fills the player's `~/.cache/longshot-builder` | `LONGSHOT_CACHE` |
 | `work/` | `mise run build`'s work folders, one per checkout (`work/<checkout>-<hash>`; `work-windows/`: `RX_TARGET=windows`), for a build, an update, a lift or a compile | `--work` |
-| `sdk/` | `scripts/fetch.py`'s SDKs: `ngx-linux/`, `ngx-windows/`, `ffx/`, `xess/` | `LONGSHOT_NGX_SDK` |
+| `sdk/` | `scripts/fetch.py`'s SDKs: `ngx-linux/`, `ngx-windows/`, `ffx/`, `xess/`, `sl/` | `LONGSHOT_NGX_SDK` |
 | `runs/` | Game runs: `control/` (`longshot_ctl.py`), `memtour-*`, `cover-*` | `--root`, `--out` |
 | `update/` | `dev.py update`'s worktree `tree/`, `work/`, the game folder's `backups/`, `history.md` | |
 | `tools/` | glslang (`mise run setup`) and Tracy's capture tools (`mise run tracy-tools`) | |

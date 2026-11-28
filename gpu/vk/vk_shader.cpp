@@ -37,6 +37,7 @@
 #include "shader_recompiler/ir_opt/fragment_output_guard.h"
 #include "shader_recompiler/ir_opt/sim_turf_pool_pass.h"
 #include "shader_recompiler/ir_opt/scene_tonemap_pass.h"
+#include "shader_recompiler/ir_opt/lens_eye_pass.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/environment.h"
@@ -770,6 +771,7 @@ constexpr size_t kSparePoolBytes = 8u << 20;
 struct Translation {
     std::unique_ptr<Pools> pools;
     Shader::IR::Program program;
+    bool lens_eye = false;   // (longshot: the Lens of Truth's eye, lens_eye_pass.h: its vertex program's ring follows)
     Translation() {
         auto& spare = spare_pools();
         if (spare.empty()) {
@@ -798,6 +800,8 @@ std::unique_ptr<Translation> translate(Env& env, bool graphics, bool one_exit = 
                                    env.StartAddress() + (graphics ? static_cast<u32>(sizeof(Shader::ProgramHeader)) : 0u),
                                    one_exit};
     t->program = Shader::Maxwell::TranslateProgram(t->pools->insts, t->pools->blocks, env, cfg, host_info());
+    // (longshot) the Lens of Truth's eye at the picture's shape (lens_eye_pass.h): its fragment program, whichever pipeline draws it
+    if (graphics && t->program.stage == Shader::Stage::Fragment && !Shader::Optimization::LensEyePass(t->program)) t->lens_eye = true;
     return t;
 }
 
@@ -1503,6 +1507,7 @@ uint64_t translator_stamp() {
         // NaN guard, the matrix layout measured on this device. Without them a cache made on one GPU was used on another (a laptop's
         // integrated and dedicated GPUs), and RX_VK_NO_INVARIANT / RX_VK_NAN_GUARD did nothing for programs already cached)
         using namespace Shader::Backend::SPIRV;
+        const bool staged_b = mma_software && mma_software_staged_b && mma_software_full_subgroups;   // (vk_coopmat.cpp choose_staged_b)
         // (and the vendor fixes of the translation, device_policy.h: out-of-bounds fetches, NaN tests, the gather offset)
         const uint32_t flags = (position_invariant ? 1u : 0u) | (frag_nan_guard ? 2u : 0u) | (mma_software ? 4u : 0u) |
                                (global_table_loop ? 8u : 0u) | (fetch_bounds ? 16u : 0u) | (nan_bits ? 32u : 0u) |
@@ -1513,8 +1518,12 @@ uint64_t translator_stamp() {
                                (mesh_fallback_shared_warp ? 8192u : 0u) | (mesh_fallback_shared_warp_check ? 16384u : 0u) |
                                (mesh_fallback_strict_fmul ? 32768u : 0u) |
                                (mma_wmma16 ? 65536u : 0u) | (mma_wmma16_fast ? 131072u : 0u) |
-                               (mma_wmma16 && mma_wmma16_fused ? 262144u : 0u) | (uint32_t)graphics_table_loads << 19;
+                               // (graphics_table_loads is 0, 1 or 2: bits 19 and 20)
+                               (mma_wmma16 && mma_wmma16_fused ? 262144u : 0u) | (uint32_t)graphics_table_loads << 19 |
+                               // (and B through workgroup memory, bit 21, past graphics_table_loads' two; its limit below)
+                               (staged_b ? 2097152u : 0u);
         add(&flags, sizeof flags);
+        if (staged_b) add(&mma_software_staged_b, sizeof mma_software_staged_b);
         add(mma_order_a.data(), sizeof(uint32_t) * mma_order_a.size());
         add(mma_order_b.data(), sizeof(uint32_t) * mma_order_b.size());
         add(mma_order_c.data(), sizeof(uint32_t) * mma_order_c.size());
@@ -1693,6 +1702,15 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
                 Env fs_env{s, *fsc, Shader::Stage::Fragment};
                 fs = translate(fs_env, true);
                 questions += fs_env.texture_questions;
+            }
+            if (fs && fs->lens_eye) {   // (the eye's ring narrowed with it: lens_eye_pass.h)
+                const char* swirl = nullptr;
+                const char* why = Shader::Optimization::LensEyeVertexPass(vs->program, &swirl);
+                static std::atomic<int> told{0};
+                if (told++ < 4)
+                    logf("vk: program %016llx: the Lens of Truth's eye at the picture's shape%s%s%s%s", (unsigned long long)p.key,
+                         why ? ", its ring left as the game's: " : ", its ring with it", why ? why : "",
+                         why ? "" : swirl ? ", its swirl left as the game's: " : ", its swirl too", why || !swirl ? "" : swirl);
             }
             Shader::RuntimeInfo vrt{};
             Shader::RuntimeInfo frt{};
@@ -2038,8 +2056,8 @@ const Program* mesh_program_locked(const NvnState& s, const uint8_t color_types[
         else if (c->stage == 7) mesh = c;
         else if (c->stage == 1) fsc = c;
     }
-    static int logged;
-    if (logged++ < 6) log_program_stages(s, "mesh draw");
+    static int logged;   // (counted only while it logs: on every mesh draw it would overflow and log every draw again)
+    if (logged < 6 && ++logged) log_program_stages(s, "mesh draw");
     if (!mesh) return nullptr;
     const bool fallback = dev.uses_mesh_fallback(task != nullptr);
     const uint64_t key = mesh_key(task.get(), *mesh, fsc.get(), prim.get(), color_types);
@@ -2386,12 +2404,6 @@ struct Seed {
     std::vector<std::vector<uint32_t>> programs;
     std::unordered_map<uint64_t, uint32_t> index;   // (a stage by its code key: the pipeline state list's programs)
 } seed;
-std::string beside_exe(const char* name) {
-    char exe[MAX_PATH];
-    const DWORD n = game_module_path(exe, MAX_PATH);
-    std::string dir(exe, n);
-    return dir.substr(0, dir.find_last_of("\\/") + 1) + name;
-}
 Code stage_of_seed(const SeedStage& st) {
     return parse_code(seed.blob.data() + st.control, std::vector<uint8_t>(seed.blob.begin() + (ptrdiff_t)st.code,
                                                                           seed.blob.begin() + (ptrdiff_t)st.code + st.end));
@@ -2404,7 +2416,7 @@ void seed_stage_failed(const Code& c, uint64_t program) {
 }
 } // namespace
 
-std::string seed_path() { return beside_exe("longshot_shaders.bin"); }
+std::string seed_path() { return data_file("longshot_shaders.bin"); }
 
 size_t seed_open() {
     if (FILE* f = fopen(seed_path().c_str(), "rb")) {

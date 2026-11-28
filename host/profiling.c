@@ -108,8 +108,8 @@ void hos_profiling_env(void) {
     /* (a folder of this run's own: two starts in one second, the shader preparation's and the game's say, get -2, -3...) */
     int made = 0;
     for (int k = 1; k <= 50 && !made; k++) {
-        if (k == 1) snprintf(prof_dir, sizeof prof_dir, "%slogs" SEP_S "profile-%s", game, stamp);
-        else snprintf(prof_dir, sizeof prof_dir, "%slogs" SEP_S "profile-%s-%d", game, stamp, k);
+        if (k == 1) snprintf(prof_dir, sizeof prof_dir, "%s%slogs" SEP_S "profile-%s", game, hos_organized_build() ? "diagnostics/" : "", stamp);
+        else snprintf(prof_dir, sizeof prof_dir, "%s%slogs" SEP_S "profile-%s-%d", game, hos_organized_build() ? "diagnostics/" : "", stamp, k);
         made = CreateDirectoryA(prof_dir, NULL) != 0;
         if (!made && GetFileAttributesA(prof_dir) == INVALID_FILE_ATTRIBUTES) break;   /* (not there and not made: no use going on) */
     }

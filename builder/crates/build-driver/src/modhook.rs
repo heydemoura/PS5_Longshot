@@ -170,8 +170,14 @@ impl<'a> BuilderCx<'a> {
 }
 
 /// The folders `dirs` as [`crate::play::DEV_MODS_VAR`]'s value (the OS's path separator), or the reason one cannot be.
+/// A folder with the separator in its name is refused on every OS: the game splits the value at each separator
+/// (std's `join_paths` refuses it on Unix, but on Windows puts it in quotes, which the game does not read).
 pub fn dev_mods_value(dirs: &[PathBuf]) -> Result<OsString, String> {
-    std::env::join_paths(dirs).map_err(|e| format!("a mod folder has the path separator in its name: {e}"))
+    let sep = if cfg!(windows) { b';' } else { b':' };
+    if let Some(d) = dirs.iter().find(|d| d.as_os_str().as_encoded_bytes().contains(&sep)) {
+        return Err(format!("a mod folder has the path separator ({}) in its name: {}", char::from(sep), d.display()));
+    }
+    std::env::join_paths(dirs).map_err(|e| format!("a mod folder's name cannot be in the list: {e}"))
 }
 
 /// `mod`'s arguments (after `mod` and the builder's flags): this builder has no mod tooling, so it says so and ends
@@ -218,12 +224,7 @@ mod tests {
     }
 
     fn scratch(name: &str) -> PathBuf {
-        let d = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../target/test-scratch")
-            .join(format!("modhook-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+        crate::scratch(&format!("modhook-{name}"))
     }
 
     #[test]

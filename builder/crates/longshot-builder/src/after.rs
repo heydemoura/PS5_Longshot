@@ -281,7 +281,9 @@ pub fn build_ended(result: &Result<(), String>, release: Option<&str>, builder: 
     let who = crash::redact::Who::here();
     if STATISTICS.load(std::sync::atomic::Ordering::SeqCst) {
         let json = report(outcome, why, release, builder, true).json(&who.home, &[who.user.as_str()]);
-        let payload = seen().lock().unwrap_or_else(|e| e.into_inner()).out.join("logs").join("build-statistics.json");
+        let payload = build_core::game_layout::diagnostics(&seen().lock().unwrap_or_else(|e| e.into_inner()).out)
+            .join("logs")
+            .join("build-statistics.json");
         let t = std::thread::spawn(move || {
             let _ = std::fs::create_dir_all(payload.parent().unwrap_or(Path::new(".")));
             let (_, said, _) = br::send(&json, &payload, br::ADDRESS);
@@ -342,7 +344,11 @@ pub fn error_window(text: &str) -> bool {
                     buttons: &["Send", "Cancel"],
                 });
                 if sent == Ok(Some(0)) {
-                    let (_, said, _) = br::send(&json, &out.join("logs").join("build-report.json"), br::ADDRESS);
+                    let (_, said, _) = br::send(
+                        &json,
+                        &build_core::game_layout::diagnostics(&out).join("logs").join("build-report.json"),
+                        br::ADDRESS,
+                    );
                     let _ = ui.page(&Page {
                         title: "Longshot: send the report",
                         text: &said,
@@ -359,8 +365,9 @@ pub fn error_window(text: &str) -> bool {
                 for f in [log.clone().unwrap_or_default(), out.join(build_driver::folder::RECORD_FILE)] {
                     b.add(f);
                 }
-                let zip =
-                    out.join("bug-reports").join(format!("diagnostics-{}.zip", crash::names::utc(crash::store::now())));
+                let zip = build_core::game_layout::diagnostics(&out)
+                    .join("bug-reports")
+                    .join(format!("diagnostics-{}.zip", crash::names::utc(crash::store::now())));
                 let said = match crash::diag::write(&b, &zip, &who) {
                     Ok(()) => {
                         crash::desk::open(&zip.parent().unwrap_or(&out).display().to_string());

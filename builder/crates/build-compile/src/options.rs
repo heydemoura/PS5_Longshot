@@ -111,6 +111,8 @@ pub struct Settings {
     pub sdl_dir: Option<PathBuf>,
     /// `LONGSHOT_NGX_SDK`: NVIDIA's NGX SDK (DLSS).
     pub ngx_sdk: Option<PathBuf>,
+    /// `LONGSHOT_SL_SDK`: NVIDIA Streamline's SDK, a developer's (DLSS Frame Generation through Streamline, Windows).
+    pub sl_sdk: Option<PathBuf>,
     /// `LONGSHOT_FSR=1`: AMD FSR 4.
     pub fsr: bool,
     /// `LONGSHOT_TRACY=1`: a Tracy build (a developer's).
@@ -129,6 +131,9 @@ pub struct Settings {
     pub ir_level: Level,
     /// `RX_COLD_OPT`: the level of the units of the functions the guest profile saw never run (`lifted_cold_*`, O0).
     pub cold_level: Level,
+    /// `LONGSHOT_HOT_SPLIT` (on by default, `0` off: [`crate::hotsplit::on`]): the hot units compiled with LLVM's
+    /// hot-cold splitting ([`crate::hotsplit`]; the lift reads the same switch and writes them for it).
+    pub hot_split: bool,
     /// `LONGSHOT_MEM_GATE=0`: compilers start by the job count alone.
     pub mem_gate: bool,
     /// `LONGSHOT_OBJ_STORE`: one object store for every work folder; else the work folder's own.
@@ -189,6 +194,7 @@ impl Settings {
             sdl2: path(get("LONGSHOT_SDL2")).map(|p| if p.is_dir() { p.join("libSDL2-2.0.so.0") } else { p }),
             sdl_dir: path(get("LONGSHOT_SDL_DIR")),
             ngx_sdk: path(get("LONGSHOT_NGX_SDK")),
+            sl_sdk: path(get("LONGSHOT_SL_SDK")),
             fsr: get("LONGSHOT_FSR").as_deref() == Some("1"),
             tracy: get("LONGSHOT_TRACY").as_deref() == Some("1"),
             tracy_fibers: get("LONGSHOT_TRACY_FIBERS").as_deref() == Some("1"),
@@ -199,6 +205,7 @@ impl Settings {
             a64_rt_o2: get("RX_A64_RT_O2").is_none_or(|v| build_core::switch(&v) != Some(false)),
             ir_level: level("LONGSHOT_IR_LEVEL", Level::O1),
             cold_level: level("RX_COLD_OPT", Level::O0),
+            hot_split: crate::hotsplit::on(get("LONGSHOT_HOT_SPLIT").as_deref()),
             mem_gate: get("LONGSHOT_MEM_GATE").as_deref() != Some("0"),
             obj_store: path(get("LONGSHOT_OBJ_STORE")).filter(|p| p.as_os_str() != "0"),
             third_party_objects,

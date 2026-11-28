@@ -97,13 +97,13 @@ int main(int argc, char** argv) {
         return d;
     };
     /* 3x at 60 game frames a second (5.56 ms apart): the game frame's slot 118.18 */
-    CHECK(fifo_catch_up(2, dues(105 * ms, 5555556, 2), 100 * ms, 0, R, 100 * ms) == 0);   /* 2.07 after its time */
-    CHECK(fifo_catch_up(2, dues(101010100, 5555556, 2), 100 * ms, 0, R, 100 * ms) == 0);   /* exactly a refresh: kept */
-    CHECK(fifo_catch_up(2, dues(101010099, 5555556, 2), 100 * ms, 0, R, 100 * ms) == 1);   /* 1 ns more: a made frame out */
-    CHECK(fifo_catch_up(2, dues(80 * ms, 5555556, 2), 100 * ms, 0, R, 100 * ms) == 1);     /* far behind: at most made - 1 */
+    CHECK(fifo_catch_up(2, dues(105 * ms, 5555556, 2), 100 * ms, 0, R, 100 * ms, 0) == 0);   /* 2.07 after its time */
+    CHECK(fifo_catch_up(2, dues(101010100, 5555556, 2), 100 * ms, 0, R, 100 * ms, 0) == 0);   /* exactly a refresh: kept */
+    CHECK(fifo_catch_up(2, dues(101010099, 5555556, 2), 100 * ms, 0, R, 100 * ms, 0) == 1);   /* 1 ns more: a made frame out */
+    CHECK(fifo_catch_up(2, dues(80 * ms, 5555556, 2), 100 * ms, 0, R, 100 * ms, 0) == 1);     /* far behind: at most made - 1 */
     /* 2x keeps its one made frame; nothing made: nothing out */
-    CHECK(fifo_catch_up(1, dues(80 * ms, 8333333, 1), 100 * ms, 0, R, 100 * ms) == 0);
-    CHECK(fifo_catch_up(0, dues(80 * ms, 0, 0), 100 * ms, 0, R, 100 * ms) == 0);
+    CHECK(fifo_catch_up(1, dues(80 * ms, 8333333, 1), 100 * ms, 0, R, 100 * ms, 0) == 0);
+    CHECK(fifo_catch_up(0, dues(80 * ms, 0, 0), 100 * ms, 0, R, 100 * ms, 0) == 0);
     /* which frames are shown: spread over the set, the last the game's */
     const int p63[] = {1, 3, 5}, p65[] = {0, 1, 3, 4, 5}, p32[] = {1, 2}, p64[] = {1, 2, 4, 5};
     for (int k = 0; k < 3; k++) CHECK(fifo_pick(6, 3, k) == p63[k]);
@@ -113,22 +113,22 @@ int main(int argc, char** argv) {
     for (int k = 0; k < 6; k++) CHECK(fifo_pick(6, 6, k) == k);
     /* 6x at 43 game frames a second (3.88 ms apart), due on its first slot: all 6 shown leave the game frame 10.9 ms
        late; the 3rd left out, 4.9 */
-    CHECK(fifo_catch_up(5, dues(106060606, 3875969, 5), 100 * ms, 0, R, 100 * ms) == 1);
+    CHECK(fifo_catch_up(5, dues(106060606, 3875969, 5), 100 * ms, 0, R, 100 * ms, 0) == 1);
     /* a refresh behind: 5 shown leave it 10.9 ms late; 4 (the 2nd, 3rd, 5th and 6th), 4.9 */
-    CHECK(fifo_catch_up(5, dues(100 * ms, 3875969, 5), 100 * ms, 0, R, 100 * ms) == 2);
+    CHECK(fifo_catch_up(5, dues(100 * ms, 3875969, 5), 100 * ms, 0, R, 100 * ms, 0) == 2);
     /* 6x at 27 a second (6.17 ms apart, over a refresh): each frame at its own time, none out */
-    CHECK(fifo_catch_up(5, dues(106060606, 6172840, 5), 100 * ms, 0, R, 100 * ms) == 0);
+    CHECK(fifo_catch_up(5, dues(106060606, 6172840, 5), 100 * ms, 0, R, 100 * ms, 0) == 0);
     /* 6x far behind: at most made - 1 = 4 out, a made frame and the game's stay */
-    CHECK(fifo_catch_up(5, dues(60 * ms, 3875969, 5), 100 * ms, 0, R, 100 * ms) == 4);
+    CHECK(fifo_catch_up(5, dues(60 * ms, 3875969, 5), 100 * ms, 0, R, 100 * ms, 0) == 4);
     /* taken early, 2 of the set before still to show from 100: its first slot 112.12 */
-    CHECK(fifo_catch_up(2, dues(110 * ms, 5555556, 2), 100 * ms, 2, R, 100 * ms) == 0);
-    CHECK(fifo_catch_up(2, dues(104 * ms, 5555556, 2), 100 * ms, 2, R, 100 * ms) == 1);
+    CHECK(fifo_catch_up(2, dues(110 * ms, 5555556, 2), 100 * ms, 2, R, 100 * ms, 0) == 0);
+    CHECK(fifo_catch_up(2, dues(104 * ms, 5555556, 2), 100 * ms, 2, R, 100 * ms, 0) == 1);
     /* a line fallen behind now starts again from now (fifo_slot): late against its own time only by now */
-    CHECK(fifo_catch_up(2, dues(99 * ms, 5555556, 2), 50 * ms, 0, R, 100 * ms) == 0);
-    CHECK(fifo_catch_up(2, dues(90 * ms, 5555556, 2), 50 * ms, 0, R, 100 * ms) == 1);
+    CHECK(fifo_catch_up(2, dues(99 * ms, 5555556, 2), 50 * ms, 0, R, 100 * ms, 0) == 0);
+    CHECK(fifo_catch_up(2, dues(90 * ms, 5555556, 2), 50 * ms, 0, R, 100 * ms, 0) == 1);
     /* no slot yet, or the refresh not known */
-    CHECK(fifo_catch_up(2, dues(50 * ms, 5555556, 2), 0, 0, R, 100 * ms) == 0);
-    CHECK(fifo_catch_up(2, dues(50 * ms, 5555556, 2), 100 * ms, 0, 0, 100 * ms) == 0);
+    CHECK(fifo_catch_up(2, dues(50 * ms, 5555556, 2), 0, 0, R, 100 * ms, 0) == 0);
+    CHECK(fifo_catch_up(2, dues(50 * ms, 5555556, 2), 100 * ms, 0, 0, 100 * ms, 0) == 0);
     if (failures) return 1;
     std::puts("PASS: under FIFO the game's frames at most the multiplier's share of refresh - refresh^2/3600 a second while "
               "frames are made; a set whose game frame would be over a refresh late keeps the most frames that bring it "
@@ -149,7 +149,7 @@ def check_sources(reflex, framegen):
         sleep.index("const uint32_t minimum = fifo_min_interval_us();") < sleep.index("std::lock_guard lk(r.mu);"), \
         "reflex_sleep: the minimum asked for before Reflex's lock (it may ask Windows), passed on before each frame's sleep"
     take = block(framegen, "const auto take = [&](Taken& s, const Job& j, int room, int left)", where="gpu/vk/vk_framegen.cpp")
-    assert "fifo_catch_up(j.set->made, j.set->due, slot, left, fifo_refresh, now_ns())" in take and \
+    assert "fifo_catch_up(j.set->made, j.set->due, slot, left, fifo_refresh, now_ns(), j.set->hand_due_ns)" in take and \
         "s.shown -= s.first, stat.caught += s.first;" in take, \
         "take: the catch-up's answer leaves that many made frames out, and the log counts them"
 
@@ -164,8 +164,8 @@ def main():
     check_sources(reflex, framegen)
     fixture = (STUBS + block(reflex, "uint32_t fifo_min_interval_us() {", where="gpu/vk/vk_reflex.cpp") + "\n"
                + block(framegen, "int fifo_pick(int frames, int shown, int k) {", where="gpu/vk/vk_framegen.cpp") + "\n"
-               + block(framegen, "int fifo_catch_up(int made, const int64_t* due, int64_t slot, int left, int64_t refresh, int64_t now) {",
-                       where="gpu/vk/vk_framegen.cpp") + MAIN)
+               + block(framegen, "int fifo_catch_up(int made, const int64_t* due, int64_t slot, int left, int64_t refresh, "
+                       "int64_t now, int64_t hand_due) {", where="gpu/vk/vk_framegen.cpp") + MAIN)
     with tempfile.TemporaryDirectory(prefix="framegen-fifo-cap-") as tmp:
         cpp = Path(tmp) / "fixture.cpp"
         exe = Path(tmp) / "fixture"

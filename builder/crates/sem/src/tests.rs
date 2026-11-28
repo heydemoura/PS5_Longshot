@@ -47,7 +47,7 @@ fn every_simd_word_lowers_to_valid_ir() {
         (0xbf00_0000, 0x0d00_0000),
         (0x3a00_0000, 0x2c00_0000),
     ];
-    let mut lowered = 0;
+    let (mut lowered, mut mid) = (0, NanMidStats::default());
     for &(mask, value) in &groups {
         for _ in 0..100_000 {
             let w = (xorshift(&mut state) & !mask) | value;
@@ -60,10 +60,16 @@ fn every_simd_word_lowers_to_valid_ir() {
                 if let Err(e) = f.verify() {
                     panic!("{w:#010x} ({insn}): {e}\n{f}");
                 }
+                // (and with the float slow paths' middle path: its helpers verify too)
+                mid += nan_mid(&mut f);
+                if let Err(e) = f.verify() {
+                    panic!("{w:#010x} ({insn}) with the middle path: {e}\n{f}");
+                }
             }
         }
     }
     assert!(lowered > 100_000, "{lowered} lowered");
+    assert!(mid.mid > 1000 && mid.mid < mid.checks, "{mid:?}");
 }
 
 #[test]

@@ -642,7 +642,7 @@ Id EmitDPdyCoarse(EmitContext& ctx, Id op_a) {
 // (longshot) HMMA in software (mma_software.h): the 32 lanes' fragments through subgroup operations in one helper function,
 // accumulated with FMA in f32 and rounded to f16 after every 8 columns of K, as HMMA.F16 does. It needs no cooperative matrices
 // (RX_VK_MMA_SOFTWARE=1, vk_coopmat.cpp); the form is the one vk_coopmat.cpp's self-test chose for this device (mma_software_form).
-void DefineSoftwareMatrixFunction(EmitContext& ctx) {
+void DefineSoftwareMatrixFunction(EmitContext& ctx, const IR::Program& program) {
     ctx.AddCapability(spv::Capability::GroupNonUniform);
     ctx.AddCapability(spv::Capability::GroupNonUniformShuffle);
     if (!ctx.profile.SupportsSubgroupStage(ctx.stage) || ctx.profile.has_broken_spirv_subgroup_shuffle)
@@ -650,8 +650,39 @@ void DefineSoftwareMatrixFunction(EmitContext& ctx) {
     const auto form = static_cast<SoftwareMmaForm>(mma_software_form);
     const bool quad = form != SoftwareMmaForm::Loop && mma_software_quad;
     if (quad) ctx.AddCapability(spv::Capability::GroupNonUniformQuad);
-    const SoftwareMmaTypes types{ctx.U32[1], ctx.U32[2], ctx.U32[4], ctx.F32[1], ctx.F32[2], ctx.F16[1], ctx.U1};
-    ctx.software_matrix_function = DefineSoftwareMma(ctx, types, ctx.subgroup_local_invocation_id, form, quad);
+    const SoftwareMmaTypes types{ctx.U32[1], ctx.U32[2], ctx.U32[4], ctx.F32[1], ctx.F32[2], ctx.F16[1], ctx.U1, ctx.F16[2]};
+    // (B through a workgroup memory tile a subgroup, mma_software.h: where the self-test passed it, in a compute program pinned to
+    // 32 lanes (profile_pinned) whose subgroups are full: the device has computeFullSubgroups (mma_software_full_subgroups) and the
+    // workgroup's X width is a multiple of 32, where vk_draw.cpp pin_subgroup asks REQUIRE_FULL_SUBGROUPS; its own workgroup
+    // memory and the tiles within the device's. Not in a program with an explicit workgroup layout and workgroup memory of its own
+    // (EmitContext::DefineSharedMemory: every workgroup variable a Block from byte 0), a layout the self-test does not run and the
+    // renderer does not enable (make_profile leaves support_explicit_workgroup_layout off): such a program keeps the shuffles)
+    SoftwareMmaStagedB staged{};
+    const auto& wg = program.workgroup_size;
+    const u32 invocations = wg[0] * wg[1] * wg[2];
+    const u32 own = (program.shared_memory_size + 15U) & ~15U, tiles = invocations / 32;
+    const bool explicit_layout = ctx.uses_explicit_workgroup_layout && program.shared_memory_size != 0;
+    const bool full_subgroups = mma_software_full_subgroups && ctx.stage == Stage::Compute &&
+                                !ctx.profile.warp_size_potentially_larger_than_guest && ctx.profile.max_subgroup_size == 32 &&
+                                invocations && wg[0] % 32 == 0;
+    const bool stage_b = form != SoftwareMmaForm::Loop && mma_software_staged_b && !explicit_layout &&
+                         full_subgroups && own + tiles * kSoftwareMmaTileBytes <= mma_software_staged_b;
+    if (stage_b) {
+        // (without an explicit layout the driver lays the variables out, and an array has no stride. Its length a signed
+        // constant, as DefineSharedWarp's: Sirit gives back the type already made for the same words, and u32x4 arrays made for
+        // blocks (constant buffers) carry an ArrayStride)
+        const Id array{ctx.TypeArray(ctx.U32[4], ctx.SConst(static_cast<s32>(tiles * kSoftwareMmaTileVectors)))};
+        staged.tile = ctx.AddGlobalVariable(ctx.TypePointer(spv::StorageClass::Workgroup, array), spv::StorageClass::Workgroup);
+        ctx.Name(staged.tile, "mma_b_tiles");
+        ctx.interfaces.push_back(staged.tile);
+        staged.subgroup_id = ctx.AddGlobalVariable(ctx.TypePointer(spv::StorageClass::Input, ctx.U32[1]), spv::StorageClass::Input);
+        ctx.Decorate(staged.subgroup_id, spv::Decoration::BuiltIn, spv::BuiltIn::SubgroupId);
+        ctx.interfaces.push_back(staged.subgroup_id);
+        staged.u32_pointer = ctx.TypePointer(spv::StorageClass::Workgroup, ctx.U32[1]);
+        staged.u32x4_pointer = ctx.TypePointer(spv::StorageClass::Workgroup, ctx.U32[4]);
+    }
+    ctx.software_matrix_function =
+        DefineSoftwareMma(ctx, types, ctx.subgroup_local_invocation_id, form, quad, stage_b ? &staged : nullptr);
 }
 
 

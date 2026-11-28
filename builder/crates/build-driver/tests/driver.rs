@@ -190,11 +190,13 @@ fn a_build_an_update_and_a_failed_link() {
     assert!(ev.iter().any(|e| e["type"] == "warning" && e["code"] == "shaders_not_prepared"));
     assert!(ev.iter().any(|e| e["type"] == "warning" && e["code"] == "low_disk_space"));
     assert!(game.romfs_done.load(Ordering::SeqCst));
-    for f in ["image.bin", "longshot_vk.so", "language.txt", "longshot_build.json", "longshot_romfs.idx"] {
+    for f in
+        ["data/image.bin", "longshot_vk.so", "config/language.txt", "longshot_build.json", "data/longshot_romfs.idx"]
+    {
         assert!(out.join(f).is_file(), "{f} in the game folder");
     }
     assert!(built.exe.is_file());
-    assert!(out.join("licenses/stb_image/LICENSE").is_file());
+    assert!(out.join("data/licenses/stb_image/LICENSE").is_file());
     assert_eq!(build_driver::folder::folder_language(&out), Some("de"));
     let version = std::fs::read_to_string(out.join("longshot_version.txt")).unwrap();
     assert!(version.starts_with("version=v9.9-test\nsource=v9.9-test (source "), "{version}");
@@ -218,16 +220,16 @@ fn a_build_an_update_and_a_failed_link() {
     use build_driver::verify;
     let v = verify::verify(&out, 2).unwrap();
     assert!(v.intact() && v.extra.is_empty(), "{v:?}");
-    assert!(v.checked >= 5 && v.excluded.contains(&"language.txt".to_string()), "{v:?}");
+    assert!(v.checked >= 5 && v.excluded.contains(&"config/".to_string()), "{v:?}");
     std::fs::create_dir_all(out.join("user")).unwrap();
     std::fs::write(out.join("user/save.bin"), b"the player's").unwrap();
-    std::fs::write(out.join("image.bin"), b"damaged").unwrap();
-    std::fs::write(out.join("licenses/stb_image/LICENSE"), b"MIT, changed\n").unwrap();
+    std::fs::write(out.join("data/image.bin"), b"damaged").unwrap();
+    std::fs::write(out.join("data/licenses/stb_image/LICENSE"), b"MIT, changed\n").unwrap();
     std::fs::remove_file(out.join("longshot_version.txt")).unwrap();
     let v = verify::verify(&out, 2).unwrap();
     assert_eq!(v.missing, ["longshot_version.txt"]);
-    assert_eq!(v.changed, ["image.bin", "licenses/stb_image/LICENSE"]);
-    assert_eq!(verify::repair(&out, &p.work.dir, &v, &r).unwrap(), ["image.bin"], "the work folder's image");
+    assert_eq!(v.changed, ["data/image.bin", "data/licenses/stb_image/LICENSE"]);
+    assert_eq!(verify::repair(&out, &p.work.dir, &v, &r).unwrap(), ["data/image.bin"], "the work folder's image");
     build::build(&u, &p, &st, &r).unwrap();
     let ev = events(&buf);
     assert!(ev.iter().any(|e| e["type"] == "log" && e["text"].as_str().unwrap().contains("1 files copied in")));
@@ -403,7 +405,7 @@ fn a_build_whose_compile_fails_leaves_the_old_build_s_assets_in_the_game_folder(
     let p = Places::of(&o).unwrap();
     let quiet = || Reporter::to(Format::Json, Box::new(Buf::default()));
     build::build(&o, &p, &st, &quiet()).unwrap();
-    let text = out.join("texts/msg.sarc");
+    let text = out.join("data/texts/msg.sarc");
     assert_eq!(std::fs::read_to_string(&text).unwrap(), "the first build's");
     // (the next build's texts are made beside its compile, which fails: the game folder keeps the first build's)
     *assets.0.lock().unwrap() = "the second build's";

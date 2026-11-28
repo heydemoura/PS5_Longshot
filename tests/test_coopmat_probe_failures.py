@@ -28,7 +28,8 @@ static uint32_t mapped[64];
 template <class T> T handle(uintptr_t v) { return reinterpret_cast<T>(v); }
 
 struct { VkDevice device = handle<VkDevice>(1); VkPhysicalDevice physical = handle<VkPhysicalDevice>(2);
-         VkQueue queue = handle<VkQueue>(3); uint32_t queue_family = 0; VkShaderStageFlags sg32_stages = 0; } dev;
+         VkQueue queue = handle<VkQueue>(3); uint32_t queue_family = 0; VkShaderStageFlags sg32_stages = 0;
+         struct { VkBool32 computeFullSubgroups = VK_FALSE; } vk13; } dev;
 void logf(const char*, ...) {}
 struct IntelDriverGate { ~IntelDriverGate() {} };
 VkResult vkCreateShaderModule(VkDevice, const VkShaderModuleCreateInfo*, const VkAllocationCallbacks*, VkShaderModule*);

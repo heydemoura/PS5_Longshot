@@ -47,6 +47,17 @@ static uintptr_t resolve() {
     return reinterpret_cast<uintptr_t>(&wrapped_gipa);
 }
 static uintptr_t fail_resolve() { return 0; }
+// (NVIDIA Streamline's loader, vk_dlssg.cpp: its own when it started, in place of the host's and of vulkan-1.dll's)
+static int streamline_loads;
+static bool streamline_starts;
+static void streamline_create() {}
+static void* streamline_gipa(void*, const char*) { return reinterpret_cast<void*>(&streamline_create); }
+namespace mkwvk {
+static PFN_vkGetInstanceProcAddr dlssg_load() {
+    ++streamline_loads;
+    return streamline_starts ? &streamline_gipa : nullptr;
+}
+}  // namespace mkwvk
 
 static PFN_vkGetInstanceProcAddr get_instance_proc;
 static PFN_vkCreateInstance vkCreateInstance;
@@ -62,6 +73,11 @@ int main() {
     h.vulkan_loader_proc = fail_resolve;
     if (load_global() || direct_loads != 1)
         return 3;
+    // (asked first each time, and null so far: the three cases above ran as without it. Started: its own, nothing else asked)
+    h.vulkan_loader_proc = resolve;
+    streamline_starts = true;
+    if (streamline_loads != 3 || !load_global() || vkCreateInstance != streamline_create || host_resolves != 1 || direct_loads != 1)
+        return 4;
 }
 """
 with tempfile.TemporaryDirectory() as tmp:
@@ -75,5 +91,6 @@ with tempfile.TemporaryDirectory() as tmp:
             1: "the renderer bypassed the executable's Vulkan resolver",
             2: "the previous host's System32 fallback failed",
             3: "a failed host resolve silently changed resolver paths",
+            4: "NVIDIA Streamline's loader, started, is not the renderer's, or another resolver was asked beside it",
         }.get(status, f"Vulkan loader harness exited with {status}"))
 print("Vulkan host resolver, previous-host fallback, and missing resolver checked")

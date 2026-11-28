@@ -426,3 +426,323 @@ fn a_host_store_on_the_gpu_bitmap_marks_when_its_last_page_is_the_gpu_s() {
     assert!(Command::new(&exe).status().unwrap().success(), "both pages marked, and only those");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A lift of `o`, and what its log said (text).
+fn logged(o: &LiftOptions) -> (LiftOutcome, String) {
+    #[derive(Clone)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+    let out = run(o, &Reporter::to(Format::Text, Box::new(buf.clone()))).unwrap();
+    let text = String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned();
+    (out, text)
+}
+
+/// [`image_dir`] with a float add in each function (f0: `bl f1; fadd s0, s0, s1; ret`, f1: `fadd s2, s2, s3; bl HOOK;
+/// ret`), and a guest profile in which f0 ran and f1 did not: f0 in a hot unit, f1 in a cold one.
+fn float_image(dir: &Path) -> (PathBuf, PathBuf) {
+    let image = image_dir(dir);
+    let bin = image.join("image.bin");
+    let mut mem = std::fs::read(&bin).unwrap();
+    let (fadd0, fadd1) = (0x1e21_2800u32, 0x1e23_2842u32);
+    put(&mut mem, F0 + 4, &fadd0.to_le_bytes());
+    put(&mut mem, F1, &fadd1.to_le_bytes());
+    std::fs::write(&bin, &mem).unwrap();
+    let hash = profile::code_hash([0x9400_0004, fadd0, 0xd65f_03c0]);
+    let p = dir.join("guest.profile");
+    std::fs::write(&p, format!("longshot-guest-profile 1 build {BUILD}\nf {F0:x} {hash:016x} 1000\nb {F0:x} 1000\n"))
+        .unwrap();
+    (image, p)
+}
+
+#[test]
+fn the_float_middle_path_is_on_by_default_in_the_hot_units_and_their_keys_only() {
+    let dir = scratch("fp-nan-mid");
+    let mut o = options(&dir);
+    let (image, profile) = float_image(&dir);
+    o.image = image;
+    o.profiling = Profiling::Use { path: profile, share: 0.95, max: 10 };
+    assert_eq!(o.fp_nan_mid, Some(BTreeSet::new()), "on by default, no function left out");
+    // (the default lift: the hot unit's float slow path has its middle path, the cold one's not)
+    let default = run(&o, &quiet()).unwrap();
+    let hot_text = std::fs::read_to_string(o.gen_dir.join(format!("lifted_hot_{F0:08x}.ll"))).unwrap();
+    let cold_text = std::fs::read_to_string(o.gen_dir.join(format!("lifted_cold_{F1:08x}.ll"))).unwrap();
+    assert!(hot_text.contains("call float @lifter.fp.mid.add.f32.f32.i64(float "), "{hot_text}");
+    assert!(!cold_text.contains("lifter.fp.mid"), "{cold_text}");
+    let _ = std::fs::remove_dir_all(&o.gen_dir);
+    // (the option is never in the options every unit's key holds)
+    let options_text = codegen_text(&o);
+    o.fp_nan_mid = Some(BTreeSet::from([F0]));
+    assert_eq!(codegen_text(&o), options_text);
+    o.fp_nan_mid = None;
+    assert_eq!(codegen_text(&o), options_text);
+    let text = |o: &LiftOptions, u: &Listed| std::fs::read_to_string(o.gen_dir.join(format!("{}.ll", u.name))).unwrap();
+    let texts = |o: &LiftOptions, units: &[Listed]| -> BTreeMap<String, String> {
+        units.iter().map(|u| (u.name.clone(), text(o, u))).collect()
+    };
+    // (by name: the outcome lists the units in the order the workers finished them)
+    let by_name =
+        |units: &[Listed]| -> BTreeMap<String, Listed> { units.iter().map(|u| (u.name.clone(), u.clone())).collect() };
+    let (hot, cold) = (format!("lifted_hot_{F0:08x}"), format!("lifted_cold_{F1:08x}"));
+    let off = run(&o, &quiet()).unwrap();
+    let off_texts = texts(&o, &off.units);
+    assert_eq!(off_texts.keys().cloned().collect::<Vec<_>>(), [cold.clone(), hot.clone()], "{off_texts:?}");
+    assert!(off_texts.values().all(|t| t.contains("@lifter.fp.add.f32.f32.i64(") && !t.contains("lifter.fp.mid")));
+    // (on: the lift's key moves and the hot unit's, so the hot unit alone is lifted again; the cold unit keeps its key
+    // and its text. The hot unit's float slow path has its middle path, inline)
+    o.fp_nan_mid = Some(BTreeSet::new());
+    let (on, log) = logged(&o);
+    assert!(log.contains("LONGSHOT_FP_NAN_MID, in the 1 units made now (not those kept from before): 1 of the 1 float fast paths of the functions given it"), "{log}");
+    assert_eq!((on.how, on.units_lifted), (How::Lifted, 1));
+    assert_ne!(on.key, off.key);
+    // (the default's lift is this one: the same whole key and units)
+    assert_eq!(on.key, default.key, "the default is on");
+    assert_eq!(by_name(&on.units), by_name(&default.units));
+    let (off_units, on_units) = (by_name(&off.units), by_name(&on.units));
+    assert_ne!(on_units[&hot].key, off_units[&hot].key);
+    assert_eq!(on_units[&cold].key, off_units[&cold].key, "the cold unit's key as without the option");
+    let on_texts = texts(&o, &on.units);
+    let h = &on_texts[&hot];
+    assert!(h.contains("call i1 @lifter.fp.mid.subnormal.f32.f32.f32(float "), "{h}");
+    assert!(h.contains("call float @lifter.fp.mid.add.f32.f32.i64(float "), "{h}");
+    assert!(h.contains("call float @lifter.fp.add.f32.f32.i64(float "), "{h}");
+    assert!(h.contains("attributes #5 = { nounwind willreturn alwaysinline memory(none) }"), "{h}");
+    assert_eq!(on_texts[&cold], off_texts[&cold], "the cold unit's text as without the option");
+    if let Some(cc) = clang() {
+        compiles(&cc, &o.gen_dir.join(format!("{hot}.ll")), &o.gen_dir.join("rt"));
+    }
+    // (a cold function on the list: the lift's key moves, no unit's: nothing lifted again)
+    o.fp_nan_mid = Some(BTreeSet::from([F1]));
+    let skipped = run(&o, &quiet()).unwrap();
+    assert_ne!(skipped.key, on.key);
+    assert_eq!(by_name(&skipped.units), on_units, "a skip entry moves its own unit's key alone");
+    assert_eq!((skipped.how, skipped.units_lifted), (How::Lifted, 0));
+    // (the hot function on the list: its unit's key moves back to the one without the option, as every function of it
+    // is left out; the cold one's not; the units are the lift's without the option, text for text: the option touches
+    // nothing else. The line counts the entries as entries)
+    o.fp_nan_mid = Some(BTreeSet::from([F0, F1]));
+    let (none, log) = logged(&o);
+    let none_units = by_name(&none.units);
+    assert_ne!(none_units[&hot].key, on_units[&hot].key);
+    assert_eq!(none_units[&hot].key, off_units[&hot].key, "every function left out: the key without the option");
+    assert_eq!(none_units[&cold].key, off_units[&cold].key);
+    assert_eq!(none.units_lifted, 1);
+    assert_eq!(texts(&o, &none.units), off_texts);
+    assert!(
+        log.contains("1 units made now (not those kept from before): 0 of the 0 float fast paths")
+            && log.contains("the 2 entries on the skip list"),
+        "none given it: {log}"
+    );
+    // (a lift on, in a fresh gen/: the cold unit's text made anew is the one without the option, the hot one's not)
+    let mut fresh = o.clone();
+    fresh.gen_dir = dir.join("gen-fresh");
+    fresh.fp_nan_mid = Some(BTreeSet::new());
+    let made = run(&fresh, &quiet()).unwrap();
+    assert_eq!(made.units_lifted, 2);
+    let made_texts = texts(&fresh, &made.units);
+    assert_eq!(made_texts[&cold], off_texts[&cold]);
+    assert!(made_texts[&hot].contains("lifter.fp.mid."), "{}", made_texts[&hot]);
+    // (off again after on: the first lift's key and units, the hot one lifted again, the cold one kept)
+    fresh.fp_nan_mid = None;
+    let back = run(&fresh, &quiet()).unwrap();
+    assert_eq!(back.key, off.key);
+    assert_eq!(by_name(&back.units), off_units);
+    assert_eq!(back.units_lifted, 1);
+    // (and off after every function left out: the lift's key moves back, no unit's (they were the off ones already))
+    o.fp_nan_mid = None;
+    let back = run(&o, &quiet()).unwrap();
+    assert_eq!(back.key, off.key);
+    assert_eq!(by_name(&back.units), off_units);
+    assert_eq!(back.units_lifted, 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_hot_unit_s_key_holds_which_of_its_functions_the_middle_path_leaves_out() {
+    // (one hot unit of two functions, each with a float add: f0 and f1 both in the profile, every function hot, the hot
+    // units' budget big enough for both)
+    let dir = scratch("fp-nan-mid-two");
+    let mut o = options(&dir);
+    let (image, _) = float_image(&dir);
+    o.image = image;
+    let (fadd0, fadd1) = (0x1e21_2800u32, 0x1e23_2842u32);
+    let (h0, h1) =
+        (profile::code_hash([0x9400_0004, fadd0, 0xd65f_03c0]), profile::code_hash([fadd1, 0x9400_0003, 0xd65f_03c0]));
+    let p = dir.join("two.profile");
+    std::fs::write(
+        &p,
+        format!(
+            "longshot-guest-profile 1 build {BUILD}\nf {F0:x} {h0:016x} 1000\nb {F0:x} 1000\nf {F1:x} {h1:016x} 1000\nb {F1:x} 1000\n"
+        ),
+    )
+    .unwrap();
+    o.profiling = Profiling::Use { path: p, share: 1.0, max: 10 };
+    o.sizing.hot_budget = 1 << 40;
+    let hot = format!("lifted_hot_{F0:08x}");
+    let unit = |o: &LiftOptions, out: &LiftOutcome| -> (Listed, String) {
+        let u = out.units.iter().find(|u| u.name == hot).unwrap_or_else(|| panic!("{hot} in {:?}", out.units)).clone();
+        let text = std::fs::read_to_string(o.gen_dir.join(format!("{hot}.ll"))).unwrap();
+        (u, text)
+    };
+    let mids = |text: &str| text.matches("call float @lifter.fp.mid.add.f32.f32.i64(").count();
+    o.fp_nan_mid = None;
+    let off = run(&o, &quiet()).unwrap();
+    let (off_unit, off_text) = unit(&o, &off);
+    assert_eq!(off.units.len(), 1, "{:?}", off.units);
+    assert_eq!(mids(&off_text), 0);
+    // (on: both functions given the middle path)
+    o.fp_nan_mid = Some(BTreeSet::new());
+    let on = run(&o, &quiet()).unwrap();
+    let (on_unit, on_text) = unit(&o, &on);
+    assert_ne!(on_unit.key, off_unit.key);
+    assert_eq!(mids(&on_text), 2, "{on_text}");
+    // (one of them left out: the unit's key moves again, the unit is lifted again, one middle path)
+    o.fp_nan_mid = Some(BTreeSet::from([F1]));
+    let one = run(&o, &quiet()).unwrap();
+    let (one_unit, one_text) = unit(&o, &one);
+    assert_ne!(one_unit.key, on_unit.key, "the key holds which of the unit's functions are left out");
+    assert_ne!(one_unit.key, off_unit.key);
+    assert_eq!(one.units_lifted, 1);
+    assert_eq!(mids(&one_text), 1, "{one_text}");
+    // (both left out: the unit's key and text without the option; the lift's key still not the one without it)
+    o.fp_nan_mid = Some(BTreeSet::from([F0, F1]));
+    let both = run(&o, &quiet()).unwrap();
+    let (both_unit, both_text) = unit(&o, &both);
+    assert_eq!(both_unit.key, off_unit.key);
+    assert_eq!(both_text, off_text);
+    assert_ne!(both.key, off.key);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_hot_split_is_in_the_key_only_when_on() {
+    let dir = scratch("hot-split");
+    let mut o = options(&dir);
+    // (the options' own value: off. The build's switch is on by default and sets it,
+    // build_driver::stages::lift_options; longshot-builder's tests/hot_split.rs checks that default)
+    assert_eq!(o.hot_split, None, "LiftOptions::new: off until the build sets it");
+    // (off, the options' text is a lift's without the option, so no unit's key moves)
+    assert_eq!(
+        codegen_text(&o),
+        format!("{:?} mark_each={} no_simplify={} split={:?}", o.codegen, o.mark_each, o.no_simplify, o.split)
+    );
+    // (a profile of the made-up build: f0 ran most and is hot, f1 ran once; their words as image_dir has them)
+    let hash = profile::code_hash([0x9400_0004, 0x9100_0400, 0xd65f_03c0]);
+    let f1_hash = profile::code_hash([0x9100_0400, 0x9400_0003, 0xd65f_03c0]);
+    let profile = dir.join("guest.profile");
+    let text = format!(
+        "{} 1 build {BUILD}\nf {F0:x} {hash:016x} 1000\nb {F0:x} 1000\nf {F1:x} {f1_hash:016x} 1\nb {F1:x} 1\n",
+        profile::MAGIC
+    );
+    std::fs::write(&profile, text).unwrap();
+    o.profiling = Profiling::Use { path: profile, share: 0.5, max: 4000 };
+    let text = |o: &LiftOptions, name: &str| std::fs::read_to_string(o.gen_dir.join(format!("{name}.ll"))).unwrap();
+    let by_name =
+        |units: &[Listed]| -> BTreeMap<String, Listed> { units.iter().map(|u| (u.name.clone(), u.clone())).collect() };
+    let hot = format!("lifted_hot_{F0:08x}");
+    let off = run(&o, &quiet()).unwrap();
+    let off_units = by_name(&off.units);
+    assert!(off_units.contains_key(&hot), "f0 in a hot unit: {:?}", off_units.keys());
+    let off_texts: BTreeMap<String, String> = off_units.keys().map(|n| (n.clone(), text(&o, n))).collect();
+    let key_file = std::fs::read_to_string(o.gen_dir.join(KEY_FILE)).unwrap();
+    assert_eq!(hot_split_of(&o.gen_dir), Some(None), "off: no line in the key file: {key_file}");
+    assert_eq!(hot_split_of(&dir.join("nowhere")), None);
+    // (on: the lift's key moves, and among the units' keys the hot unit's alone: the others' texts are the same either
+    // way. These functions have no branch, so the hot unit's text is the same too: the switch adds weights to branches
+    // never taken alone, llvm's hotsplit_tests)
+    o.hot_split = Some(BTreeSet::new());
+    let on = run(&o, &quiet()).unwrap();
+    assert_ne!(on.key, off.key);
+    assert_eq!(on.units_lifted, 1, "the hot unit alone lifted again");
+    for u in &on.units {
+        if u.name == hot {
+            assert_ne!(u.key, off_units[&u.name].key, "{}", u.name);
+        } else {
+            assert_eq!(u.key, off_units[&u.name].key, "{}: not a hot unit, its key as off", u.name);
+        }
+        assert_eq!(text(&o, &u.name), off_texts[&u.name], "{}", u.name);
+    }
+    assert_eq!(hot_split_of(&o.gen_dir), Some(Some(BTreeSet::new())));
+    // (f0 left out: another key for the lift and for f0's hot unit; f1, no hot function, left out: the units' keys as
+    // on, the lift's not: it holds the whole list)
+    let on_units = by_name(&on.units);
+    o.hot_split = Some(BTreeSet::from([F1]));
+    let f1_left = run(&o, &quiet()).unwrap();
+    assert_ne!(f1_left.key, on.key);
+    for u in &f1_left.units {
+        assert_eq!(u.key, on_units[&u.name].key, "{}", u.name);
+    }
+    o.hot_split = Some(BTreeSet::from([F0]));
+    let left = run(&o, &quiet()).unwrap();
+    assert_ne!(left.key, on.key);
+    assert_ne!(by_name(&left.units)[&hot].key, on_units[&hot].key);
+    // (and not the off key either: a left-out unit's text is not off's, the guard's weights are in it)
+    assert_ne!(by_name(&left.units)[&hot].key, off_units[&hot].key);
+    assert_eq!(hot_split_of(&o.gen_dir), Some(Some(BTreeSet::from([F0]))));
+    // (and off again: the first lift's key and units)
+    o.hot_split = None;
+    let back = run(&o, &quiet()).unwrap();
+    assert_eq!(back.key, off.key);
+    assert_eq!(by_name(&back.units), off_units);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_middle_path_and_the_hot_split_are_each_in_the_hot_units_keys_on_their_own() {
+    // (f0 hot, f1 cold, a float add in each: float_image)
+    let dir = scratch("fp-nan-mid-hot-split");
+    let mut o = options(&dir);
+    let (image, profile) = float_image(&dir);
+    o.image = image;
+    o.profiling = Profiling::Use { path: profile, share: 0.95, max: 10 };
+    let by_name =
+        |units: &[Listed]| -> BTreeMap<String, Listed> { units.iter().map(|u| (u.name.clone(), u.clone())).collect() };
+    let (hot, cold) = (format!("lifted_hot_{F0:08x}"), format!("lifted_cold_{F1:08x}"));
+    let options_text = codegen_text(&o);
+    // (the four settings: (middle path, hot split) -> the lift's key and its units)
+    let mut lifts: BTreeMap<(bool, bool), (String, BTreeMap<String, Listed>)> = BTreeMap::new();
+    for mid in [false, true] {
+        for split in [false, true] {
+            o.fp_nan_mid = mid.then(BTreeSet::new);
+            o.hot_split = split.then(BTreeSet::new);
+            assert_eq!(
+                codegen_text(&o),
+                options_text,
+                "({mid}, {split}): neither in the options every unit's key holds"
+            );
+            let out = run(&o, &quiet()).unwrap();
+            assert_eq!(hot_split_of(&o.gen_dir), Some(o.hot_split.clone()), "({mid}, {split}): the key file's line");
+            lifts.insert((mid, split), (out.key.clone(), by_name(&out.units)));
+        }
+    }
+    let whole: BTreeSet<&String> = lifts.values().map(|(k, _)| k).collect();
+    assert_eq!(whole.len(), 4, "the lift's key holds both: {lifts:?}");
+    let hot_keys: BTreeSet<&String> = lifts.values().map(|(_, u)| &u[&hot].key).collect();
+    assert_eq!(hot_keys.len(), 4, "the hot unit's key holds each on its own: {lifts:?}");
+    let cold_keys: BTreeSet<&String> = lifts.values().map(|(_, u)| &u[&cold].key).collect();
+    assert_eq!(cold_keys.len(), 1, "the cold unit's key holds neither: {lifts:?}");
+    // (the middle path's list leaving out the hot unit's one function: its key as with the middle path off and the hot
+    // split on; the lift's key not, it holds the whole list)
+    o.fp_nan_mid = Some(BTreeSet::from([F0]));
+    o.hot_split = Some(BTreeSet::new());
+    let out = run(&o, &quiet()).unwrap();
+    assert_eq!(by_name(&out.units)[&hot].key, lifts[&(false, true)].1[&hot].key);
+    assert!(lifts.values().all(|(k, _)| *k != out.key));
+    // (the hot split's list leaving it out: a key of its own, the middle path's part as on)
+    o.fp_nan_mid = Some(BTreeSet::new());
+    o.hot_split = Some(BTreeSet::from([F0]));
+    let out = run(&o, &quiet()).unwrap();
+    let left = &by_name(&out.units)[&hot].key;
+    assert!(lifts.values().all(|(_, u)| u[&hot].key != *left), "{left}");
+    assert_eq!(by_name(&out.units)[&cold].key, lifts[&(false, false)].1[&cold].key);
+    assert_eq!(hot_split_of(&o.gen_dir), Some(Some(BTreeSet::from([F0]))));
+    let _ = std::fs::remove_dir_all(&dir);
+}

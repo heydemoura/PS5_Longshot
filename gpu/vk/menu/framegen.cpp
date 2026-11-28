@@ -8,10 +8,12 @@
 #include "framegen_rows.h"
 
 #ifndef MENU_LAYOUT_ONLY
+#include <atomic>
 #include "menu/framegen.h"
 #include "fg_by.h"   // (PS5: the Frame generation by row's two more values)
 #include "vk_antilag.h"
 #include "vk_dlss.h"
+#include "vk_dlssg.h"
 #include "vk_framegen.h"
 #include "vk_fsr3fi.h"
 #include "vk_reflex.h"
@@ -26,6 +28,13 @@ namespace mkwvk {
 namespace fgr = framegen_rows;
 
 #ifndef MENU_LAYOUT_ONLY
+namespace {
+std::atomic<int> live_antilag{0};
+}
+
+void menu_antilag_changed(int on) { live_antilag.store(on, std::memory_order_relaxed); }
+int menu_antilag() { return live_antilag.load(std::memory_order_relaxed); }
+
 int display_refresh_mhz();   // (vk_main.cpp: the window's display, mHz. PS5: the Frame generation row's names)
 /// (PS5) The display's refresh rate in whole Hz (59.94 is 60), 60 when not known
 int console_hz() {
@@ -145,9 +154,10 @@ const char* framegen_skip_text(int why, unsigned most) {
 /// Its line: the choice's. Where DLSS FG cannot run in this run, why, whatever is saved ("DLSS FG cannot run: " and
 /// framegen_skip_text, or for DLSS itself dlss_why_text: the log has NGX's own answer); with RX_VK_DLSS_FG=1, that it chooses.
 /// At DLSS FG with the game's frames alone now (its own menus, movies and loading screens draw no 3D to make frames from:
-/// vk_dlss.cpp dlss_fg_holds), that it is paused; with another making the frames now, why ("Not DLSS FG now: "). Variants
-/// (every one): the choice's; at DLSS FG "Not DLSS FG now: " with each reason, and the paused line; the switch's line; then
-/// "DLSS FG cannot run: " with each of its reasons
+/// vk_dlss.cpp dlss_fg_holds), that it is paused; with another making the frames now, why ("Not DLSS FG now: "). While the
+/// rows take a restart for NVIDIA Streamline (vk_dlssg.h dlssg_restart_needed: it starts before Vulkan), what the restart
+/// changes. Variants (every one): the choice's; at DLSS FG "Not DLSS FG now: " with each reason, and the paused line; the
+/// switch's line; then "DLSS FG cannot run: " with each of its reasons; then Streamline's two restart lines
 const char* hn_framegen_by(int v, int variant) {
 #ifdef __PROSPERO__   // (the console's generators, fg_by.h: no DLSS there, so none of the lines below. Variants: the
                      // value's line, then the ones for when its generator is not making the frames)
@@ -182,6 +192,10 @@ const char* hn_framegen_by(int v, int variant) {
     };
     static const char* const paused = "DLSS FG paused: the game's own menus, movies and loading screens draw no 3D to make "
                                       "frames from, so only the game's own frames show.";
+    static const char* const sl_starts = "After a restart NVIDIA Streamline makes DLSS FG's frames, shown at even times. "
+                                         "Until then NVIDIA's NGX makes them.";
+    static const char* const sl_stops = "NVIDIA Streamline makes DLSS FG's frames in this run, and no other frames can be "
+                                        "made beside it: this choice makes its frames after a restart.";
     // (dlss_fg_unavailable's reasons, each for the whole run; FG_SKIP_DEVICE with each of DLSS's own, dlss_why)
     struct Cannot { int why, dlss; };
     static const Cannot cannot[] = {{FG_SKIP_OFF, 0},
@@ -212,8 +226,11 @@ const char* hn_framegen_by(int v, int variant) {
         } else if (variant == forced_at) {
             forced = true;
         } else {
-            return nullptr;
+            const int restart = variant - forced_at - kCannot;
+            return restart == 1 ? sl_starts : restart == 2 ? sl_stops : nullptr;
         }
+    } else if (dlssg_restart_needed()) {
+        return dlssg_active() ? sl_stops : sl_starts;
     } else if (v == 1 && !dlss_fg_forced()) {
         return t[1];   // (Built-in FG, chosen)
     } else if ((why = dlss_fg_unavailable()) != FG_SKIP_NONE) {   // (FSR 3.1 FG makes them: why not DLSS FG)
@@ -315,9 +332,13 @@ MENU_MODULE(framegen) {
                       "the scene's depth and motion. Changes at once.",
               .value = &opts.framegen_by,
               .lo = 0, .hi = 2,
+              // (NVIDIA Streamline starts before Vulkan, from the rows as saved: a change of the Frame generation rows or
+              // of the Upscaler that brings it in, or takes its frames away, applies at the next start. 0 without it)
+              .restart = true,
               .preset_exempt = true,
               .text = MENU_HOOK([](int v) { return std::string(tx_framegen_by(v)); }),
-              .hint = MENU_HOOK(hn_framegen_by)})
+              .hint = MENU_HOOK(hn_framegen_by),
+              .restart_value = MENU_HOOK([](int) { return dlssg_restart_needed(); })})
         .row({.key = "frame_rate_cap",
               .label = "Game frame rate cap",
               .help = "Limits frames rendered by the game. Generated frames are additional. Changes at once. "
@@ -347,7 +368,8 @@ MENU_MODULE(framegen) {
               .preset_exempt = true,
               .shown = MENU_HOOK([] { return antilag_available(); }),
               .text = MENU_HOOK([](int v) { return std::string(tx_antilag(v)); }),
-              .hint = MENU_HOOK(hn_antilag)});
+              .hint = MENU_HOOK(hn_antilag),
+              .on_change = MENU_HOOK(menu_antilag_changed)});
     menu::tab("debug")
         .row({.key = "frame_pacing",
               .label = "Frame pacing",

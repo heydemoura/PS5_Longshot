@@ -30,6 +30,7 @@ static struct {
         *GetDesktopDisplayMode, *Vulkan_CreateSurface, *PixelSize, *GetKeyboardState, *GetMouseState, *WaitEventTimeout,
         *PollEvent, *GetWindowSize, *LoadPNG, *SetWindowIcon, *DestroySurface, *GetWindowDisplay, *GetCurrentDisplayMode;
     void *StartTextInput, *StopTextInput, *GetClipboardText;   /* (longshot: the menu's text fields; optional) */
+    void *ShowCursor, *HideCursor;   /* (longshot: the cursor hidden while the pads or keys are used, host/posix/display_sdl.c; optional) */
     void *GetDisplays, *GetNumVideoDisplays, *GetDisplayName, *GetCurrentVideoDriver, *GetWindowPosition, *GetWindowFlags, *SyncWindow;
     /* sound */
     void *OpenAudioDevice, *PauseAudioDevice, *OpenAudioDeviceStream, *ResumeAudioStreamDevice, *PutAudioStreamData;
@@ -112,6 +113,8 @@ static int get_all(HMODULE m, int three) {
     /* (longshot: the Insert menu's text fields; without them a field takes nothing from the keyboard here) */
     *(FARPROC *)&f.StartTextInput = GetProcAddress(m, "SDL_StartTextInput");
     *(FARPROC *)&f.StopTextInput = GetProcAddress(m, "SDL_StopTextInput");
+    *(FARPROC *)&f.ShowCursor = GetProcAddress(m, "SDL_ShowCursor");   /* (SDL2: SDL_ShowCursor(0) hides it) */
+    if (three) *(FARPROC *)&f.HideCursor = GetProcAddress(m, "SDL_HideCursor");
     *(FARPROC *)&f.GetClipboardText = GetProcAddress(m, "SDL_GetClipboardText");
     GET(GetDisplayName,"SDL_GetDisplayName");
     GET(GetCurrentVideoDriver,"SDL_GetCurrentVideoDriver");
@@ -392,6 +395,12 @@ void hos_sdl_text_input(void *window, int on) {
     if (!fn) return;
     if (version == 3) ((_Bool (*)(void *))fn)(window);
     else ((void (*)(void))fn)();
+}
+void hos_sdl_cursor(int shown) {
+    if (version == 3) {
+        void *fn = shown ? f.ShowCursor : f.HideCursor;
+        if (fn) ((_Bool (*)(void))fn)();
+    } else if (version == 2 && f.ShowCursor) CALL(int (*)(int), ShowCursor)(shown ? 1 : 0);
 }
 char *hos_sdl_clipboard(void) { return f.GetClipboardText ? CALL(char *(*)(void), GetClipboardText)() : NULL; }
 void hos_sdl_free(void *p) {

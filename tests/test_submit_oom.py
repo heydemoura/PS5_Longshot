@@ -16,6 +16,9 @@ sound going on. No game or GPU required:
   errors are not tried again; RX_VK_SUBMIT_RETRY=0 drops it as before; RX_VK_TEST_SUBMIT_REFUSE refuses the first try.
 - Every vkQueueSubmit2 of vk_replay.cpp goes through it, nothing is destroyed under the queue's lock, and texture_frame frees
   the idle staging arenas and the reaper's queue after a refusal.
+- A submit refused with VK_ERROR_INITIALIZATION_FAILED (-3) is a lost device: Qualcomm's Adreno driver on Windows answers every
+  submit so after Windows has reset a hung GPU, never with VK_ERROR_DEVICE_LOST. Returned, the game froze for good with no
+  report (nothing sent ran, and the hang watch saw nothing owed). Now device_lost() is called, once, with no retry.
 
 python -I -B tests/test_submit_oom.py [--cxx g++]
 """
@@ -179,7 +182,8 @@ SUBMIT = r"""
 #include <string>
 #include "submit_retry.h"
 
-enum VkResult { VK_SUCCESS = 0, VK_ERROR_OUT_OF_HOST_MEMORY = -1, VK_ERROR_OUT_OF_DEVICE_MEMORY = -2, VK_ERROR_DEVICE_LOST = -4 };
+enum VkResult { VK_SUCCESS = 0, VK_ERROR_OUT_OF_HOST_MEMORY = -1, VK_ERROR_OUT_OF_DEVICE_MEMORY = -2, VK_ERROR_INITIALIZATION_FAILED = -3,
+                VK_ERROR_DEVICE_LOST = -4 };
 struct VkSubmitInfo2 { int sType; };
 typedef void* VkFence;
 typedef void* VkQueue;
@@ -205,6 +209,13 @@ static VkResult vkQueueSubmit2(VkQueue, int, const VkSubmitInfo2*, VkFence) {
     driver_calls++;
     return script[std::min(script_at++, 7)];
 }
+// (vk_replay.cpp's device_lost never returns: it writes the report and ends the process. Here it throws, so the test sees it)
+struct DeviceLost { std::string why; };
+static int lost_calls = 0;
+[[noreturn]] static void device_lost(const char* why = nullptr) {
+    lost_calls++;
+    throw DeviceLost{why ? why : ""};
+}
 
 /* SUBMIT_OR_RETRY */
 
@@ -216,7 +227,7 @@ static VkResult run(std::initializer_list<VkResult> answers) {
     int i = 0;
     for (VkResult r : answers) script[i++] = r;
     for (; i < 8; i++) script[i] = VK_SUCCESS;
-    script_at = 0, waits = 0, told = 0, driver_calls = 0;
+    script_at = 0, waits = 0, told = 0, driver_calls = 0, lost_calls = 0;
     VkSubmitInfo2 si{};
     return submit_or_retry(si, nullptr);
 }
@@ -243,6 +254,21 @@ int main(int argc, char** argv) {
         retry_switch = false;
         const VkResult r = run({VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_SUCCESS});
         expect(r == VK_ERROR_OUT_OF_DEVICE_MEMORY && driver_calls == 1 && waits == 0, "RX_VK_SUBMIT_RETRY=0: dropped, as before");
+    } else if (mode == "reset") {   // (Qualcomm's driver after Windows reset a hung GPU: -3 from every submit)
+        bool lost = false;
+        std::string why;
+        try {
+            run({VK_ERROR_INITIALIZATION_FAILED, VK_SUCCESS});
+        } catch (const DeviceLost& e) {
+            lost = true, why = e.why;
+        }
+        if (!lost)
+            std::printf("FAIL: a submit refused with VK_ERROR_INITIALIZATION_FAILED (-3) after a GPU reset is not taken as a lost "
+                        "device: the game froze for good with no report (Adreno X1-85, Qualcomm's Windows driver)\n"), failures++;
+        expect(!lost || lost_calls == 1, "device_lost is called once");
+        expect(driver_calls == 1 && waits == 0, "a submit refused with -3 is not tried again");
+        expect(!lost || why.find("reset") != std::string::npos, "the report says the GPU was reset");
+        expect(log_text.find("taken as a lost device") != std::string::npos, "the log says why the game ends");
     } else if (mode == "refuse") {   // (RX_VK_TEST_SUBMIT_REFUSE=1: the first try of every submit refused without the driver)
         for (int i = 0; i < 3; i++) {
             const VkResult r = run({VK_SUCCESS});
@@ -319,7 +345,8 @@ def main():
         submit = SUBMIT.replace("/* SUBMIT_OR_RETRY */", between(replay, START_SUBMIT, END_SUBMIT))
         env_clear = {"RX_VK_TEST_SUBMIT_REFUSE": ""}
         failed |= compile_and_run(a.cxx, submit, temp, "submit",
-                                  [(["on"], env_clear), (["off"], env_clear), (["refuse"], {"RX_VK_TEST_SUBMIT_REFUSE": "1"})],
+                                  [(["on"], env_clear), (["off"], env_clear), (["reset"], env_clear),
+                                   (["refuse"], {"RX_VK_TEST_SUBMIT_REFUSE": "1"})],
                                   includes=[VK])
     for problem in check_source():
         print("FAIL:", problem)

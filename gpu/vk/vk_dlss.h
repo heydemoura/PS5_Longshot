@@ -96,7 +96,8 @@ enum FgSkip {
 };
 int dlss_fg_skip(unsigned* most = nullptr);
 /// (longshot) Why DLSS-G cannot run in this process at all, for the Frame generation by row, which offers DLSS FG only where
-/// it can: FG_SKIP_NONE while it can as far as is known (NGX not asked yet, or its yes), else for the rest of the run
+/// it can: FG_SKIP_NONE while it can as far as is known (NGX not asked yet, or its yes; NVIDIA Streamline making its frames
+/// in this run, vk_dlssg.h), else for the rest of the run
 /// FG_SKIP_NOT_BUILT, FG_SKIP_DEVICE (DLSS does not run here, dlss_why says why: RX_VK_DLSS=0 among them), FG_SKIP_OFF
 /// (RX_VK_DLSS_FG=0), FG_SKIP_START (NGX's no) or FG_SKIP_REFUSED (its feature given up). Read without a lock, by the menu
 int dlss_fg_unavailable();
@@ -119,7 +120,8 @@ bool dlss_fg_holds();
 bool dlss_fg_runs(int frames);
 /// (longshot) The most made frames its runtime makes a set (NGX's MultiFrameCountMax: 5 on an RTX 50's runtime, 1 on an RTX
 /// 40's) while DLSS-G is to make the frames: asked for, on a device DLSS runs on, a temporal Upscaler chosen (its inputs),
-/// NGX's answer a yes and its feature not given up. 0 otherwise, and before NGX has answered. Frame generation's fixed
+/// NGX's answer a yes and its feature not given up. 0 otherwise, and before NGX has answered. Through NVIDIA Streamline
+/// (vk_dlssg.h): what its DLSS-G makes at most (1 on an RTX 40, more on an RTX 50). Frame generation's fixed
 /// multiplier stops at it + 1 (vk_framegen.h framegen_now): past it NGX was not asked for the sets (FG_SKIP_TOO_MANY) and the
 /// renderer's own made every frame
 int dlss_fg_most();
@@ -132,7 +134,8 @@ void dlss_fg_inputs(VkCommandBuffer cmd, const TemporalFrame& f, const float pro
 /// At the present (vk_framegen.cpp framegen_record): `count` frames between the last picture and this one (color, the
 /// window's, w x h RGBA8) into out[0..count). Returns count, or 0 when it did not make them (the renderer's own methods do).
 /// blend: there is a picture before this one; sequence: the present's count (one skipped makes a new history)
-int dlss_fg_frames(VkCommandBuffer cmd, VkImage color, VkImageView color_view, uint32_t w, uint32_t h, int count,
+int dlss_fg_frames(VkCommandBuffer cmd, VkImage color, VkImageView color_view, VkFormat color_format,
+                   uint32_t w, uint32_t h, int count,
                    const VkImage* out, const VkImageView* out_views, bool blend, uint64_t sequence);
 /// Frame generation at Off or Auto (no fixed multiplier: dlss_fg_frames is not asked): its feature, if made, let go and its
 /// memory back, as when the Frame generation by row changes. Each such present (vk_replay.cpp); nothing to do is one load

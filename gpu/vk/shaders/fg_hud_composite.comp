@@ -27,11 +27,20 @@ vec3 hud_over(vec3 made, vec3 shown, vec4 l, bool pq) {
     return srgb(l.rgb + l.a * linear(made));
 }
 
+// Unpack RGBA8 UNORM SDR hud.layer written by fg_hud_layer.comp (-DFG_HUD_LAYER_RGBA8).
+vec4 unpack_layer(vec4 p) {
+    if (p.a < 0.5 / 255.0) return vec4(0.0, 0.0, 0.0, -1.0);
+    return vec4(p.rgb * p.rgb, (p.a * 255.0 - 1.0) / 254.0);
+}
+
 void main() {
     const ivec2 g = ivec2(gl_GlobalInvocationID.xy);
     if (any(greaterThanEqual(g, pc.size))) return;
-    const vec4 l = texelFetch(layer, g, 0);
+    vec4 l = texelFetch(layer, g, 0);
     if (l == vec4(0.0, 0.0, 0.0, 1.0)) return;   // (no HUD: FSR 3.1's pixel, untouched)
+#ifdef FG_HUD_LAYER_RGBA8
+    l = unpack_layer(l);
+#endif
     const vec3 m = imageLoad(made, g).rgb;
     imageStore(made, g, vec4(hud_over(m, texelFetch(shown, g, 0).rgb, l, pc.pq != 0), 1.0));
 }
