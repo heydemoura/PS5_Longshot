@@ -496,10 +496,25 @@ frame rate. `tests/test_framegen_fixed_pace.py` runs the timing functions throug
    - Under immediate (V-Sync Off), a set presented as it arrives shows almost only the game's frame.
    - Spacing a set's frames evenly makes the motion stutter as much as the game's frame times vary.
    - Under FIFO, a frame goes at its time but no sooner than a refresh after the frame before (`fifo_slot`).
+   - The game's timeline is the game's thread's presents (`fixed_clock`, the time `present` in `vk_replay.cpp` was
+     called), not the render thread's hand-over of the frame. The hand-over comes after the main thread's signal and the
+     frame's replay, a few milliseconds later and several times less even, and the screen follows whichever the set's
+     times are taken from. So the presents give the intervals and the hand-over's lag after them, smoothed, the phase:
+     the GPU's delay (rule 3) then takes up only how much the lag varies, and stays under a game frame even when the lag
+     is near one. A set whose present is not known is put at its hand-over, the lag kept.
+   - That holds while the game runs at its cap. Below it, the game's thread waits in its present: for the main thread's
+     signal that the frame's data is written, then for room in the render thread's queue. Each present then comes the
+     game's own work after the present before let it go, and sets placed on them take in how both vary. `fixed_clock`
+     smooths how long the thread waited in its present (`game_wait`, from the present's time to its job in the queue,
+     taken in `enqueue`): over 1 ms the sets are at their hand-over, under 0.5 ms they go back on the presents. Without
+     the render thread (`RX_VK_ASYNC=0`) no wait is taken and the sets stay on the presents.
+     `RX_VK_FG_GAME_CLOCK=0` takes the times from the hand-over for an A/B.
    - `RX_VK_FG_TIMELINE=0` turns this off for an A/B.
 3. **The GPU's delay is fed back only from sets taken as they came** (`pace_delay`, and `as_came` in `display_main`).
    A set that was late for another reason (no free swapchain image, the display thread busy) would raise the delay by
    its own lateness. That pushes the next set's copies later still, and at 4x the delay grows to a whole game frame.
+   Nor from a set after a long game frame, on the game's timeline or in the hand-overs (`pace_feeds`): it came early or
+   late by that frame, not by the GPU.
 4. **A set presented ahead needs a frame slot for every frame of both sets in flight, plus two sets' spare swapchain
    images** (`present_slots_for` in `vk_replay.cpp`; `create_swapchain` in `vk_main.cpp`; `present_ahead_wanted`).
    - Each present waits for the copy last made in its slot. With fewer slots, a set's copies wait behind each other, or
@@ -522,6 +537,10 @@ frame rate. `tests/test_framegen_fixed_pace.py` runs the timing functions throug
      of its time. The frames left out are spread evenly over the set (6x with 3 shown: the 2nd, 4th and 6th), and their
      copies are never made.
    - At most all made frames but one are left out, so 2x keeps its made frame.
+   - A set on the game's presents whose game frame was due before the render thread handed it over (its lag past the
+     smoothed one by more than the set's lead and the GPU's delay, as with a present held in the replay) is measured
+     from where its hand-over puts that frame, as with `RX_VK_FG_GAME_CLOCK=0`. Its frames cannot be shown sooner, and
+     measured from a time already past it left all its made frames out but one.
    - The GPU's delay is still fed back against the set's first frame.
    - `RX_VK_FG_FIFO_CAP=1` (off) uses Reflex to cap the game at the multiplier's share of refresh − refresh²/3600.
      This suits G-SYNC and FreeSync displays only: on a fixed-refresh display it leaves refreshes without a new frame.

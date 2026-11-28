@@ -26,18 +26,48 @@ the game's own frame rate. The real fixed_dues, pace_lead, pace_delay and fixed_
   and each game frame is shown within two refreshes of its time; 4x at 60 fps on a 239.5 Hz display taken as 240 Hz is
   shown evenly at the display's rate; 3x, 4x and 6x at 33 to 60 game frames a second on 165 Hz: past the refresh 160 to
   165 shown a second, each game frame within a refresh of its time, none waiting, under it none left out.
+- the set's place on the game's timeline is when the game's thread presented its frame, the render thread's lag after
+  the presents later, smoothed (fixed_clock), not when the render thread handed it over: under FIFO at 2x on 240 Hz,
+  the frames handed over 2.6 to 6.4 ms after their presents (as measured on an RTX 4090), every frame is shown as long
+  after its picture as the others, where on the hand-over's timeline (RX_VK_FG_GAME_CLOCK=0, as before) the screen
+  moved with the hand-over; at most a millisecond later. So too handed over 12 to 16 ms after, at 90 to 110 fps, once a
+  second 18 ms after, 17 to 19 ms after with a present not known, and at 30 fps 25 to 40 ms after: the GPU's delay
+  takes up only how much the lag varies, never a whole game frame; a set handed over long after the one before does not
+  feed it back (pace_feeds); after a present not known the next set is on the presents again. A step in the lag is one
+  jump on the screen on either timeline, then the frames glide to the new lag; after a hitch (a load) the lag is taken
+  again, so the sets after it are on their presents at once.
+- at 3x and 4x on 240 Hz, handed over as measured with the lag's step, a present held in the replay a game frame once
+  a second and once 50 ms (hold_ms, the game's thread stalled): the set whose game frame was due on the presents before
+  its hand-over keeps its made frames, FIFO's catch-up holding that frame to where the hand-over puts it (as
+  RX_VK_FG_GAME_CLOCK=0 does); measured from its own time, all but one were left out and it went late anyway. Past the
+  refresh (3x and 4x at about 55 fps on 165 Hz), handed over as measured, no game frame is due before its hand-over and
+  the catch-up is as before.
+- only while the game runs at its cap: below it its thread waits in its present, for the main thread's signal that the
+  frame's data is written, then for room in the render thread's queue, so its presents follow the hand-overs (as
+  measured in the game) and add how long its own work takes. Modelled in a closed loop, each present its work after the
+  last hand-over (its work 6 to 14 ms, the replay's 17 to 23, 50 fps, 2x on 240 Hz): on the presents the GPU's delay
+  ran to 11.4 ms against 7.2 at the hand-over and the frames jumped twice as much; with how long it waited smoothed over
+  16 presents, over 1 ms (under 0.5 ms back) the sets are at their hand-over, and the screen is the hand-over's, also
+  with its thread freed halfway (on the presents again once, 21 sets later). Not modelled: what took the game to its
+  cap in the game (the render thread's own lag in the frame after); a present wait once a second (a load) never moves
+  the sets.
 
 - present_image's frame slots: 3, and a slot per frame of two sets where the swapchain is made for two (RX_VK_FG_TIMELINE
   on, any present mode) while frame generation runs: a set's copies all at once, none waiting in its own first copy's
   slot or in the slot of the shown set's copy; RX_VK_FG_TIMELINE=0 keeps 3.
 
-The text checks: every fixed set with a frame before (blend) and a made frame gets its times, whatever Frame pacing says;
+The text checks: every fixed set with a frame before (blend) and a made frame gets its times, whatever Frame pacing says,
+from its place on the game's timeline (the game's thread's time, taken in vk_replay.cpp's present and carried in the
+present's job to both framegen_record calls, through the present that job makes, and to both of the presents made on the
+game's thread; on the clock frame generation reads; with it how long the thread was held there, taken once its job is in
+the queue);
 display_main shows it at them whatever the swapchain's mode, under FIFO no sooner than fifo_slot allows (the display's
 refresh, the mode read at each present), puts only a set presented ahead on the timeline, takes the next one early
 (looked for every 2 ms of a wait) with its copies for the images free, the rest as presents give images back, and feeds
-back only a set whose first copy it waited for, that went as it came and that did not follow a long game frame.
+back only a set whose first copy it waited for, that went as it came and that did not follow a long game frame on
+either timeline.
 vk_main.cpp asks for two sets' images, under FIFO too, one set's with RX_VK_FG_TIMELINE=0.
-python -I -B tests/test_framegen_fixed_pace.py [--cxx g++]
+python -I -B tests/test_framegen_fixed_pace.py [--cxx g++] [--source <checkout>]
 """
 import argparse
 import re
@@ -54,6 +84,7 @@ RUN_ALL_ARGS = ["--cxx", "{cxx}"]
 ROOT = Path(__file__).resolve().parents[1]
 
 PREFIX = r'''#include <algorithm>
+#include <cmath>
 #include <initializer_list>
 #include <cstdint>
 #include <cstdio>
@@ -127,40 +158,85 @@ static void count(const Run& r, int64_t close, int& late, int& together) {
    to be shown at a present; r.extra_max: the GPU's delay at its most over the second half. FIFO's catch-up as take has it
    (fifo_catch_up, the set taken as it comes): a set whose game frame would be shown over a refresh late leaves made
    frames out, spread over it (fifo_pick); r.caught: the frames so left out, r.due: each shown frame's own time,
-   r.is_game: whether it is a set's game frame */
+   r.is_game: whether it is a set's game frame; a set whose game frame's time came before its hand-over is held to where
+   the hand-over puts it (hand_due, as framegen_record gives it), r.behind such sets and r.caught_behind the frames left
+   out of them. lag[i]: the render thread hands game frame i over (framegen_record's
+   now) that long after the game's thread presented it (the set's copies then; none: at once); the set is put on the
+   game's timeline at fixed_clock's place (clock_off: RX_VK_FG_GAME_CLOCK=0; set `unknown`'s present not known), its
+   pictures where the game's presents put them, and it feeds the delay back as pace_feeds lets it. Over the second half:
+   r.capped, the sets that left the delay at its most (a game frame); r.on_clock and r.fallback, the sets placed on
+   their presents and at their hand-over; r.untimed, the sets after the first without times (none shown here); r.moves,
+   the sets placed otherwise than the one before (on their presents, at their hand-over). The game's thread does not
+   wait in its present there (at its cap), unless loop closes it (below the cap): the game's thread held in its present
+   by the replay. Game frame i's work then takes cpu[i] on the game's thread after its present before returned; its
+   present waits until the render thread has handed the one before over (the CPU's signal, the room for it), and the
+   render thread hands it over render[i] after the one before (the replay GPU-bound), 1 ms after its present at least.
+   The game's world moves by the mean of its last five returns' intervals (nn_vi.c's realtime_step), so its pictures
+   are there, not at its presents */
+struct Loop { const int64_t* cpu; const int64_t* render; };
 struct Fifo {
-    int n, waiting, games, caught;
-    int64_t extra_max;
+    int n, waiting, games, caught, capped, on_clock, fallback, untimed, moves, behind, caught_behind;
+    int64_t extra_max, wait_mean;
     int64_t present[8192], flip[8192], content[8192], due[8192], game[2048];
     bool is_game[8192];
 };
 static void run_fifo(const int64_t* gaps, int sets, const int64_t* gpu, int made, int64_t refresh, int64_t screen,
-                     int64_t wake, Fifo& r, bool feed = true) {
-    int64_t last = 0, game_ns = 0, extra = 0, slot = 0, t = 0, done[3] = {0, 0, 0};
-    r.n = 0, r.waiting = 0, r.games = 0, r.caught = 0, r.extra_max = 0;
+                     int64_t wake, Fifo& r, bool feed = true, const int64_t* lag = nullptr, bool clock_off = false,
+                     int unknown = -1, const Loop* loop = nullptr) {
+    FixedClock c{};
+    int64_t hand_last = 0, hand_ns = 0, extra = 0, slot = 0, t = 0, done[3] = {0, 0, 0}, presented_before = 0;
+    int64_t returned[6] = {}, world = 0, world_before = 0, waits = 0;   /* (loop: the returns, the world's time) */
+    int placed = -1;
+    r.n = 0, r.waiting = 0, r.games = 0, r.caught = 0, r.capped = 0, r.on_clock = 0, r.fallback = 0, r.untimed = 0;
+    r.behind = 0, r.caught_behind = 0;
+    r.moves = 0, r.extra_max = 0, r.wait_mean = 0;
     const auto waiting_at = [&](int64_t at) {
         int w = 0;
         for (int q = r.n - 1; q >= 0 && r.flip[q] > at; q--) w++;
         return w;
     };
     for (int i = 0; i < sets; i++) {
-        const int64_t now = std::max(last + gaps[i], done[i % 3]);
-        const int64_t span = now - last;
-        if (last && span <= 100000000) game_ns = game_ns ? (game_ns * 7 + span) / 8 : span;
-        if (r.games < 2048) r.game[r.games++] = now;
-        int64_t due[8];
+        /* the game's thread presents (game_at) its frame time after the present before, or (loop) its work after that
+           present returned; FIFO's images hold it until set i - 3 was shown */
+        const int64_t presented = std::max(loop ? returned[0] + loop->cpu[i] : presented_before + gaps[i], done[i % 3]);
+        const int64_t wait = loop ? std::max<int64_t>(hand_last - presented, 0) : 0;       /* in its present */
+        const int64_t now = loop ? std::max(presented + 1000000, hand_last + loop->render[i])
+                                 : presented + (lag ? lag[i] : 0);                        /* handed over: framegen_record */
+        if (loop) {   /* the world's time for this frame: its last five returns' intervals' mean (none yet: its frame time) */
+            int known = 0;
+            while (known < 5 && returned[known + 1]) known++;
+            world_before = world;
+            world = !i ? presented : world + (known ? (returned[0] - returned[known]) / known : presented - presented_before);
+            for (int k = 5; k > 0; k--) returned[k] = returned[k - 1];
+            returned[0] = presented + wait;
+        }
+        const bool hitch = hand_last && now - hand_last > 100000000;                 /* framegen_record's gap */
+        const int64_t hand_span = now - hand_last;
+        if (hand_last && !hitch) hand_ns = hand_ns ? (hand_ns * 7 + hand_span) / 8 : hand_span;   /* its game_ns */
+        hand_last = now;
+        const ClockPlace p = fixed_clock(c, i == unknown ? 0 : presented, i == unknown ? 0 : wait, now, hitch, clock_off);
+        const bool timed = p.timed && c.frame > 0, half = i >= sets / 2;
+        if (half) (p.lag >= 0 ? r.on_clock : r.fallback)++, r.moves += placed >= 0 && placed != (p.lag >= 0), waits += wait;
+        placed = p.lag >= 0;
+        if (i > 0 && !timed) r.untimed++;
+        if (r.games < 2048) r.game[r.games++] = presented;
+        int64_t due[8] = {};
         const int64_t set_extra = extra;
-        fixed_dues(last, now, made, pace_lead(game_ns, made) + set_extra, due);
-        const int first = i > 0 ? fifo_catch_up(made, due, slot, 0, refresh, now) : 0;
+        if (timed) fixed_dues(p.before, p.at, made, pace_lead(c.frame, made) + set_extra, due);
+        const int64_t hand_due = timed ? fixed_hand_due(due[made], p.at, now) : 0;         /* framegen_record's */
+        const int first = timed ? fifo_catch_up(made, due, slot, 0, refresh, now, hand_due) : 0;
         r.caught += first;
+        if (hand_due) r.behind++, r.caught_behind += first;
         const bool held = t >= now + gpu[i];                               /* its copy done before the thread came */
         t = std::max(t, now + gpu[i]);                                     /* its first copy waited for */
         const int64_t at = held ? now + gpu[i] : t;
-        if (feed && i > 0 && span * 2 <= game_ns * 3)
-            extra = pace_delay(extra, set_extra + (at - due[0]) + 1000000, game_ns);
-        if (i >= sets / 2) r.extra_max = std::max(r.extra_max, extra);
+        if (feed && timed && pace_feeds(p.at - p.before, c.frame, hand_span, hand_ns)) {
+            extra = pace_delay(extra, set_extra + (at - due[0]) + 1000000, c.frame);
+            if (half) r.capped += extra >= c.frame;
+        }
+        if (half) r.extra_max = std::max(r.extra_max, extra);
         const int shown = made + 1 - first;
-        for (int q = 0; q < shown && i > 0; q++) {
+        for (int q = 0; q < shown && timed; q++) {
             const int k = first ? fifo_pick(made + 1, shown, q) : q;      /* the set's frame, as display_main takes it */
             int64_t d = std::max(fifo_slot(due[k], slot, refresh, t), t);
             slot = d;
@@ -171,16 +247,22 @@ static void run_fifo(const int64_t* gaps, int sets, const int64_t* gpu, int made
             const int64_t flip = r.n ? std::max(t, r.flip[r.n - 1] + screen) : t;
             if (r.n < 8192)
                 r.is_game[r.n] = k == made, r.present[r.n] = t, r.flip[r.n] = flip, r.due[r.n] = due[k],
-                r.content[r.n++] = last + span * (k + 1) / (made + 1);
+                r.content[r.n++] = loop ? world_before + (world - world_before) * (k + 1) / (made + 1)
+                                        : presented_before + (presented - presented_before) * (k + 1) / (made + 1);
         }
         done[i % 3] = t;
-        last = now;
+        presented_before = presented;
     }
+    r.wait_mean = waits / (sets - sets / 2);
 }
 
 /* the second half's numbers of a FIFO run: the game's rate, the frames shown a second, the least time between two flips,
-   the most a present waited to be shown, and the game frames' time on the screen past their own (most and mean) */
-struct Report { double fps, shown_fps; int64_t min_gap, max_wait, lag_max, lag_mean; int caught_per_100; };
+   the most a present waited to be shown, the game frames' time on the screen past their own (most and mean), and each
+   frame's flip after its picture's place on the game's timeline (mean and sd: the same for every frame, the screen
+   moves as the game does), and how far that moves from one frame to the next (its root mean square and most: a step in
+   the lag is one such jump, the frames moving with the hand-over many small ones) */
+struct Report { double fps, shown_fps, after_mean, after_sd, jump_sd; int64_t min_gap, max_wait, lag_max, lag_mean, jump_max;
+                int caught_per_100; };
 static Report report(const Fifo& f) {
     Report o{};
     o.fps = (f.games / 2 - 1) * 1e9 / (double)(f.game[f.games - 1] - f.game[f.games / 2]);
@@ -188,19 +270,38 @@ static Report report(const Fifo& f) {
     o.min_gap = INT64_MAX;
     int64_t sum = 0;
     int games = 0;
+    double after = 0, spread = 0;
     for (int i = f.n / 2; i < f.n; i++) {
         o.min_gap = std::min(o.min_gap, f.flip[i] - f.flip[i - 1]);
         o.max_wait = std::max(o.max_wait, f.flip[i] - f.present[i]);
         if (f.is_game[i]) o.lag_max = std::max(o.lag_max, f.flip[i] - f.due[i]), sum += f.flip[i] - f.due[i], games++;
+        after += (double)(f.flip[i] - f.content[i]);
     }
+    o.after_mean = after / (f.n - f.n / 2);
+    for (int i = f.n / 2; i < f.n; i++) spread += std::pow((double)(f.flip[i] - f.content[i]) - o.after_mean, 2);
+    o.after_sd = std::sqrt(spread / (f.n - f.n / 2));
+    double jumps = 0;
+    for (int i = f.n / 2 + 1; i < f.n; i++) {
+        const int64_t d = (f.flip[i] - f.content[i]) - (f.flip[i - 1] - f.content[i - 1]);
+        jumps += (double)d * (double)d, o.jump_max = std::max(o.jump_max, d < 0 ? -d : d);
+    }
+    o.jump_sd = std::sqrt(jumps / (f.n - f.n / 2 - 1));
     o.lag_mean = games ? sum / games : 0;
     o.caught_per_100 = f.games ? f.caught * 100 / f.games : 0;
     if (std::getenv("FIFO_REPORT"))
         std::fprintf(stderr, "fifo: game %.1f fps, shown %.1f a second, flips >= %.2f ms apart, a present waited <= %.2f ms, "
-                     "game frames late <= %.2f ms (mean %.2f), %d frames left out per 100 sets, waiting %d, delay <= %.2f ms\n", o.fps,
+                     "game frames late <= %.2f ms (mean %.2f), %d frames left out per 100 sets, waiting %d, delay <= %.2f ms, "
+                     "shown %.2f ms after their pictures (sd %.2f; from frame to frame %.2f, at most %.2f), at the most "
+                     "%d, on the presents %d, at the hand-over %d (moved %d), the game's thread waited %.2f ms\n", o.fps,
                      o.shown_fps, o.min_gap / 1e6, o.max_wait / 1e6, o.lag_max / 1e6, o.lag_mean / 1e6, o.caught_per_100,
-                     f.waiting, f.extra_max / 1e6);
+                     f.waiting, f.extra_max / 1e6, o.after_mean / 1e6, o.after_sd / 1e6, o.jump_sd / 1e6, o.jump_max / 1e6,
+                     f.capped, f.on_clock, f.fallback, f.moves, f.wait_mean / 1e6);
     return o;
+}
+
+/* lo to hi (not included), evenly drawn (a linear congruential generator from seed) */
+static void lag_fill(int64_t* out, int n, int64_t lo, int64_t hi, uint32_t seed) {
+    for (int i = 0; i < n; i++) seed = seed * 1664525u + 1013904223u, out[i] = lo + (int64_t)((seed >> 8) % (uint32_t)(hi - lo));
 }
 
 int main() {
@@ -402,6 +503,293 @@ int main() {
             CHECK(o.lag_max <= hz165 + 500000);
             CHECK((asked < 165.0) == (f.caught == 0));                        /* frames left out only past the refresh */
         }
+
+    /* 2x at ~60 fps on a 240 Hz VRR display, FIFO, each game frame handed over 2.6 to 6.4 ms after the game's thread
+       presented it (sd 1.1 ms; measured on an RTX 4090: 4.5 ms at the median, sd 1.05 to 1.15, the presents themselves
+       0.27 ms apart at most of the time): on the game's own timeline every frame is shown as long after its picture
+       as the others (sd under 0.5 ms; 0.39 here), where on the hand-over's (RX_VK_FG_GAME_CLOCK=0, as before) the
+       screen moved with the hand-over (sd over 0.8 ms; 1.04 here); the GPU's delay takes up how much the
+       hand-over's lag varies, so the frames are shown no more than a millisecond later than before (0.34 ms here),
+       none waiting, the delay never at its most, every set on its present */
+    static int64_t lag[600];
+    lag_fill(lag, 600, 2600000, 6400000, 1);
+    /* (each case at the hand-over, RX_VK_FG_GAME_CLOCK=0: off, then on the game's timeline: on, where the frames are
+       shown as long after their pictures as the others, sd at most sd_most and no more than off, from frame to frame
+       too, none waiting, the delay never at its most, a game frame, and every set on its present but the one not known) */
+    const auto both = [&](const int64_t* g, const int64_t* gpu, const int64_t* l, int unknown, double sd_most,
+                          Report& on, Report& off) {
+        run_fifo(g, 600, gpu, 1, hz240, hz240, 300000, f, true, l, true, unknown);
+        off = report(f);
+        CHECK(f.waiting == 0 && f.untimed == 0);
+        run_fifo(g, 600, gpu, 1, hz240, hz240, 300000, f, true, l, false, unknown);
+        on = report(f);
+        CHECK(f.waiting == 0 && f.untimed == 0 && on.min_gap >= hz240);
+        CHECK(on.after_sd <= sd_most && on.after_sd <= off.after_sd && on.jump_sd <= off.jump_sd);
+        CHECK(f.capped == 0);
+        CHECK(f.fallback == (unknown >= 300));
+    };
+    Report on, off;
+    both(g60, gpu5, lag, -1, 500000, on, off);
+    CHECK(off.after_sd >= 800000);
+    CHECK(on.after_mean - off.after_mean <= 1000000);
+    const int64_t base_extra = f.extra_max;
+    /* handed over 12.1 to 15.9 ms after the presents (as spread as above, near a game frame: a GPU-bound replay): placed
+       on the presents themselves, the delay needed the lag, the GPU's 5 ms and 1 to spare, over a game frame, so it
+       stayed at its most (every set) and the frames went out as they came, with the hand-over (sd 1.31 ms, the
+       hand-over's own 1.03); the lag smoothed, it takes up only how much the lag varies (0.38 here) */
+    static int64_t lag_long[600];
+    lag_fill(lag_long, 600, 12100000, 15900000, 2);
+    both(g60, gpu5, lag_long, -1, 500000, on, off);
+    /* 90 to 110 fps, the GPU's frames 3.5 ms, handed over 2.6 to 6.4 ms after: the lag, the GPU's time and 1 to spare
+       passed the game frame there too (placed on the presents themselves, the delay at its most in 52 sets of 300) */
+    static int64_t g100[600], gpu35[600];
+    lag_fill(g100, 600, 9100000, 11100000, 3);
+    for (int i = 0; i < 600; i++) gpu35[i] = 3500000;
+    both(g100, gpu35, lag, -1, 500000, on, off);
+    /* once a second a frame handed over 18 ms after its present: that set comes late on the screen, but it does not feed
+       the delay back (handed over 1.5 game frames after the one before, pace_feeds), so the delay stays where it was
+       (fed back as on the game's timeline alone it went to 13.2 ms, placed on the presents themselves to 16.6) */
+    static int64_t lag_spike[600];
+    for (int i = 0; i < 600; i++) lag_spike[i] = i % 60 == 30 ? 18 * ms : lag[i];
+    both(g60, gpu5, lag_spike, -1, 1e9, on, off);
+    CHECK(f.extra_max <= base_extra + 1000000);
+    /* handed over 17 to 19 ms after the presents (over a game frame), set 350's present not known: put at its hand-over,
+       the lag kept, so the next set is on its present again (taken against the place before, the hand-over later than
+       the next present, the sets after it stayed at the hand-over until a game frame came longer than the lag: 23 of
+       300 here, sd 3.35 ms against 0.24) */
+    static int64_t lag_over[600];
+    lag_fill(lag_over, 600, 17 * ms, 19 * ms, 4);
+    both(g60, gpu5, lag_over, 350, 500000, on, off);
+    /* 30 fps (31 to 35.6 ms apart), handed over 25 to 40 ms after the presents (a game frame and more, as spread): every
+       set within fixed_clock's 100 ms, on its present; the delay takes up how much the lag varies (sd 1.80 ms against
+       4.42 at the hand-over), 1.3 ms later here */
+    static int64_t g30[600], lag_30[600];
+    lag_fill(g30, 600, 31 * ms, 35600000, 5);
+    lag_fill(lag_30, 600, 25 * ms, 40 * ms, 6);
+    both(g30, gpu5, lag_30, -1, 2500000, on, off);
+    CHECK(on.after_mean - off.after_mean <= 2000000);
+    /* the lag's steps: handed over 2.6 to 6.4 ms after the presents, from set 350 12.1 to 15.9 (the replay GPU-bound), from
+       set 470 2.6 to 6.4 again. Each step is one jump on the screen on either timeline (7.4 ms at the hand-over, 8.0 on
+       the presents: a frame is not shown before it is made), then on the presents the frames glide to the new lag as the
+       smoothed lag follows (up: two sets uneven, then the delay rises; down: about 15 sets, each frame up to a
+       millisecond sooner than the one before) where at the hand-over they moved with it: from frame to frame 0.50 ms
+       against 0.88. None waiting, none left out, the delay never at its most, at most a millisecond later */
+    static int64_t lag_step[600];
+    for (int i = 0; i < 600; i++) lag_step[i] = i >= 350 && i < 470 ? lag_long[i] : lag[i];
+    run_fifo(g60, 600, gpu5, 1, hz240, hz240, 300000, f, true, lag_step, true);
+    off = report(f);
+    run_fifo(g60, 600, gpu5, 1, hz240, hz240, 300000, f, true, lag_step, false);
+    on = report(f);
+    CHECK(f.waiting == 0 && f.untimed == 0 && f.caught == 0 && f.capped == 0 && f.fallback == 0 && on.min_gap >= hz240);
+    CHECK(on.jump_sd <= off.jump_sd && on.jump_max <= off.jump_max + 1000000);
+    CHECK(on.after_mean - off.after_mean <= 1000000);
+    /* a hitch: the game's thread held 150 ms at set 400 (a load), the frames handed over 2.6 to 6.4 ms after their presents
+       before it and 12.1 to 15.9 after (the replay GPU-bound after the load): the set after the hitch has no times
+       (nothing to place it between) and takes the lag again, so the sets after it are on their presents at once, the
+       game frames shown at their times (at most 0.3 ms late) and from frame to frame 0.45 ms against 0.83 at the
+       hand-over; the new lag's one jump falls in the 150 ms the game held. None waiting, none left out, the delay never
+       at its most. (The lag taken again, not smoothed through the hitch, is fixed_clock's own check below: on this
+       model both look alike) */
+    static int64_t g_hitch[600], lag_hitch[600];
+    for (int i = 0; i < 600; i++) g_hitch[i] = i == 400 ? 150 * ms : g60[i], lag_hitch[i] = i < 400 ? lag[i] : lag_long[i];
+    run_fifo(g_hitch, 600, gpu5, 1, hz240, hz240, 300000, f, true, lag_hitch, true);
+    off = report(f);
+    CHECK(f.waiting == 0 && f.untimed == 1);
+    run_fifo(g_hitch, 600, gpu5, 1, hz240, hz240, 300000, f, true, lag_hitch, false);
+    on = report(f);
+    CHECK(f.waiting == 0 && f.untimed == 1 && f.caught == 0 && f.capped == 0 && f.fallback == 0 && on.min_gap >= hz240);
+    CHECK(on.jump_sd <= off.jump_sd && on.lag_max <= 1000000);
+    /* 3x and 4x (from two made frames FIFO's catch-up may leave some out), handed over as above with the lag's step;
+       once a second a present held in the replay for the main thread's signal until the game's next present let it go
+       (handed over a game frame later: vk_replay.cpp replay_thread_main), and once the game's thread stalled while a
+       present was held, until hold_ms let it go (50 ms). That set's game frame was due on the presents about 28 ms
+       before its hand-over: measured from there, the catch-up left all its made frames out but one (no frames a refresh
+       apart from the hand-over end within a refresh of a time already past) and the game frame went late anyway. Held
+       to where its hand-over puts it (hand_due: RX_VK_FG_GAME_CLOCK=0's time) the set keeps them, as at the hand-over.
+       The other sets are as they were (neither the step nor the presents held a game frame put a game frame's time
+       before its hand-over): none waiting, a refresh apart, no more frames left out than at the hand-over */
+    static int64_t g_held[600], lag_held[600];
+    for (int i = 0; i < 600; i++) g_held[i] = g60[i], lag_held[i] = lag_step[i];
+    for (int i = 30; i < 599; i += 60) lag_held[i] += g60[i + 1];
+    lag_held[500] = 50 * ms + lag[500], g_held[501] = lag_held[500] + 2 * ms;
+    for (const int m : {2, 3}) {
+        run_fifo(g_held, 600, gpu5, m, hz240, hz240, 300000, f, true, lag_held, true);
+        const int off_caught = f.caught;
+        CHECK(f.behind == 0);                                            /* at the hand-over never */
+        run_fifo(g_held, 600, gpu5, m, hz240, hz240, 300000, f, true, lag_held, false);
+        on = report(f);
+        CHECK(f.waiting == 0 && f.untimed == 0 && f.fallback == 0 && on.min_gap >= hz240);
+        CHECK(f.behind == 1 && f.caught_behind == 0);
+        CHECK(f.caught <= off_caught);
+    }
+    /* the catch-up itself: a 3x and a 4x set whose game frame was due 28 ms before now, the frame before shown 10 ms
+       ago, on 240 Hz. From that time all its made frames but one are left out, as at the hand-over for a set taken that
+       late (hand_due 0); held to its hand-over's time (17 ms on) none. A set on time keeps them whatever hand_due: the
+       game frame is never held to a time before its own */
+    {
+        const int64_t now = 1000 * ms;
+        const int64_t late3[] = {now - 36 * ms, now - 32 * ms, now - 28 * ms};
+        const int64_t late4[] = {now - 40 * ms, now - 36 * ms, now - 32 * ms, now - 28 * ms};
+        const int64_t ontime[] = {now, now + 4 * ms, now + 8500000};
+        CHECK(fifo_catch_up(2, late3, now - 10 * ms, 0, hz240, now, 0) == 1);
+        CHECK(fifo_catch_up(3, late4, now - 10 * ms, 0, hz240, now, 0) == 2);
+        CHECK(fifo_catch_up(2, late3, now - 10 * ms, 0, hz240, now, now + 17 * ms) == 0);
+        CHECK(fifo_catch_up(3, late4, now - 10 * ms, 0, hz240, now, now + 17 * ms) == 0);
+        CHECK(fifo_catch_up(2, ontime, now - 10 * ms, 0, hz240, now, 0) == 0);
+        CHECK(fifo_catch_up(2, ontime, now - 10 * ms, 0, hz240, now, now - 40 * ms) == 0);
+    }
+    /* past the refresh (3x and 4x at about 55 fps on 165 Hz), handed over as measured: no game frame due before its
+       hand-over, so the catch-up holds each to its own time as before, within a refresh (held to the hand-over's time
+       whenever that is later, 3x showed them up to 6.84 ms after it, the lag's excess over the smoothed one) */
+    for (const int m : {2, 3}) {
+        for (int i = 0; i < 600; i++) gx[i] = 18000000 + (i % 3 - 1) * 400000;
+        run_fifo(gx, 600, gpu5, m, hz165, hz165, 300000, f, true, lag);
+        const Report o = report(f);
+        CHECK(f.behind == 0 && f.waiting == 0 && o.min_gap >= hz165 && o.lag_max <= hz165 + 500000);
+    }
+
+    /* below the game's cap: its thread held in its present until the render thread handed the frame before over (its
+       work 6 to 14 ms, the replay's 17 to 23: 50 fps, each present held 10 ms), 2x on 240 Hz. Placed on the presents, the
+       sets took in how the game's work and the replay's vary both (a present comes a work after the hand-over before it,
+       its own hand-over a replay after that one): the GPU's delay ran to 11.4 ms against 7.2 at the hand-over, from frame
+       to frame 2.16 ms against 0.96, a made frame and the game frame after it a refresh apart (in the game, RTX 4090 under
+       a GPU load at about 50 fps, the delay reached a game frame 10.6 times a log window, against 0.5 at the hand-over,
+       that run first). While its thread is held there the sets are at their hand-over, as with RX_VK_FG_GAME_CLOCK=0,
+       so the screen is as there */
+    static int64_t cpu[600], cpu_free[600], cpu_mixed[600], render[600];
+    lag_fill(cpu, 600, 6 * ms, 14 * ms, 7);
+    lag_fill(render, 600, 17 * ms, 23 * ms, 8);
+    const Loop held{cpu, render};
+    run_fifo(g60, 600, gpu5, 1, hz240, hz240, 300000, f, true, nullptr, true, -1, &held);
+    off = report(f);
+    int64_t off_extra = f.extra_max;
+    CHECK(f.wait_mean >= 5 * ms && f.waiting == 0 && f.untimed == 0);
+    run_fifo(g60, 600, gpu5, 1, hz240, hz240, 300000, f, true, nullptr, false, -1, &held);
+    on = report(f);
+    CHECK(on.jump_sd <= off.jump_sd + 100000 && on.min_gap >= off.min_gap - 500000 && f.extra_max <= off_extra + 500000);
+    CHECK(f.waiting == 0 && f.untimed == 0 && f.capped == 0 && f.on_clock == 0 && f.moves == 0);
+    /* its thread free from set 400 (its work 22 to 26 ms, longer than the replay's: none held): the sets on its presents
+       again once the smoothed wait is under 0.5 ms (21 sets later), and once only; the screen as at the hand-over */
+    lag_fill(cpu_free, 600, 22 * ms, 26 * ms, 9);
+    for (int i = 0; i < 600; i++) cpu_mixed[i] = i < 400 ? cpu[i] : cpu_free[i];
+    const Loop freed{cpu_mixed, render};
+    run_fifo(g60, 600, gpu5, 1, hz240, hz240, 300000, f, true, nullptr, true, -1, &freed);
+    off = report(f);
+    off_extra = f.extra_max;
+    run_fifo(g60, 600, gpu5, 1, hz240, hz240, 300000, f, true, nullptr, false, -1, &freed);
+    on = report(f);
+    CHECK(on.jump_sd <= off.jump_sd + 100000 && on.min_gap >= off.min_gap - 500000 && f.extra_max <= off_extra + 500000);
+    CHECK(f.waiting == 0 && f.untimed == 0 && f.capped == 0 && f.moves == 1 && f.on_clock >= 170 && f.on_clock <= 190);
+
+    /* the set's place on the game's timeline (fixed_clock): the game's thread's present, the render thread's lag after
+       the presents later, smoothed over 16 sets (the first takes its own); its times between the place before and its
+       own (timed), the frame time smoothed between them */
+    FixedClock c{};
+    ClockPlace p = fixed_clock(c, 495 * ms, 0, 500 * ms, false, false);
+    CHECK(!p.timed && p.before == 0 && p.at == 500 * ms && p.lag == 5 * ms && c.lag == 5 * ms && c.game == 495 * ms);
+    CHECK(c.frame == 0);
+    p = fixed_clock(c, 512 * ms, 0, 521 * ms, false, false);                     /* 9 ms after: a sixteenth of the way */
+    const int64_t lag1 = (5 * ms * 15 + 9 * ms) / 16;
+    CHECK(p.timed && p.before == 500 * ms && p.at == 512 * ms + lag1 && p.lag == 9 * ms && c.lag == lag1);
+    CHECK(c.frame == p.at - 500 * ms && c.at == p.at);
+    int64_t frame_was = c.frame;
+    const int64_t at1 = p.at;
+    p = fixed_clock(c, 0, 0, 538 * ms, false, false);                            /* not known: at the hand-over, the lag kept */
+    CHECK(p.timed && p.before == at1 && p.at == 538 * ms && p.lag == -1 && c.lag == lag1 && c.game == 512 * ms);
+    CHECK(c.frame == (frame_was * 7 + (538 * ms - at1)) / 8);
+    /* a present it cannot take: not after the last one taken, after now, more than 100 ms before now, or
+       RX_VK_FG_GAME_CLOCK=0: at the hand-over, the lag kept */
+    const int64_t refused[][2] = {{512 * ms, 550 * ms}, {505 * ms, 550 * ms}, {551 * ms, 550 * ms}, {549 * ms, 650 * ms}};
+    for (const auto& q : refused) {
+        FixedClock k = c;
+        p = fixed_clock(k, q[0], 0, q[1], false, false);
+        CHECK(p.at == q[1] && p.lag == -1 && k.lag == lag1 && k.game == 512 * ms);
+    }
+    {
+        FixedClock k = c;
+        p = fixed_clock(k, 545 * ms, 0, 551 * ms, false, true);                  /* RX_VK_FG_GAME_CLOCK=0 */
+        CHECK(p.timed && p.at == 551 * ms && p.lag == -1 && k.lag == lag1 && k.game == 512 * ms);
+    }
+    p = fixed_clock(c, 545 * ms, 0, 551 * ms, false, false);                     /* on the presents again */
+    const int64_t lag2 = (lag1 * 15 + 6 * ms) / 16;
+    CHECK(p.timed && p.before == 538 * ms && p.at == 545 * ms + lag2 && c.lag == lag2 && c.game == 545 * ms);
+    /* a place not after the one before (a hand-over later than the lag, then a present not known): no times, the frame
+       time kept */
+    p = fixed_clock(c, 0, 0, 575 * ms, false, false);
+    frame_was = c.frame;
+    p = fixed_clock(c, 565 * ms, 0, 570 * ms, false, false);
+    CHECK(!p.timed && p.at < p.before && c.frame == frame_was && c.at == p.at);
+    /* a hitch (the hand-over over 100 ms after the one before): the lag taken again, no times */
+    p = fixed_clock(c, 700 * ms, 0, 712 * ms, true, false);
+    CHECK(!p.timed && p.at == 712 * ms && p.lag == 12 * ms && c.lag == 12 * ms && c.frame == frame_was);
+    /* a place over 100 ms after the one before: no times */
+    p = fixed_clock(c, 815 * ms, 0, 820 * ms, false, false);
+    CHECK(!p.timed && p.at - p.before > 100 * ms && c.frame == frame_was);
+    /* a hitch with the place within 100 ms of the one before (the hand-over over 100 ms after the one before, the present
+       before it known): the lag taken again, no times either (the frame time not smoothed through the hitch) */
+    {
+        const int64_t before_at = c.at;
+        p = fixed_clock(c, 830 * ms, 0, 840 * ms, true, false);
+        CHECK(p.at - before_at > 0 && p.at - before_at <= 100 * ms && p.at == 840 * ms && p.lag == 10 * ms);
+        CHECK(!p.timed && c.lag == 10 * ms && c.frame == frame_was);
+        p = fixed_clock(c, 850 * ms, 0, 860 * ms, false, false);                  /* the set after it: timed again */
+        CHECK(p.timed && p.before == 840 * ms && c.frame != frame_was);
+    }
+    /* where a set's hand-over puts its game frame (fixed_hand_due): its own time and how far the place is behind the
+       hand-over when it is due before it; none at or after it */
+    CHECK(fixed_hand_due(100 * ms, 90 * ms, 130 * ms) == 140 * ms);
+    CHECK(fixed_hand_due(100 * ms, 130 * ms, 130 * ms) == 100 * ms);
+    CHECK(fixed_hand_due(130 * ms, 90 * ms, 130 * ms) == 0);
+    CHECK(fixed_hand_due(131 * ms, 90 * ms, 130 * ms) == 0);
+    /* how long the game's thread was held in its present (wait), each taken to 2 ms at most and smoothed over 16 presents:
+       over 1 ms (the game below its cap, held by the replay) its sets are at their hand-over, until it is under 0.5 ms
+       again; the first set on the presents then is at its hand-over too (the lag taken again). Held 8 ms each from
+       none: the 11th set at its hand-over */
+    {
+        FixedClock k{};
+        int64_t t = 1000 * ms;
+        int i = 1;
+        for (; i <= 11; i++, t += 20 * ms) {
+            p = fixed_clock(k, t, 8 * ms, t + 25 * ms, false, false);
+            if (i < 11) CHECK(p.lag == 25 * ms && p.at == t + 25 * ms);
+        }
+        CHECK(p.lag == -1 && p.at == t - 20 * ms + 25 * ms && k.game == t - 20 * ms);
+        /* a present not known meanwhile: at its hand-over, its wait not taken (taken, the sets would be on the presents
+           again a set sooner below) */
+        p = fixed_clock(k, 0, 0, t + 25 * ms, false, false);
+        CHECK(p.lag == -1 && p.at == t + 25 * ms);
+        t += 20 * ms;
+        /* none held after it: at the hand-over still 10 sets (the wait 2 ms at most, so as from 2 ms: 21), then on the
+           presents where the hand-over is, the lag taken again, then smoothed */
+        int on_again = 0;
+        for (i = 1; i <= 30 && !on_again; i++, t += 20 * ms) {
+            p = fixed_clock(k, t, 0, t + 9 * ms, false, false);
+            if (p.lag >= 0) on_again = i;
+        }
+        CHECK(on_again == 11 && p.lag == 9 * ms && p.at == t - 20 * ms + 9 * ms && k.lag == 9 * ms);
+        p = fixed_clock(k, t, 0, t + 25 * ms, false, false);
+        CHECK(p.lag == 25 * ms && p.at == t + (9 * ms * 15 + 25 * ms) / 16);
+        /* at the game's cap, a present held 30 ms once a second (a load, a pipeline made): on the presents throughout */
+        FixedClock cap{};
+        bool all_on = true;
+        for (i = 0, t = 1000 * ms; i < 600; i++, t += 16 * ms) all_on &= fixed_clock(cap, t, i % 60 == 30 ? 30 * ms : 0,
+                                                                                    t + 5 * ms, false, false).lag >= 0;
+        CHECK(all_on);
+        /* RX_VK_FG_GAME_CLOCK=0: at the hand-over, the waits not taken either (the first set on the presents once it is
+           on again is) */
+        FixedClock off_k{};
+        bool all_off = true;
+        for (i = 0, t = 1000 * ms; i < 20; i++, t += 20 * ms)
+            all_off &= fixed_clock(off_k, t, 8 * ms, t + 25 * ms, false, true).lag == -1;
+        p = fixed_clock(off_k, t, 0, t + 25 * ms, false, false);
+        CHECK(all_off && p.lag == 25 * ms && p.at == t + 25 * ms);
+    }
+    /* which sets feed the GPU's delay back (pace_feeds): not after a game frame over 1.5 smoothed ones, on the game's
+       timeline or in the hand-overs */
+    CHECK(pace_feeds(17 * ms, 17 * ms, 17 * ms, 17 * ms));
+    CHECK(pace_feeds(24 * ms, 16 * ms, 24 * ms, 16 * ms));
+    CHECK(!pace_feeds(25 * ms, 16 * ms, 17 * ms, 17 * ms));
+    CHECK(!pace_feeds(17 * ms, 17 * ms, 25 * ms, 16 * ms));
     std::printf("PASS: a fixed multiplier's frames go out at their own times, under FIFO a refresh apart at least, and wait "
                 "only as the GPU asks\n");
 }
@@ -413,13 +801,24 @@ def check_sources(source, main_cpp):
     display = block(source, "void display_main()", where="gpu/vk/vk_framegen.cpp")
     assert re.search(r"set->shown = -1;\s*set->by_time = false;", record), \
         "framegen_record: a reused set starts without times"
-    m = re.search(r"if \(blend && set->made > 0 && fg\.game_ns > 0\) \{(.*?)\n    \}", record, re.S)
-    assert m, "framegen_record: every fixed set with a frame before and a made frame gets its times"
+    m = re.search(r"if \(blend && place\.timed && set->made > 0 && fg\.clock\.frame > 0\) \{(.*?)\n    \}", record, re.S)
+    assert m, "framegen_record: every fixed set with a frame before, a place after it and a made frame gets its times"
     body = m.group(1)
-    for part in ("fixed_dues(before, now, set->made, pace_lead(fg.game_ns, set->made) + extra, set->due);",
-                 "set->span_ns = now - before;", "set->extra_ns = extra;", "set->by_time = true;",
-                 "set->game[k] = k == set->made;"):
+    for part in ("fixed_dues(place.before, place.at, set->made, pace_lead(fg.clock.frame, set->made) + extra, set->due);",
+                 "set->frame_ns = fg.clock.frame;", "set->span_ns = place.at - place.before;",
+                 "set->hand_span_ns = now - before;", "set->hand_frame_ns = fg.game_ns;", "set->lag_ns = place.lag;",
+                 "set->extra_ns = extra;", "set->by_time = true;", "set->game[k] = k == set->made;",
+                 "set->hand_due_ns = fixed_hand_due(set->due[set->made], place.at, now);"):
         assert part in body, "framegen_record's times: " + part
+    # (on the game's timeline: the game's thread's presents, the smoothed lag later, fixed_clock; RX_VK_FG_GAME_CLOCK=0
+    # the hand-over; a hitch, framegen_record's gap, takes the lag again)
+    for part in ('getenv("RX_VK_FG_GAME_CLOCK")', "clock_off = clock_env && env_value_off(clock_env);",
+                 "const int64_t now = now_ns(), before = fg.last_at;",
+                 "const bool gap = fg.last_at && now - fg.last_at > 100000000;",
+                 "const ClockPlace place = fixed_clock(fg.clock, game_at, game_wait, now, gap, clock_off);"):
+        assert part in record, "framegen_record: a fixed set's place on the game's timeline: " + part
+    assert record.index("const bool gap = ") < record.index("fixed_clock(fg.clock") < record.index("fixed_dues("), \
+        "framegen_record: the hitch known before the set's place, the place before its times"
     assert "set->shown" not in body, "framegen_record: a fixed set keeps shown < 0; display_main decides on its times"
     assert "opts.pace" not in body, "framegen_record: the times do not depend on Frame pacing"
     assert record.index("if (auto_rate)") < record.index("fixed_dues("), "framegen_record: Auto keeps its own slots"
@@ -445,8 +844,10 @@ def check_sources(source, main_cpp):
     assert re.search(r"int64_t due = timed \? j\.set->due\[f\]", display), "display_main: each frame at its own due time"
     take = block(display, "const auto take = [&](Taken& s, const Job& j, int room, int left)", where="gpu/vk/vk_framegen.cpp")
     # (FIFO's catch-up: a set whose game frame would be shown over a refresh after its own time leaves made frames out,
-    # spread over it, and their copies; the frames shown are the ones fifo_pick picks)
-    assert "(s.first = fifo_catch_up(j.set->made, j.set->due, slot, left, fifo_refresh, now_ns())))" in take and \
+    # spread over it, and their copies; the frames shown are the ones fifo_pick picks. Its game frame held to where its
+    # hand-over puts it when its own time came before that: hand_due_ns)
+    assert "fifo_catch_up(j.set->made, j.set->due, slot, left, fifo_refresh, now_ns(), j.set->hand_due_ns)))" \
+        in take and \
         "s.shown -= s.first, stat.caught += s.first;" in take and "dev.swap_mode == VK_PRESENT_MODE_FIFO_KHR" in take and \
         "present_ahead_wanted(true, j.set->made + 1, dev.swap_spare.load(std::memory_order_relaxed)) &&" in take and \
         "fifo_refresh = s.line ? s.refresh : 0;" in take and \
@@ -478,8 +879,8 @@ def check_sources(source, main_cpp):
         "display_main: only a set whose first copy was waited for and went as it came feeds the GPU's delay back"
     assert "const int64_t at = s.ready_at ? s.ready_at : now_ns();" in feed, \
         "display_main: the copy's end as seen while the set before was shown, else now"
-    assert "j.set->span_ns * 2 <= j.set->frame_ns * 3" in feed, \
-        "display_main: a set after a long game frame does not feed it back"
+    assert "pace_feeds(j.set->span_ns, j.set->frame_ns, j.set->hand_span_ns, j.set->hand_frame_ns)" in feed, \
+        "display_main: a set after a long game frame, on the game's timeline or in the hand-overs, does not feed it back"
     # (against the set's first frame's time also when the catch-up leaves frames out: a copy takes as long whichever frame
     # it is, and the delay is the set's; against the first frame shown, 6x on 165 Hz ran the delay down to 0, the frames
     # came due before their copies and the catch-up left out a frame more a set than the refresh needed)
@@ -523,6 +924,57 @@ def check_sources(source, main_cpp):
         "retire_swapchain (which sets 3)"
 
 
+def check_game_at(replay, framegen):
+    """The game's thread's time at each present reaches framegen_record: taken as present is called, carried in the
+    present's job (held or not, and in the presents made on the game's thread), handed to both framegen_record calls. So
+    does how long that thread was held in the present (until its job is in the queue: the CPU's signal and the room
+    there), which tells fixed_clock whether the game runs below its cap."""
+    present = block(replay, "void present_tagged(const nvn_tex* t, const int crop[4], uint64_t generation) {", where="gpu/vk/vk_replay.cpp")
+    assert present.index("fps_presented();") < present.index("const int64_t game_at = bh_now();") < \
+        present.index("gf_note_present();"), \
+        "present: the game's thread's time taken as present is called (just after the FPS counter's stamp, which is first)"
+    assert "j.game_at = game_at;" in present, "present: the time in the present's job"
+    assert present.count("return do_present(t, crop, generation);") == 2 and \
+        present.index("if (!async_on()) {") < present.index("present_game_at = game_at;") < \
+        present.index("if (sync_waits_on()) {") < present.index("return do_present(t, crop, generation);"), \
+        "present: the time for both presents made on the game's thread (the one that waits for the GPU and the other)"
+    steady = "return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()" \
+             ".time_since_epoch()).count();"
+    assert re.search(r"int64_t bh_now\(\) \{\s*" + re.escape(steady), replay) and \
+        re.search(r"int64_t now_ns\(\) \{\s*" + re.escape(steady), framegen), \
+        "bh_now (vk_replay.cpp, the present's time) and now_ns (vk_framegen.cpp, the hand-over's): one clock, steady_clock " \
+        "in nanoseconds, or fixed_clock never takes a present (game_at <= now)"
+    job_struct = block(replay, "struct Job {", where="gpu/vk/vk_replay.cpp")
+    assert "int64_t game_at = 0;" in job_struct and "int64_t game_wait = 0;" in job_struct, "Job: game_at, game_wait"
+    queue = block(replay, "void enqueue(Job&& j) {", where="gpu/vk/vk_replay.cpp")
+    held = queue.index("if (j.kind == JOB_PRESENT) {")
+    assert held < queue.index("q_space.wait(lk,") < queue.index("if (j.game_at) j.game_wait = bh_now() - j.game_at;") < \
+        queue.index("q_jobs.push_back(std::move(j));"), \
+        "enqueue: a present's wait taken once there is room for it in the queue (the CPU's signal and the room both in it)"
+    room = block(queue, "if (q_presents >= presents_ahead()) {", where="gpu/vk/vk_replay.cpp enqueue")
+    wait_line = "if (j.game_at) j.game_wait = bh_now() - j.game_at;"
+    assert wait_line not in room and queue.index(room) + len(room) < queue.index(wait_line), \
+        "enqueue: the wait taken after the room's block, so a present that found room at once has its wait too (the " \
+        "CPU's signal, most of it below the cap)"
+    assert present.index("const int64_t game_at = bh_now();") < present.index("bh_signal_cv.wait_for(") < \
+        present.index("j.game_at = game_at;") < present.index("enqueue(std::move(j));"), \
+        "present: its time taken before the wait for the CPU's signal, so the wait enqueue takes counts it"
+    for job in ("held_present", "j"):
+        at = replay.index(f"present_game_at = {job}.game_at;")
+        call = replay.index("do_present(", at)
+        assert replay.startswith(f"do_present({job}.has_tex", call) and "break;" not in replay[at:call] and \
+            f"present_game_wait = {job}.game_wait;" in replay[at:call], \
+            f"replay_thread_main: the present job's time and wait handed to the do_present that job makes ({job})"
+    do = block(replay, "void do_present(const nvn_tex* t, const int crop[4], uint64_t native_generation = 0) {", where="gpu/vk/vk_replay.cpp")
+    assert do.index("const int64_t game_at = present_game_at;") < do.index("present_game_at = 0;") < \
+        do.index("framegen_record("), "do_present: the job's time, used once, before frame generation's recording"
+    assert do.index("const int64_t game_wait = present_game_wait;") < do.index("present_game_wait = 0;") < \
+        do.index("framegen_record("), "do_present: the job's wait, used once, before frame generation's recording"
+    assert do.count("framegen_record(") == 2 and \
+        do.count("present_native_pq.load(std::memory_order_relaxed), game_at, game_wait);") == 2, \
+        "do_present: both framegen_record calls get the game's thread's time and its wait"
+
+
 def check_slots(replay, internal, imgui):
     m = re.search(r"constexpr int kPresentSlotsMax = (\d+);", internal)
     assert m, "vk_internal.h: kPresentSlotsMax"
@@ -542,19 +994,22 @@ def check_slots(replay, internal, imgui):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--cxx", default="g++")
+    p.add_argument("--source", type=Path, default=ROOT, help="the checkout whose gpu/vk sources are checked")
     a = p.parse_args()
-    vk = ROOT / "gpu" / "vk"
+    vk = a.source / "gpu" / "vk"
     source = (vk / "vk_framegen.cpp").read_text(encoding="utf-8")
     main_cpp = (vk / "vk_main.cpp").read_text(encoding="utf-8")
     replay = (vk / "vk_replay.cpp").read_text(encoding="utf-8")
     internal = (vk / "vk_internal.h").read_text(encoding="utf-8")
     imgui = (vk / "vk_imgui.cpp").read_text(encoding="utf-8")
     slots_max = check_slots(replay, internal, imgui)
-    check_sources(source, main_cpp)
     fixture = (PREFIX + f"constexpr int kPresentSlotsMax = {slots_max};\n" +
+               "".join(block(source, m, where="gpu/vk/vk_framegen.cpp") + ";\n"
+                       for m in ("struct FixedClock {", "struct ClockPlace {")) +
                "\n".join(block(source, m, where="gpu/vk/vk_framegen.cpp") for m in (
-                   "void fixed_dues(", "int64_t pace_lead(", "int64_t pace_delay(", "bool fixed_on_timeline(",
-                   "int64_t fifo_slot(", "int fifo_pick(", "int fifo_catch_up(")) + "\n" +
+                   "void fixed_dues(", "ClockPlace fixed_clock(", "bool pace_feeds(", "int64_t pace_lead(",
+                   "int64_t pace_delay(", "bool fixed_on_timeline(", "int64_t fifo_slot(", "int fifo_pick(",
+                   "int fifo_catch_up(", "int64_t fixed_hand_due(")) + "\n" +
                block(replay, "int present_slots_for(", where="gpu/vk/vk_replay.cpp") + MAIN)
     with tempfile.TemporaryDirectory(prefix="framegen-fixed-pace-") as tmp:
         cpp = Path(tmp) / "fixture.cpp"
@@ -562,6 +1017,8 @@ def main():
         cpp.write_text(fixture, encoding="utf-8")
         subprocess.run([a.cxx, "-std=c++20", "-Wall", "-Wextra", "-Werror", str(cpp), "-o", str(exe)], check=True)
         subprocess.run([str(exe)], check=True)
+    check_sources(source, main_cpp)
+    check_game_at(replay, source)
 
 
 if __name__ == "__main__":

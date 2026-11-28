@@ -5169,6 +5169,8 @@ void frame_info(int64_t* replayed, int64_t* draws, int* width, int* height) {
 }
 
 uint64_t present_value = 0;   // (the present job's value, handed out as it came; 0: the next one)
+int64_t present_game_at = 0;  // (the present job's game_at, frame generation's timeline; 0: not known)
+int64_t present_game_wait = 0;  // (its game_wait: how long the game's thread was held in that present)
 struct PendingShot {
     bool on = false;
     uint64_t value = 0;
@@ -5448,6 +5450,10 @@ void do_present(const nvn_tex* t, const int crop[4], uint64_t native_generation 
         PROF(PROF_PRESENT);
         const uint64_t value = present_value ? present_value : ++q_values;
         present_value = 0;
+        const int64_t game_at = present_game_at;
+        present_game_at = 0;
+        const int64_t game_wait = present_game_wait;
+        present_game_wait = 0;
         rec_value_now = value;
         ub_first_of_recording = ub_updates.size();
         Recording& r = begin_recording(value);
@@ -5514,7 +5520,7 @@ void do_present(const nvn_tex* t, const int crop[4], uint64_t native_generation 
         const bool fg_after = !preview && framegen_on() && tex && !fg_inline;
         interpolated = !preview && framegen_on() && tex && fg_inline &&
                        framegen_record(r.cmd, texture_view(tex, t, nullptr, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample), sw,
-                                       sh, crop, present_native_pq.load(std::memory_order_relaxed));
+                                       sh, crop, present_native_pq.load(std::memory_order_relaxed), game_at, game_wait);
         texture_frame(completed());
         full_barrier(r.cmd);
         presents++;
@@ -5619,7 +5625,7 @@ void do_present(const nvn_tex* t, const int crop[4], uint64_t native_generation 
             // (its slot is free again once the next submit's value is reached: that one comes after it)
             Recording& g = begin_recording(value + 1);
             interpolated = framegen_record(g.cmd, texture_view(tex, t, nullptr, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Sample),
-                                           sw, sh, crop, present_native_pq.load(std::memory_order_relaxed));
+                                           sw, sh, crop, present_native_pq.load(std::memory_order_relaxed), game_at, game_wait);
             submit_recording(g, false);
         }
         // (frame generation at Off or Auto, where DLSS-G is not asked: its feature, if made, let go, vk_dlss.cpp)
@@ -7225,6 +7231,8 @@ struct Job {
     nvn_prog prog;
     std::chrono::steady_clock::time_point queued;
     uint64_t cap_seq = 0;       // (RX_VK_MEM_CHECK: the number of the capture made with it, for its take to match; 0: none)
+    int64_t game_at = 0;        // (a present: when the game's thread presented it, bh_now: frame generation's timeline)
+    int64_t game_wait = 0;      // (and how long it was held there, until the job was in the queue: below its cap, long)
 };
 std::mutex q_mu;
 std::condition_variable q_cv, q_space, q_idle;
@@ -7631,6 +7639,8 @@ void replay_thread_main() {
         const int64_t t0 = bh_now();
         drain(0);
         present_value = held_present.value;
+        present_game_at = held_present.game_at;
+        present_game_wait = held_present.game_wait;
         fo_present.store(held_present.value, std::memory_order_release);   // (frame overlap: its recording ends the frame)
         do_present(held_present.has_tex ? &held_present.tex : nullptr, held_present.has_crop ? held_present.crop : nullptr,
                    held_present.output_generation);
@@ -7705,6 +7715,8 @@ void replay_thread_main() {
             }
             drain(0);
             present_value = j.value;
+            present_game_at = j.game_at;
+            present_game_wait = j.game_wait;
             fo_present.store(j.value, std::memory_order_release);   // (frame overlap: its recording ends the frame)
             do_present(j.has_tex ? &j.tex : nullptr, j.has_crop ? j.crop : nullptr, j.output_generation);
             bh_shown(j.queued);
@@ -7822,6 +7834,8 @@ void enqueue(Job&& j) {
             bh_st.room_ns += bh_now() - t0, bh_st.room_n++;
         }
         q_presents++;
+        // (the CPU's signal and the room here, frame generation's fixed_clock: the game below its cap or at it)
+        if (j.game_at) j.game_wait = bh_now() - j.game_at;
     }
     if (j.kind == JOB_SUBMIT || j.kind == JOB_PRESENT) j.value = ++q_values;
     if (j.kind == JOB_SUBMIT) gf_note_value(j.value);
@@ -7971,6 +7985,9 @@ void submit(const uint64_t* handles, int n) {
 }
 void present_tagged(const nvn_tex* t, const int crop[4], uint64_t generation) {
     fps_presented();   // (the FPS counter: the game's frame ends here, on its presenting thread)
+    // (frame generation's timeline: the game's own presents, before the CPU's signal and the replay put them off,
+    // vk_framegen.cpp fixed_clock)
+    const int64_t game_at = bh_now();
 #ifdef TRACY_ENABLE
     HT_SCOPE("rx present (game thread)");
 #endif
@@ -7980,6 +7997,7 @@ void present_tagged(const nvn_tex* t, const int crop[4], uint64_t generation) {
     if (!async_on()) {
         std::lock_guard order(sync_order_mu);
         ReplayPin pin;   // (the frame's last replays and the present on the replay's core)
+        present_game_at = game_at;
         if (sync_waits_on()) {
             drain(0);   // (the frame's work whole before it is shown)
             update_blocked();
@@ -8017,6 +8035,7 @@ void present_tagged(const nvn_tex* t, const int crop[4], uint64_t generation) {
     j.output_generation = generation;
     if (t) j.tex = *t, j.has_tex = true;
     if (crop) std::memcpy(j.crop, crop, sizeof j.crop), j.has_crop = true;
+    j.game_at = game_at;
     enqueue(std::move(j));
 }
 void texture_released_of(const nvn_tex* t) {

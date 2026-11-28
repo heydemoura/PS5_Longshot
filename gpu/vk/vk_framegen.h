@@ -23,9 +23,12 @@ int framegen_now();
 /// framegen_queue, so a set this present filled is the display thread's by then
 void framegen_idle(bool recorded);
 /// Records the frame's processing into the present's recording (src: the window texture's view, sw x sh, the crop
-/// x, y, w, h; native_pq: the encoding of that captured present); false when interpolation cannot run
-/// (the present goes to the window as without it)
-bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t sh, const int crop[4], bool native_pq);
+/// x, y, w, h; native_pq: the encoding of that captured present; game_at: when the game's thread presented the frame,
+/// steady clock ns, 0 when not known: the game's timeline a fixed multiplier's set is put on, fixed_clock; game_wait: how
+/// long the game's thread was held in that present, ns, which tells whether the game runs below its cap); false when
+/// interpolation cannot run (the present goes to the window as without it)
+bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t sh, const int crop[4], bool native_pq,
+                     int64_t game_at = 0, int64_t game_wait = 0);
 /// (longshot) Who made the made frames of the sets shown lately (the last 64, about a second at 60): what the Insert menu's
 /// Frame generation by row and the FPS counter name. None: none made (Off, nothing to blend from, none for half a second).
 /// DlssPaused: DLSS FG chosen, and the sets were the game's frames alone, with no Upscaler picture to make frames from (the
