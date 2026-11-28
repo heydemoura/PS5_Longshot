@@ -34,7 +34,10 @@ static inline DWORD hos_game_path_w(wchar_t *buf, DWORD size) {
     if (root + 10 >= sizeof probe / sizeof probe[0]) return n;
     wmemcpy(probe, buf, root);
     wcscpy(probe + root, L"image.bin");
-    if (GetFileAttributesW(probe) == INVALID_FILE_ATTRIBUTES) return n;
+    if (GetFileAttributesW(probe) == INVALID_FILE_ATTRIBUTES) {
+        wcscpy(probe + root, L"data/image.bin");
+        if (GetFileAttributesW(probe) == INVALID_FILE_ATTRIBUTES) return n;
+    }
     wmemmove(buf + root, name, wcslen(name) + 1);
     return (DWORD)wcslen(buf);
 }
@@ -71,11 +74,26 @@ static inline DWORD hos_game_path_a(char *buf, DWORD size) {
     if (root + 10 >= sizeof probe) return n;
     memcpy(probe, buf, root);
     memcpy(probe + root, "image.bin", 10);
-    if (access(probe, F_OK) != 0) return n;
+    if (access(probe, F_OK) != 0) {
+        memcpy(probe + root, "data/image.bin", sizeof "data/image.bin");
+        if (access(probe, F_OK) != 0) return n;
+    }
     memmove(buf + root, name, strlen(name) + 1);
     return (DWORD)strlen(buf);
 }
 #endif
+
+/* A structured build carries the image in data/. All callers, including a directly
+   started game, make the same choice independently of the current directory. */
+static inline int hos_organized_build(void) {
+    char path[HOS_PATH_CAP];
+    DWORD n = hos_game_path_a(path, HOS_PATH_CAP);
+    if (!n || n >= HOS_PATH_CAP) return 0;
+    while (n && path[n-1] != '/' && path[n-1] != 92) --n;
+    if (n + sizeof "data/image.bin" > sizeof path) return 0;
+    memcpy(path+n, "data/image.bin", sizeof "data/image.bin");
+    return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+}
 
 /* (longshot) The window's title: the game's own name, "The Legend of Zelda: Ocarina of Time (Longshot)", the first line of
    longshot_title.txt in the game folder (UTF-8), which the builder writes from the game's .nup (builder/crates/game-files/src/title.rs); fallback
@@ -92,7 +110,7 @@ static inline const char *hos_game_title(const char *fallback) {
         DWORD n = hos_game_path_w(path, HOS_PATH_CAP);
         if (n && n < HOS_PATH_CAP) {
             while (n && path[n - 1] != L'\\' && path[n - 1] != L'/') n--;
-            wcscpy(path + n, L"longshot_title.txt");
+            wcscpy(path + n, hos_organized_build() ? L"data/longshot_title.txt" : L"longshot_title.txt");
             f = _wfopen(path, L"rb");
         }
 #else
@@ -100,7 +118,7 @@ static inline const char *hos_game_title(const char *fallback) {
         DWORD n = hos_game_path_a(path, HOS_PATH_CAP);
         if (n && n < HOS_PATH_CAP) {
             while (n && path[n - 1] != '/') n--;
-            strcpy(path + n, "longshot_title.txt");
+            strcpy(path + n, hos_organized_build() ? "data/longshot_title.txt" : "longshot_title.txt");
             f = fopen(path, "rb");
         }
 #endif

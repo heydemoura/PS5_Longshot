@@ -135,8 +135,10 @@ impl GameFiles for ReadStage {
                 std::fs::create_dir_all(staging).at(staging)?;
                 // (the game folder's own index, of this .nup, taken as the staged one's start: a work folder made
                 // anew, or the first build that stages it, indexes nothing again)
-                if !staging.join(romfs::INDEX_FILE).is_file() && out.join(romfs::INDEX_FILE).is_file() {
-                    let _ = romfs::reuse(out, staging, &n);
+                if !staging.join(romfs::INDEX_FILE).is_file()
+                    && build_core::game_layout::data(out).join(romfs::INDEX_FILE).is_file()
+                {
+                    let _ = romfs::reuse(&build_core::game_layout::data(out), staging, &n);
                 }
                 let (done, kept) = romfs::index_or_keep(&n, t, staging, &mut |_| {})?;
                 if kept {
@@ -219,7 +221,7 @@ impl GameFiles for ReadStage {
 /// title, or the first build that stages it) as the game folder `out` has them.
 pub fn title_of(staging: &Path, out: &Path) -> (Option<String>, Option<Vec<u8>>) {
     match title::kept(staging) {
-        (None, None) => title::kept(out),
+        (None, None) => title::kept(&build_core::game_layout::data(out)),
         kept => kept,
     }
 }

@@ -42,7 +42,7 @@ static const char *desired_language(void) {
 #if !defined(__EMSCRIPTEN__)   /* (linux too: host/posix) */
         DWORD n = hos_game_path_a(path, 260);
         while (n > 0 && path[n - 1] != 92 && path[n - 1] != 47) n--;
-        snprintf(path + n, sizeof path - n, "language.txt");
+        snprintf(path + n, sizeof path - n, "%s", hos_organized_build() ? "config/language.txt" : "language.txt");
 #endif
         FILE *f = fopen(path, "r");
         if (f) {

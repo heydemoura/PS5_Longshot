@@ -2386,12 +2386,6 @@ struct Seed {
     std::vector<std::vector<uint32_t>> programs;
     std::unordered_map<uint64_t, uint32_t> index;   // (a stage by its code key: the pipeline state list's programs)
 } seed;
-std::string beside_exe(const char* name) {
-    char exe[MAX_PATH];
-    const DWORD n = game_module_path(exe, MAX_PATH);
-    std::string dir(exe, n);
-    return dir.substr(0, dir.find_last_of("\\/") + 1) + name;
-}
 Code stage_of_seed(const SeedStage& st) {
     return parse_code(seed.blob.data() + st.control, std::vector<uint8_t>(seed.blob.begin() + (ptrdiff_t)st.code,
                                                                           seed.blob.begin() + (ptrdiff_t)st.code + st.end));
@@ -2404,7 +2398,7 @@ void seed_stage_failed(const Code& c, uint64_t program) {
 }
 } // namespace
 
-std::string seed_path() { return beside_exe("longshot_shaders.bin"); }
+std::string seed_path() { return data_file("longshot_shaders.bin"); }
 
 size_t seed_open() {
     if (FILE* f = fopen(seed_path().c_str(), "rb")) {

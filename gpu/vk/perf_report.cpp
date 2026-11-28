@@ -82,7 +82,7 @@ int64_t l_failed = 0;   // (the renderer's counts at the summary before: at the 
 uint64_t l_swap = 0;
 
 bool ticked(const std::filesystem::path& dir) {
-    std::ifstream f(dir / "longshot_perf.ini");
+    std::ifstream f(dir / (organized_game() ? "config/longshot_perf.ini" : "longshot_perf.ini"));
     bool on = false;
     for (std::string line; std::getline(f, line);)
         if (!line.compare(0, 5, "send=")) on = atoi(line.c_str() + 5) == 1;
@@ -232,7 +232,7 @@ pr::SendResult send_summary(const std::string& name) {
         lk.lock();
     }
     if (send_url.empty()) return pr::SendResult::None;
-    const auto pending = folder / "perf_pending";
+    const auto pending = folder / (organized_game() ? "diagnostics/perf_pending" : "perf_pending");
     const auto path = pending / (name + ".json"), headers = pending / (name + ".headers.txt"),
                answer = pending / (name + ".answer.txt");
     std::error_code ec;
@@ -242,7 +242,7 @@ pr::SendResult send_summary(const std::string& name) {
     fsys::remove(headers, ec), fsys::remove(answer, ec);
     if (!pr::drop_after(result)) return result;   // (busy or no answer: kept)
     if (result == pr::SendResult::Sent && keep_sent) {
-        const auto sent = folder / "perf_sent";
+        const auto sent = folder / (organized_game() ? "diagnostics/perf_sent" : "perf_sent");
         fsys::create_directory(sent, ec);
         fsys::rename(path, sent / (name + ".json"), ec);   // (the copy is the file, exactly as it was sent)
         if (!ec) return result;
@@ -257,7 +257,7 @@ void clean_pending() {
     namespace fsys = std::filesystem;
     std::unique_lock<std::mutex> lk(send_mu, std::try_to_lock);
     if (!lk.owns_lock()) return;   // (a curl still has its header/answer files: clean them at the next start)
-    const auto dir = folder / "perf_pending";
+    const auto dir = folder / (organized_game() ? "diagnostics/perf_pending" : "perf_pending");
     const auto ends = [](const std::string& s, const char* suffix) {
         const std::string t = suffix;
         return s.size() >= t.size() && s.compare(s.size() - t.size(), t.size(), t) == 0;
@@ -275,7 +275,7 @@ void clean_pending() {
 void send_pending(int limit = kMaxPending, const std::string& skip = "") {
     namespace fsys = std::filesystem;
     if (send_url.empty()) return;
-    const auto dir = folder / "perf_pending";
+    const auto dir = folder / (organized_game() ? "diagnostics/perf_pending" : "perf_pending");
     std::vector<std::string> names;
     std::error_code ec;
     for (fsys::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
@@ -292,7 +292,7 @@ void send_pending(int limit = kMaxPending, const std::string& skip = "") {
 
 void write_summary(const std::filesystem::path& dir, const std::string& name, const std::string& json) {
     namespace fsys = std::filesystem;
-    const fsys::path pending = dir / "perf_pending";
+    const fsys::path pending = dir / (organized_game() ? "diagnostics/perf_pending" : "perf_pending");
     std::error_code ec;
     {
         int waiting = 0;
@@ -400,7 +400,7 @@ bool perf_report_init() {
             if (line.compare(0, 7, "source=") == 0) stamp_source = line.substr(7);
             at = end + 1;
         }
-        std::ifstream choice(folder / "longshot_perf.ini");
+        std::ifstream choice(folder / (organized_game() ? "config/longshot_perf.ini" : "longshot_perf.ini"));
         for (std::string line; std::getline(choice, line);)
             if (line == "keep_sent=0") keep_sent = false;
         if (send_url.empty()) logf("vk: performance statistics on, but no perf_reports= in longshot_version.txt: summaries stay in perf_pending");

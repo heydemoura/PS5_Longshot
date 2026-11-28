@@ -117,7 +117,9 @@ fn env_switch(env: Env<'_>, name: &str) -> Option<bool> {
 }
 
 fn choices(folder: &Path) -> BTreeMap<String, String> {
-    let text = std::fs::read(folder.join(CHOICE)).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+    let text = std::fs::read(build_core::game_layout::config(folder).join(CHOICE))
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
     text.lines().filter_map(|l| l.trim().split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect()
 }
 
@@ -141,7 +143,7 @@ pub fn keep_sent_choice(folder: &Path) -> bool {
 
 /// Deletes `sub`'s files whose names end with one of `ends`; nothing raised.
 fn remove_all(folder: &Path, sub: &str, ends: &[&str]) {
-    let Ok(dir) = std::fs::read_dir(folder.join(sub)) else { return };
+    let Ok(dir) = std::fs::read_dir(build_core::game_layout::diagnostics(folder).join(sub)) else { return };
     for e in dir.flatten() {
         if ends.iter().any(|end| e.file_name().to_string_lossy().ends_with(end)) {
             let _ = std::fs::remove_file(e.path());
@@ -155,9 +157,9 @@ const SENT_FILES: [&str; 2] = [".json", ".tmp"];
 /// The tick, saved for the game (it reads it at its start), and whether copies of what was sent are kept (off empties
 /// `perf_sent/`). The tick off deletes what is waiting, and the copies.
 pub fn set_tick(folder: &Path, on: bool, keep_sent: bool) -> std::io::Result<()> {
-    let path = folder.join(CHOICE);
+    let path = build_core::game_layout::config(folder).join(CHOICE);
     if on {
-        let tmp = folder.join(format!("{CHOICE}.tmp"));
+        let tmp = build_core::game_layout::config(folder).join(format!("{CHOICE}.tmp"));
         std::fs::write(&tmp, format!("send=1\n{}", if keep_sent { "" } else { "keep_sent=0\n" }))?;
         build_core::fsx::rename(&tmp, &path)?;
         if !keep_sent {
@@ -181,7 +183,7 @@ fn order(name: &str) -> (u64, u64) {
 }
 
 fn listed(folder: &Path, sub: &str) -> Vec<String> {
-    let Ok(dir) = std::fs::read_dir(folder.join(sub)) else { return Vec::new() };
+    let Ok(dir) = std::fs::read_dir(build_core::game_layout::diagnostics(folder).join(sub)) else { return Vec::new() };
     dir.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".json")).collect()
 }
 
@@ -239,7 +241,11 @@ pub fn build_facts(folder: &Path) -> (String, bool, String) {
     let mut source = String::new();
     'logs: for dir in ["logs", ""] {
         for name in LOG_NAMES {
-            let path = if dir.is_empty() { folder.join(name) } else { folder.join(dir).join(name) };
+            let path = if dir.is_empty() {
+                folder.join(name)
+            } else {
+                build_core::game_layout::diagnostics(folder).join(dir).join(name)
+            };
             let Ok(mut f) = std::fs::File::open(&path) else { continue };
             let mut head = vec![0; 4096];
             let n = f.read(&mut head).unwrap_or(0);
@@ -391,7 +397,7 @@ pub fn post(body: &[u8], url: &str, timeout: u64) -> Answer {
 }
 
 fn pending(folder: &Path, name: &str) -> PathBuf {
-    folder.join(PENDING).join(name)
+    build_core::game_layout::diagnostics(folder).join(PENDING).join(name)
 }
 
 /// `(when the relay may be asked again, the wait that set it)`: `(0, 0)` when it wasn't busy.
@@ -707,7 +713,7 @@ fn keep_copy(folder: &Path, env: Env<'_>, name: &str, body: &[u8]) {
     if !ticked(folder) || !keeping_sent(folder, env) {
         return;
     }
-    let dir = folder.join(SENT);
+    let dir = build_core::game_layout::diagnostics(folder).join(SENT);
     let tmp = dir.join(format!("{name}.tmp"));
     let ok = std::fs::create_dir_all(&dir).is_ok()
         && std::fs::write(&tmp, body).is_ok()
@@ -719,7 +725,7 @@ fn keep_copy(folder: &Path, env: Env<'_>, name: &str, body: &[u8]) {
 
 /// `perf_sent/` down to the [`MAX_PENDING`] copies written last (by when they were written there, not by their names).
 fn prune_sent(folder: &Path) {
-    let dir = folder.join(SENT);
+    let dir = build_core::game_layout::diagnostics(folder).join(SENT);
     let mut names: Vec<(SystemTime, String)> = listed(folder, SENT)
         .into_iter()
         .map(|n| (std::fs::metadata(dir.join(&n)).and_then(|m| m.modified()).unwrap_or(UNIX_EPOCH), n))

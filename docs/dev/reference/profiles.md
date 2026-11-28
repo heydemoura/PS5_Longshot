@@ -99,3 +99,12 @@ itself, `mods/`, `saves/save`, `saves/save-work`) and tries each for writing. On
 the `profile_unwritable` error (an event with `--output json`, a message box with `--output user`, exit status 121) names
 the folder and why, and the game is not started. A saves folder the game still can't use is a plain fatal error of the
 game's, never a fall back to another profile's saves.
+
+### Launcher-managed installations
+
+Steam starts the builder in the chosen installation with `play --profile-id <id>`.
+The launcher writes `launcher-instance.json` beside that executable. Format 1 records
+the absolute `profiles` and `cache` directories and the installation’s `upscalers`
+array. Managed play reads these on every start and leaves builder updates to the
+launcher. The profile directory supplies the game source, saves and player settings.
+Standalone builders continue to accept a profile directory via `--profile`.

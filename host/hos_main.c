@@ -621,7 +621,7 @@ static void recover_writes(void) {
     const DWORD len = hos_game_path_a(path, HOS_PATH_CAP);
     char *slash = len ? strrchr(path, SEP) : NULL;
     if (slash) {
-        snprintf(slash + 1, (size_t)(path + HOS_PATH_CAP - slash - 1), "language.txt");
+        snprintf(slash + 1, (size_t)(path + HOS_PATH_CAP - slash - 1), "%s", hos_organized_build() ? "config/language.txt" : "language.txt");
         hos_atomic_remove_stale(path);
     }
     if (hos_options_file()[0]) hos_atomic_remove_stale(hos_options_file());
@@ -682,7 +682,7 @@ static void load_longshot_env(void) {
     } else {
         DWORD n = hos_game_path_a(path, HOS_PATH_CAP);
         while (n && path[n - 1] != 92 && path[n - 1] != 47) n--;
-        memcpy(path + n, "longshot_env.txt", 17);
+        snprintf(path+n, sizeof path-n, "%s", hos_organized_build() ? "config/longshot_env.txt" : "longshot_env.txt");
     }
     FILE *f = fopen(path, "r");
     if (!f) return;
@@ -1042,9 +1042,11 @@ static int game_main(int argc, char **argv) {
             char path[HOS_PATH_CAP + 32];
             DWORD n = hos_game_path_a(path, HOS_PATH_CAP);
             while (n && path[n - 1] != 92 && path[n - 1] != 47) n--;
-            if (n && n + 5 < HOS_PATH_CAP) {   /* (its logs/, which hos_game_layout made; else beside the game, as before) */
-                memcpy(path + n, "logs", 5);
-                if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) path[n + 4] = path[n - 1], n += 5;
+            const char *log_dir = hos_organized_build() ? "diagnostics/logs" : "logs";
+            const size_t log_len = strlen(log_dir);
+            if (n && n + log_len + 1 < HOS_PATH_CAP) {   /* (its logs/, which hos_game_layout made; else beside the game, as before) */
+                memcpy(path + n, log_dir, log_len + 1);
+                if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) path[n + log_len] = path[n - 1], n += (DWORD)log_len + 1;
             }
             memcpy(path + n, "longshot_log.txt", 17);
             hos_crash_record_prepare(path);   /* recovery before rotation; keep this run's actual destination */
@@ -1139,7 +1141,7 @@ static int game_main(int argc, char **argv) {
         if (slash) {
             *slash = 0;
             SetCurrentDirectoryA(dir);
-            snprintf(beside_image, HOS_PATH_CAP, "%s" SEP_S "image.bin", dir);
+            snprintf(beside_image, HOS_PATH_CAP, "%s" SEP_S "%s", dir, hos_organized_build() ? "data/image.bin" : "image.bin");
             snprintf(beside_romfs, HOS_PATH_CAP, "%s" SEP_S "romfs", dir);
             snprintf(beside_user, HOS_PATH_CAP, "%s" SEP_S "user", dir);
             if (GetFileAttributesA(beside_image) != INVALID_FILE_ATTRIBUTES) {

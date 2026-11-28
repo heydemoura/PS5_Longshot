@@ -2423,7 +2423,7 @@ void bug_report_save() {
     in.version = LONGSHOT_VERSION;
     in.gpu = device_report_text();
     in.options = changed_rows_text(in.pc_options);
-    in.game_dir = game_folder_path();   // (its logs/ and bug-reports/: vk_paths.h)
+    in.game_dir = game_folder_path() + (organized_game() ? "diagnostics/" : "");   // (its logs/ and bug-reports/: vk_paths.h)
     in.log = [](const char* line) { logf("%s", line); };
     in.ask_picture = bug_report_picture;
     logf("menu: bug report asked for");

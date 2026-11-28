@@ -137,6 +137,48 @@ fn split_args(args: &[String]) -> PlayArgs {
     p
 }
 
+/// Launcher-managed play uses the installation beside this executable. Resolve the
+/// profile before starting update checks or creating any profile directories.
+fn managed_play(exe: &Path, id: &str) -> Result<(PathBuf, PathBuf, Vec<Upscaler>), String> {
+    if !(id == "default"
+        || id.strip_prefix("p-").is_some_and(|suffix| {
+            suffix.len() == 8 && suffix.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }))
+    {
+        return Err("Invalid launcher profile ID".into());
+    }
+    let file = exe.parent().ok_or("Missing installation folder")?.join("launcher-instance.json");
+    let settings: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&file).map_err(|e| format!("Cannot read {}: {e}", file.display()))?)
+            .map_err(|e| e.to_string())?;
+    if settings["format"] != 1 {
+        return Err("Unsupported launcher instance settings".into());
+    }
+    let path = |key: &str| {
+        settings[key]
+            .as_str()
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .ok_or_else(|| format!("Missing absolute {key} path"))
+    };
+    let profile = path("profiles")?.join(id);
+    if !profile.join("profile.json").is_file() {
+        return Err(format!("Profile {id} is no longer installed"));
+    }
+    let names = settings["upscalers"]
+        .as_array()
+        .ok_or("Missing installation upscalers")?
+        .iter()
+        .map(|v| v.as_str().ok_or("Invalid installation upscaler"))
+        .collect::<Result<Vec<_>, _>>()?;
+    let modules = if names.is_empty() {
+        Vec::new()
+    } else {
+        Upscaler::parse_list(&names.join(",")).map_err(|e| e.to_string())?
+    };
+    Ok((profile, path("cache")?, modules))
+}
+
 /// The version folder of the program at `exe` (its own folder) and the profile it plays: `--profile`'s (absolute),
 /// else the default selected by the version layout.
 pub(crate) fn places(exe: &Path, asked: Option<&Path>) -> (PathBuf, PathBuf) {
@@ -620,13 +662,36 @@ pub fn run_with(
     }
     let env = env.as_slice();
     // (a portable copy's daily update check, in the background; none with --no-self-update: a launcher's version)
-    crate::self_update::in_background(exe, release, &mut args);
+    let options_end = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let managed = if let Some(pos) = args[..options_end].iter().position(|a| a == "--profile-id") {
+        let result = args
+            .get(pos + 1)
+            .filter(|_| pos + 1 < options_end)
+            .ok_or_else(|| "Missing launcher profile ID".to_owned())
+            .and_then(|id| managed_play(exe, id));
+        match result {
+            Ok(settings) => {
+                args.drain(pos..pos + 2);
+                Some(settings)
+            }
+            Err(error) => {
+                say(&error, true, true);
+                return FAILED;
+            }
+        }
+    } else {
+        None
+    };
+    if managed.is_none() {
+        crate::self_update::in_background(exe, release, &mut args);
+    }
     crate::after::set_builder(release, builder);
     let PlayArgs { game, upscalers, profile, cache, rest } = split_args(&args);
+    let cache = managed.as_ref().map(|m| &m.1).or(cache.as_ref());
     if let Some(c) = cache {
         build_driver::set_flag("LONGSHOT_CACHE", &c.to_string_lossy());
     }
-    let (version, profile) = places(exe, profile.as_deref());
+    let (version, profile) = places(exe, managed.as_ref().map(|m| m.0.as_path()).or(profile.as_deref()));
     // (one copy per profile: held while it builds and while the game runs; a second start stops here, single.rs)
     let _held = match crate::single::hold(&profile) {
         Ok(held) => held,
@@ -641,13 +706,17 @@ pub fn run_with(
     };
     // (--output user: the builder's picker of the player's .nup)
     let pick = crate::after::pick;
-    let p = match profile_for(&profile, game.as_deref(), upscalers.as_deref(), None, &pick) {
-        Ok(p) => p,
-        Err((status, text)) => {
-            say(&text, true, true);
-            return status;
-        }
-    };
+    let mut p =
+        match profile_for(&profile, game.as_deref(), upscalers.as_deref().filter(|_| managed.is_none()), None, &pick) {
+            Ok(p) => p,
+            Err((status, text)) => {
+                say(&text, true, true);
+                return status;
+            }
+        };
+    if let Some((_, _, modules)) = managed {
+        p.upscalers = modules;
+    }
     mods_need_import(&profile);
     // (a crash record of an earlier run nobody showed: shown first)
     for folder in crate::after::game_folders(&version) {

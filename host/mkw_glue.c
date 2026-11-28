@@ -341,6 +341,10 @@ void hos_crash_record_prepare(const char *log_path) {
     if (!n) return;
     path[n] = 0;
     const char *hos_version(void);
+    if (hos_organized_build()) {
+        if (n + sizeof "diagnostics" > sizeof path) return;
+        memcpy(path+n, "diagnostics", sizeof "diagnostics");
+    }
     hos_crash_record_start(path, hos_version(), log_path);
 }
 

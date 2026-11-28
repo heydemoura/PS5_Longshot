@@ -2583,7 +2583,7 @@ struct StateRec2 {
 static_assert(sizeof(StateRec2) == 552 && std::is_trivially_copyable_v<StateRec2>, "the state list's record is a file format");
 std::string state_list_path(const char* name) {
     // (the shipped list is the build's, beside the game; the ones play adds to are this PC's, in the game folder's cache/)
-    return strstr(name, "_shipped") ? game_folder_path() + name : cache_path(name);
+    return strstr(name, "_shipped") ? data_file(name) : cache_path(name);
 }
 template <class R>
 uint64_t state_hash(const R& r) {
@@ -11946,7 +11946,7 @@ bool compile_level_all() {
             why = "RX_VK_COMPILE_SHADERS";
         } else {
             std::string ini = game_module_string();
-            ini = ini.substr(0, ini.find_last_of("\\/") + 1) + "longshot_options.ini";
+            ini = ini.substr(0, ini.find_last_of("\\/") + 1) + (organized_game() ? "config/build.ini" : "longshot_options.ini");
             if (FILE* f = fopen(ini.c_str(), "r")) {
                 char line[80];
                 while (fgets(line, sizeof line, f))

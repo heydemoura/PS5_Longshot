@@ -367,7 +367,7 @@ void hos_display_loop(void) {
         char png[MAX_PATH];
         DWORD n = hos_game_path_a(png, MAX_PATH);
         while (n && png[n - 1] != '/') n--;
-        snprintf(png + n, sizeof png - n, "longshot.png");
+        snprintf(png + n, sizeof png - n, "%s", hos_organized_build() ? "data/longshot.png" : "longshot.png");
         hos_sdl_icon(window, png);
     }
     refresh_monitors();

@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 /// `verify` never checks, repairs nor counts it as extra. The saves (`user/`), the mods (`mods/`, `mods.json`, the
 /// mods' own cache), the settings (`longshot_options.ini`, `language.txt`, `longshot_env.txt`, the mouse's), the
 /// caches and logs the game makes (`cache/`, `logs/`, its bug reports), the performance statistics.
-pub const USER_DATA: [&str; 15] = [
+pub const USER_DATA: [&str; 17] = [
+    "config",
+    "diagnostics",
     "user",
     "mods",
     "mods.json",
@@ -176,6 +178,7 @@ pub fn verify(out: &Path, jobs: usize) -> Result<Verified> {
 /// Where a copy of the game folder's `rel` may still be in work folder `work`: the finish's assets as made
 /// (`finish/`), the compile's outputs (`build/`: the game, the renderer, their libraries), the image (`image/`).
 fn copies(work: &Path, rel: &str) -> Vec<PathBuf> {
+    let rel = rel.strip_prefix("data/").unwrap_or(rel);
     let mut at = vec![work.join("finish").join(rel)];
     if !rel.contains('/') {
         at.push(work.join("build").join(rel));

@@ -35,10 +35,10 @@ impl Paths {
     pub fn of_game(game: &Path) -> Paths {
         Paths {
             game: game.to_path_buf(),
-            reports: game.join("bug-reports"),
-            log: Some(game.join("logs").join("longshot_log.txt")),
+            reports: build_core::game_layout::diagnostics(game).join("bug-reports"),
+            log: Some(build_core::game_layout::diagnostics(game).join("logs").join("longshot_log.txt")),
             options: None,
-            crash_ini: game.join("longshot_crash.ini"),
+            crash_ini: build_core::game_layout::config(game).join("longshot_crash.ini"),
             extra: Vec::new(),
         }
     }
@@ -81,7 +81,13 @@ impl Paths {
 
     /// The run's options file: the one given, else the game folder's.
     pub fn options_file(&self) -> PathBuf {
-        self.options.clone().unwrap_or_else(|| self.game.join("longshot_options.ini"))
+        self.options.clone().unwrap_or_else(|| {
+            if build_core::game_layout::organized(&self.game) {
+                self.game.join("config/settings.ini")
+            } else {
+                self.game.join("longshot_options.ini")
+            }
+        })
     }
 
     /// The folder Open the log folder opens: the log's, else the game folder's `logs/`.
@@ -90,7 +96,7 @@ impl Paths {
             .or(self.log.as_deref())
             .and_then(Path::parent)
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| self.game.join("logs"))
+            .unwrap_or_else(|| build_core::game_layout::diagnostics(&self.game).join("logs"))
     }
 }
 

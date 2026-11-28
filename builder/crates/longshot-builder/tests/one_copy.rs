@@ -35,3 +35,34 @@ fn a_second_play_of_a_held_profile_is_refused_and_other_profiles_play() {
     assert!(!ProfileLock::held(&ann), "and the lock went with that process");
     std::fs::remove_dir_all(&d).unwrap();
 }
+
+#[test]
+fn managed_builder_resolves_the_named_profile_from_its_own_installation() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("managed-one-copy");
+    std::fs::create_dir_all(&dir).unwrap();
+    let builder = dir.join(if cfg!(windows) { "Longshot.exe" } else { "Longshot.x86_64" });
+    std::fs::copy(env!("CARGO_BIN_EXE_longshot-builder"), &builder).unwrap();
+    let profiles = dir.join("profiles");
+    let profile = profiles.join("p-12345678");
+    std::fs::create_dir_all(&profile).unwrap();
+    std::fs::write(profile.join("profile.json"), "{}").unwrap();
+    std::fs::write(
+        dir.join("launcher-instance.json"),
+        serde_json::json!({"format":1,"profiles":profiles,"cache":dir.join("cache"),"upscalers":["dlss"]}).to_string(),
+    )
+    .unwrap();
+    let held = ProfileLock::take(&profile).unwrap().unwrap();
+    let run = |id| {
+        std::process::Command::new(&builder)
+            .args(["play", "--profile-id", id, "--output", "json"])
+            .output()
+            .unwrap()
+            .status
+            .code()
+    };
+    assert_eq!(run("p-12345678"), Some(123));
+    assert_eq!(run("../p-12345678"), Some(121));
+    assert_eq!(run("default"), Some(121));
+    drop(held);
+    std::fs::remove_dir_all(dir).unwrap();
+}

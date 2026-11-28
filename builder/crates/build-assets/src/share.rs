@@ -215,7 +215,7 @@ pub fn find_mods(folder: &Path) -> Vec<String> {
 }
 
 fn log_lines(folder: &Path) -> Vec<String> {
-    for d in [folder.join("logs"), folder.to_path_buf(), folder.join("bin")] {
+    for d in [build_core::game_layout::diagnostics(folder).join("logs"), folder.to_path_buf(), folder.join("bin")] {
         if let Ok(mut f) = std::fs::File::open(d.join("longshot_log.txt")) {
             let mut buf = Vec::new();
             let _ = std::io::Read::read_to_end(&mut std::io::Read::take(&mut f, 4 << 20), &mut buf);

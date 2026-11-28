@@ -110,6 +110,15 @@ static int game_dir(char *out, size_t cap) {   /* the game folder, with its sepa
 
 /* the game folder's cache/prompts/, made, with its separator: what this player's face and controls make goes there. 0 when it
    cannot be made: then nothing is written (not into the current folder) and the game keeps its own icons */
+static int asset_dir(char *out, size_t cap) {
+    if (!game_dir(out, cap)) return 0;
+    if (!hos_organized_build()) return 1;
+    size_t n = strlen(out);
+    if (n + sizeof "data/" > cap) return 0;
+    memcpy(out+n, "data/", sizeof "data/");
+    return 1;
+}
+
 static int made_dir(char *out, size_t cap) {
     char game[MAX_PATH];
     if (!game_dir(game, sizeof game)) return 0;
@@ -421,7 +430,7 @@ static int game_table(const char *key, char *out, size_t cap) {
    fits; 0 when the game folder has no prompts' font or the RomFS no font of its own (then no font is served) */
 uint32_t hos_prompts_font_entry(uint32_t entry) {
     char dir[MAX_PATH], path[MAX_PATH];
-    if (!game_dir(dir, sizeof dir) || !hos_romfs_ready()) return 0;
+    if (!asset_dir(dir, sizeof dir) || !hos_romfs_ready()) return 0;
     snprintf(path, sizeof path, "%sprompts/External.bfotf", dir);
     FILE *f = fopen(path, "rb");
     long ours = -1;
@@ -545,7 +554,7 @@ static int setup(char *dir, size_t cap, int *face) {
     static int f;
     if (InterlockedCompareExchange(&setup_state, 1, 0) == 0) {
         char path[MAX_PATH];
-        int ok = game_dir(d, sizeof d);
+        int ok = asset_dir(d, sizeof d);
         if (ok) {
             snprintf(path, sizeof path, "%sprompts", d);
             ok = GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
