@@ -836,9 +836,11 @@ bool chain_evaluate(VkCommandBuffer cmd, const TemporalFrame& f) {
         logf("vk: fsr3 on the chain: the scene's projection is not one FSR takes");
         return false;
     }
-    if (!f.color.view || !f.depth.view || !f.motion.view || !f.output.image || f.output.format != VK_FORMAT_R16G16B16A16_SFLOAT)
-        return false;
     const bool direct_out = f.output.view != VK_NULL_HANDLE && (f.output.usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0;
+    const bool output_format_ok = f.output.format == VK_FORMAT_R16G16B16A16_SFLOAT ||
+                                  (f.output.format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && direct_out);
+    if (!f.color.view || !f.depth.view || !f.motion.view || !f.output.image || !output_format_ok)
+        return false;
     fsr3::Inputs ai;
     ai.color = f.color.view, ai.depth = f.depth.view, ai.motion = f.motion.view;
     if (direct_out) ai.output = f.output.view;

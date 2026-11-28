@@ -41,7 +41,9 @@
 #include "shaders/fg_flow_comp_spv.h"
 #include "shaders/fg_hud_comp_spv.h"   // (AMD FSR 3.1's interpolation source with the HUD marked: hud_source)
 #include "shaders/fg_hud_composite_comp_spv.h"   // (the HUD over FSR 3.1's made frames: fsr3fi_frames)
+#include "shaders/fg_hud_composite_rgba8_comp_spv.h"
 #include "shaders/fg_hud_layer_comp_spv.h"   // (how see-through the HUD is: hud_source)
+#include "shaders/fg_hud_layer_rgba8_comp_spv.h"
 #include "shaders/fg_luma_comp_spv.h"
 #include "shaders/fg_median_comp_spv.h"
 #include "shaders/fg_scale_comp_spv.h"
@@ -381,7 +383,7 @@ bool init_scale() {
     scale.init = scale.failed = true;
     if (!dev.push_descriptor || !vkCmdPushDescriptorSetKHR) return false;
     const VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    if (make_pipe(scale.pipe, BUILTIN_SPV_ARGS(FG_SCALE_COMP_SPV), {S, I, S}, 20)) {
+    if (make_pipe(scale.pipe, BUILTIN_SPV_ARGS(FG_SCALE_COMP_SPV), {S, I, S}, 36)) {
         VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
         si.addressModeU = si.addressModeV = si.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         si.maxLod = 0.25f;
@@ -1140,7 +1142,7 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
     if (pq && !scale.pq_tried) {
         scale.pq_tried = true;
         const VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        if (!make_pipe(scale.pipe_pq, BUILTIN_SPV_ARGS(FG_SCALE_PQ_COMP_SPV), {S, I, S}, 20))
+        if (!make_pipe(scale.pipe_pq, BUILTIN_SPV_ARGS(FG_SCALE_PQ_COMP_SPV), {S, I, S}, 36))
             logf("vk: the 10-bit window scaling pass could not be made: Native HDR's picture is shown unscaled");
     }
     if (pq && !scale.pipe_pq.pipe) return VK_NULL_HANDLE;
@@ -1150,45 +1152,44 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
     }
     const VkFormat format = pq ? VK_FORMAT_A2B10G10R10_UNORM_PACK32 : VK_FORMAT_R8G8B8A8_UNORM;
     const Pipe& pipe = pq ? scale.pipe_pq : scale.pipe;
-    // (the game draws into part of its window textures, 2048 x 1152 of 2560 x 1440 here: the filter was given the whole texture, and the
-    // picture came out in the top left corner of the window with black around it. The crop first, then the filter)
-    if (source.x || source.y || source.w != sw || source.h != sh) {
-        const uint32_t cw = source.w, ch = source.h;
-        if (scale.cropped_w != cw || scale.cropped_h != ch) {
-            {
-                std::lock_guard qk(dev.present_mu);
-                device_wait_idle_locked();
-            }
-            drop_img(scale.cropped);
-            scale.cropped_w = scale.cropped_h = 0;
-            if (!make_img(scale.cropped, cw, ch, format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
-                drop_img(scale.cropped);
-                return VK_NULL_HANDLE;
-            }
-            scale.cropped_w = cw, scale.cropped_h = ch;
-            to_general(cmd, scale.cropped.image);
-        }
-        if (pq) {   // (the bits as they are: a blit converts from the image's own format, which is not always the picture's
-                    // (vk_texture.cpp format_class shares images by class); a copy keeps the game's 10-bit codes either way)
-            VkImageCopy c{};
-            c.srcSubresource = c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            c.srcOffset = {(int)source.x, (int)source.y, 0};
-            c.extent = {cw, ch, 1};
-            vkCmdCopyImage(cmd, image, VK_IMAGE_LAYOUT_GENERAL, scale.cropped.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
-        } else {
-            VkImageBlit b{};
-            b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            b.srcOffsets[0] = {(int)source.x, (int)source.y, 0};
-            b.srcOffsets[1] = {(int)(source.x + cw), (int)(source.y + ch), 1};
-            b.dstOffsets[1] = {(int)cw, (int)ch, 1};
-            vkCmdBlitImage(cmd, image, VK_IMAGE_LAYOUT_GENERAL, scale.cropped.image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
-        }
-        full_barrier(cmd);
-        src = scale.cropped.view;
-    }
     // With no window effect, the CRT itself maps the finished game image to the output pixel grid.
-    // Avoid an otherwise redundant full-size scale image and dispatch.
-    if (!scaling) return record_crt(cmd, src, source.w, source.h, dw, dh, scale.output_view);
+    // CRT downsample has no crop UVs, so materialize scale.cropped only on this CRT-only cropped route.
+    if (!scaling) {
+        if (source.x || source.y || source.w != sw || source.h != sh) {
+            const uint32_t cw = source.w, ch = source.h;
+            if (scale.cropped_w != cw || scale.cropped_h != ch) {
+                {
+                    std::lock_guard qk(dev.present_mu);
+                    device_wait_idle_locked();
+                }
+                drop_img(scale.cropped);
+                scale.cropped_w = scale.cropped_h = 0;
+                if (!make_img(scale.cropped, cw, ch, format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+                    drop_img(scale.cropped);
+                    return VK_NULL_HANDLE;
+                }
+                scale.cropped_w = cw, scale.cropped_h = ch;
+                to_general(cmd, scale.cropped.image);
+            }
+            if (pq) {
+                VkImageCopy c{};
+                c.srcSubresource = c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                c.srcOffset = {(int)source.x, (int)source.y, 0};
+                c.extent = {cw, ch, 1};
+                vkCmdCopyImage(cmd, image, VK_IMAGE_LAYOUT_GENERAL, scale.cropped.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+            } else {
+                VkImageBlit b{};
+                b.srcSubresource = b.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                b.srcOffsets[0] = {(int)source.x, (int)source.y, 0};
+                b.srcOffsets[1] = {(int)(source.x + cw), (int)(source.y + ch), 1};
+                b.dstOffsets[1] = {(int)cw, (int)ch, 1};
+                vkCmdBlitImage(cmd, image, VK_IMAGE_LAYOUT_GENERAL, scale.cropped.image, VK_IMAGE_LAYOUT_GENERAL, 1, &b, VK_FILTER_NEAREST);
+            }
+            full_barrier(cmd);
+            src = scale.cropped.view;
+        }
+        return record_crt(cmd, src, source.w, source.h, dw, dh, scale.output_view);
+    }
     if (scale.scaled_w != dw || scale.scaled_h != dh) {
         {
             std::lock_guard qk(dev.present_mu);   // (the queue is idle only while nothing else submits to it)
@@ -1206,7 +1207,9 @@ VkImage framegen_scale(VkCommandBuffer cmd, VkImageView src, VkImage image, uint
         scale.scaled_w = dw, scale.scaled_h = dh;
         to_general(cmd, scale.scaled.image);
     }
-    struct { int mode; float sharp; float x0, x1; int side; } pc{opts.upscale, opts.sharpness / 100.0f, wide.x0, 1.0f - wide.x0, wide.side};
+    struct { int mode; float sharp; float x0, x1; int side; int crop[4]; } pc{
+        opts.upscale, opts.sharpness / 100.0f, wide.x0, 1.0f - wide.x0, wide.side,
+        {(int)source.x, (int)source.y, (int)source.w, (int)source.h}};
     if (wide.side == 1) {   // (the blurred sides: first the picture at 1/8, each pixel the mean of its 8 x 8, which they blur)
         // (the checked source rectangle, as the crop above: the picture src now holds)
         const uint32_t smw = std::max(1u, source.w / 8), smh = std::max(1u, source.h / 8);
@@ -1337,10 +1340,11 @@ struct HudState {
     Img before[2], after[2];
     int k = 0;
     bool prev = false;
-    Pipe fit_pipe, over_pipe;
+    Pipe fit_pipe, over_pipe, fit_pipe_rgba8, over_pipe_rgba8;
     bool layer_failed = false;
+    bool layer_hdr = false;
     Img fit;     // (the HUD layer's fit, kept from frame to frame: the crop's size, RGBA16F)
-    Img layer;   // (the HUD's colour and how see-through it is, the crop's size, RGBA16F: fg_hud_layer.comp)
+    Img layer;   // (the HUD's colour and how see-through it is, the crop's size, RGBA8 in SDR / RGBA16F in HDR)
     bool layered = false;   // (this present's layer made: fsr3fi_frames lays the HUD over the made frames with it)
     uint64_t layers = 0;    // (presents with it: the 600-present line)
     Img source;          // (the interpolation source: the frame's crop, RGBA8, the HUD's alpha 0)
@@ -1404,27 +1408,43 @@ bool hudless_wanted(bool native_pq) {
     return on;
 }
 
+VkFormat hud_layer_format(bool hdr_active) {
+    return hdr_active ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+}
+
 /// The HUD layer of this present (hud.layer, shaders/fg_hud_layer.comp), from this frame's pictures and the frame before's:
 /// how see-through the HUD is where it is known. False: none (the HUD laid over the made frames whole, as presented)
-bool hud_layer(VkCommandBuffer cmd, int x0, int y0, uint32_t w, uint32_t h) {
+bool hud_layer(VkCommandBuffer cmd, int x0, int y0, uint32_t w, uint32_t h, bool hdr_layer) {
     if (hud.layer_failed || !hud_layer_wanted()) return false;
     const VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    if (!hud.fit_pipe.pipe && (!make_pipe(hud.fit_pipe, BUILTIN_SPV_ARGS(FG_HUD_LAYER_COMP_SPV), {S, S, S, S, I, I}, 20) ||
-                               !make_pipe(hud.over_pipe, BUILTIN_SPV_ARGS(FG_HUD_COMPOSITE_COMP_SPV), {I, S, S}, 12))) {
-        hud.layer_failed = true;
-        logf("vk: fsr3fi: the HUD layer's pipelines were not made: the HUD laid over the made frames as presented");
-        return false;
+    Pipe& fit_pipe = hdr_layer ? hud.fit_pipe : hud.fit_pipe_rgba8;
+    Pipe& over_pipe = hdr_layer ? hud.over_pipe : hud.over_pipe_rgba8;
+    if (!fit_pipe.pipe) {
+        const bool ok = hdr_layer
+                            ? make_pipe(fit_pipe, BUILTIN_SPV_ARGS(FG_HUD_LAYER_COMP_SPV), {S, S, S, S, I, I}, 20) &&
+                                  make_pipe(over_pipe, BUILTIN_SPV_ARGS(FG_HUD_COMPOSITE_COMP_SPV), {I, S, S}, 12)
+                            : make_pipe(fit_pipe, BUILTIN_SPV_ARGS(FG_HUD_LAYER_RGBA8_COMP_SPV), {S, S, S, S, I, I}, 20) &&
+                                  make_pipe(over_pipe, BUILTIN_SPV_ARGS(FG_HUD_COMPOSITE_RGBA8_COMP_SPV), {I, S, S}, 12);
+        if (!ok) {
+            drop_pipe(fit_pipe);
+            drop_pipe(over_pipe);
+            hud.layer_failed = true;
+            logf("vk: fsr3fi: the HUD layer's pipelines were not made: the HUD laid over the made frames as presented");
+            return false;
+        }
     }
+    if (hud.layer.image && hud.layer_hdr != hdr_layer) hud_retire(hud.layer);
+    hud.layer_hdr = hdr_layer;
     const VkImageUsageFlags rw = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     if (!hud_image(cmd, hud.fit, w, h, VK_FORMAT_R16G16B16A16_SFLOAT, rw) ||
-        !hud_image(cmd, hud.layer, w, h, VK_FORMAT_R16G16B16A16_SFLOAT, rw)) {
+        !hud_image(cmd, hud.layer, w, h, hud_layer_format(hdr_layer), rw)) {
         hud.layer_failed = true;
         logf("vk: fsr3fi: the HUD layer's images (%ux%u) were not made: the HUD laid over the made frames as presented", w, h);
         return false;
     }
     const int k = hud.k, j = hud.prev ? k ^ 1 : k;   // (no frame before: this frame's bound in its place, not read)
     const int32_t pc[5] = {x0, y0, (int32_t)w, (int32_t)h, hud.prev ? 1 : 0};
-    pass(cmd, hud.fit_pipe,
+    pass(cmd, fit_pipe,
          {{hud.before[k].view, fg.nearest},
           {hud.after[k].view, fg.nearest},
           {hud.before[j].view, fg.nearest},
@@ -1491,7 +1511,7 @@ bool hud_source(VkCommandBuffer cmd, int cur, uint32_t sw, uint32_t sh, int x0, 
         logf("vk: fsr3fi: the HUD marked for it: what the game drew over its picture after the upscale (%ux%u, format %d)",
              sw, sh, (int)hud.format);
     }
-    hud.layered = hudless_wanted(pq) && hud_layer(cmd, x0, y0, w, h);
+    hud.layered = hudless_wanted(pq) && hud_layer(cmd, x0, y0, w, h, pq || dev.hdr || opts.hdr != 0);
     // (a fit uses the preceding pair only if its layer ran; a Native HDR capture must not feed the next sRGB fit)
     hud.prev = hud.layered;
     hud.k ^= 1;
@@ -1590,8 +1610,9 @@ int fsr3fi_frames(VkCommandBuffer cmd, OutSet& set, int cur, uint32_t uw, uint32
     if (layered) {   // (this frame's HUD over each made frame's own scene: shaders/fg_hud_composite.comp)
         full_barrier(cmd);
         const int32_t pc[3] = {(int32_t)uw, (int32_t)uh, native_pq ? 1 : 0};
+        const Pipe& over = hud.layer_hdr ? hud.over_pipe : hud.over_pipe_rgba8;
         for (int i = 0; i < count; i++)
-            pass(cmd, hud.over_pipe,
+            pass(cmd, over,
                  {{set.frame[slot[i]].view, VK_NULL_HANDLE}, {fg.frames[cur].view, fg.nearest}, {hud.layer.view, fg.nearest}},
                  uw, uh, pc, sizeof pc);
     }

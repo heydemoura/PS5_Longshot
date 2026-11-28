@@ -205,10 +205,10 @@ def main():
         raise SystemExit("fg_scale.comp: FG_SCALE_PQ does not make the destination RGB10A2 (and its dither 10-bit steps)")
     body = block(text, "void main()")
     sharp = body[body.index("if (pc.sharp > 0.0)"):]
-    if "textureSize(src, 0)" not in sharp:
-        raise SystemExit("the sharpen's neighbours are not spaced by the picture's size (textureSize(src, 0))")
+    if "vec2(pc.crop_w, pc.crop_h)" not in sharp:
+        raise SystemExit("the sharpen's neighbours are not spaced by the cropped picture's size (pc.crop_w, pc.crop_h)")
     spacing = re.search(r"const vec2 e = ([^;]*);", sharp)
-    if not spacing or "textureSize(src, 0)" not in spacing.group(1):
+    if not spacing or "vec2(pc.crop_w, pc.crop_h)" not in spacing.group(1):
         raise SystemExit("the neighbour spacing e is not one picture pixel")
     for tap in ("uv + vec2(0.0, -e.y)", "uv + vec2(0.0, e.y)", "uv + vec2(-e.x, 0.0)", "uv + vec2(e.x, 0.0)"):
         if tap not in sharp:

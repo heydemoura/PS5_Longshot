@@ -1,5 +1,5 @@
-// fg_hud_composite.comp sha256 af4b1f6410433d96c9aaa94dd496d06ff51c63a0df015aaf8aef8f4f6ac848a8 (tests/test_fsr3fi_hud_layer.py --write: glslangValidator -V --target-env vulkan1.3 --vn FG_HUD_COMPOSITE_COMP_SPV)
-	// 1116.2.0
+// fg_hud_composite.comp sha256 8a72cf337031643f1ec74e381b092fcd7ec0a573e8948cad86d721c768e81f40 (tests/test_fsr3fi_hud_layer.py --write: glslangValidator -V --target-env vulkan1.3 --vn FG_HUD_COMPOSITE_COMP_SPV)
+	// 1116.6.0
 	 #pragma once
 const uint32_t FG_HUD_COMPOSITE_COMP_SPV[] = {
 	0x07230203,0x00010600,0x0008000b,0x000000dd,0x00000000,0x00020011,0x00000001,0x0006000b,

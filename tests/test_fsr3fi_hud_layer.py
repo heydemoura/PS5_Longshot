@@ -38,19 +38,23 @@ RUN_ALL_ARGS = ["--cxx", "{cxx}", "--glslang", "{glslang}"]
 
 ROOT = Path(__file__).resolve().parents[1]
 SHADERS = ROOT / "gpu" / "vk" / "shaders"
-PAIRS = [(SHADERS / "fg_hud_layer.comp", SHADERS / "fg_hud_layer_comp_spv.h", "FG_HUD_LAYER_COMP_SPV"),
-         (SHADERS / "fg_hud_composite.comp", SHADERS / "fg_hud_composite_comp_spv.h", "FG_HUD_COMPOSITE_COMP_SPV")]
+PAIRS = [(SHADERS / "fg_hud_layer.comp", SHADERS / "fg_hud_layer_comp_spv.h", "FG_HUD_LAYER_COMP_SPV", ()),
+         (SHADERS / "fg_hud_composite.comp", SHADERS / "fg_hud_composite_comp_spv.h", "FG_HUD_COMPOSITE_COMP_SPV", ()),
+         (SHADERS / "fg_hud_layer.comp", SHADERS / "fg_hud_layer_rgba8_comp_spv.h", "FG_HUD_LAYER_RGBA8_COMP_SPV",
+          ("-DFG_HUD_LAYER_RGBA8",)),
+         (SHADERS / "fg_hud_composite.comp", SHADERS / "fg_hud_composite_rgba8_comp_spv.h",
+          "FG_HUD_COMPOSITE_RGBA8_COMP_SPV", ("-DFG_HUD_LAYER_RGBA8",))]
 
 
-def source_line(comp, var):
+def source_line(comp, var, defines=()):
     """the header's first line: the shader's hash (line ends as LF, as the checkout has them) and how the header is made"""
     digest = hashlib.sha256(comp.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
-    return ("// %s sha256 %s (tests/test_fsr3fi_hud_layer.py --write: glslangValidator -V --target-env vulkan1.3 --vn %s)\n"
-            % (comp.name, digest, var)).encode()
+    return ("// %s sha256 %s (tests/test_fsr3fi_hud_layer.py --write: glslangValidator -V --target-env vulkan1.3 %s--vn %s)\n"
+            % (comp.name, digest, "".join(d + " " for d in defines), var)).encode()
 
 
-def compile_header(glslang, comp, var, out):
-    r = subprocess.run([glslang, "-V", "--target-env", "vulkan1.3", "--vn", var, "-o", str(out), str(comp)],
+def compile_header(glslang, comp, var, out, defines=()):
+    r = subprocess.run([glslang, "-V", "--target-env", "vulkan1.3", *defines, "--vn", var, "-o", str(out), str(comp)],
                        capture_output=True, text=True)
     if r.returncode:
         raise SystemExit("%s does not compile:\n%s%s" % (comp.name, r.stdout, r.stderr))
@@ -274,16 +278,17 @@ def main():
         if not glslang:
             raise SystemExit("--write needs %s" % a.glslang)
         with tempfile.TemporaryDirectory(prefix="fg-hud-layer-") as tmp:
-            for comp, header, var in PAIRS:
-                header.write_bytes(source_line(comp, var) + compile_header(glslang, comp, var, Path(tmp) / "out.h"))
+            for comp, header, var, defines in PAIRS:
+                header.write_bytes(source_line(comp, var, defines) +
+                                   compile_header(glslang, comp, var, Path(tmp) / "out.h", defines))
                 print("wrote %s" % header)
         return
-    for comp, header, var in PAIRS:
+    for comp, header, var, defines in PAIRS:
         if not comp.exists() or not header.exists():
             raise SystemExit("%s or its header is missing: the HUD is laid over the made frames whole, halo and all "
                              "(#1565)" % comp.name)
         first = header.read_bytes().partition(b"\n")[0]
-        if first + b"\n" != source_line(comp, var):
+        if first + b"\n" != source_line(comp, var, defines):
             raise SystemExit("%s was not made from this %s (its first line names another hash or command): "
                              "python -I -B tests/test_fsr3fi_hud_layer.py --write" % (header.name, comp.name))
     layer = PAIRS[0][0].read_text(encoding="utf-8")
@@ -309,9 +314,9 @@ def main():
         subprocess.run([a.cxx, "-std=c++20", "-O1", "-Wall", "-Wextra", "-Werror", "-Wno-unused-function", str(cpp), "-o",
                         str(exe)], check=True)
         subprocess.run([str(exe)], check=True)
-        for comp, header, var in PAIRS:
+        for comp, header, var, defines in PAIRS:
             if glslang:
-                made = compile_header(glslang, comp, var, Path(tmp) / "out.h")
+                made = compile_header(glslang, comp, var, Path(tmp) / "out.h", defines)
                 if without_version(made) != without_version(header.read_bytes().partition(b"\n")[2]):
                     raise SystemExit("%s is not glslang's output for %s: python -I -B tests/test_fsr3fi_hud_layer.py --write"
                                      % (header.name, comp.name))

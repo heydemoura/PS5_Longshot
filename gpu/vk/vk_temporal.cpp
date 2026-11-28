@@ -91,6 +91,7 @@
 #include "shaders/dlss_out_comp_spv.h"
 #include "shaders/dlss_out_rgba_comp_spv.h"
 #include "shaders/dlss_prep_comp_spv.h"
+#include "shaders/dlss_prep_packed_comp_spv.h"
 #include "reshade/fx_runtime.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
@@ -228,6 +229,10 @@ struct State {
     VkDescriptorSetLayout prep_lin_set = VK_NULL_HANDLE;
     VkPipelineLayout prep_lin_layout = VK_NULL_HANDLE;
     VkPipeline prep_lin = VK_NULL_HANDLE;
+    VkDescriptorSetLayout prep_packed_set = VK_NULL_HANDLE;
+    VkPipelineLayout prep_packed_layout = VK_NULL_HANDLE;
+    VkPipeline prep_packed = VK_NULL_HANDLE;
+    bool prep_packed_tried = false;
     VkDescriptorSetLayout out_rgba_set = VK_NULL_HANDLE;
     VkPipelineLayout out_rgba_layout = VK_NULL_HANDLE;
     VkPipeline out_rgba = VK_NULL_HANDLE;
@@ -534,6 +539,35 @@ bool make_rgba_stretch() {
     const VkDescriptorType types[2] = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
     return make_pipeline(BUILTIN_SPV_ARGS(DLSS_OUT_RGBA_COMP_SPV), types, 2, 8,
                          s.stretch_rgba_set, s.stretch_rgba_layout, s.stretch_rgba);
+}
+
+// 32-bit B10G11R11 temporal targets for SDR FSR 3.1 (halves s.color / s.output VRAM & bandwidth).
+bool packed_color_supported() {
+    static const bool ok = [] {
+        if (!dev.features.shaderStorageImageExtendedFormats) return false;
+        VkFormatProperties props{};
+        vkGetPhysicalDeviceFormatProperties(dev.physical, VK_FORMAT_B10G11R11_UFLOAT_PACK32, &props);
+        constexpr VkFormatFeatureFlags need = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+        return (props.optimalTilingFeatures & need) == need;
+    }();
+    return ok;
+}
+
+bool make_packed_prep() {
+    State& s = st();
+    if (s.prep_packed) return true;
+    if (s.prep_packed_tried) return false;
+    s.prep_packed_tried = true;
+    const VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    const VkDescriptorType prep_types[5] = {S, S, I, I, I};
+    return make_pipeline(BUILTIN_SPV_ARGS(DLSS_PREP_PACKED_COMP_SPV), prep_types, 5, 84,
+                         s.prep_packed_set, s.prep_packed_layout, s.prep_packed);
+}
+
+VkFormat temporal_target_format(int mode, bool hdr, bool pre, bool rgba, int opt_hdr, bool packed_storage) {
+    if (mode == ur::FSR3 && !hdr && !pre && !rgba && opt_hdr == 0 && packed_storage)
+        return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+    return VK_FORMAT_R16G16B16A16_SFLOAT;
 }
 
 /// A view of a depth texture's depth alone, for sampling (made once per image)
@@ -1445,8 +1479,9 @@ void fg_inputs(VkCommandBuffer cmd, bool known, Texture* in, VkImageView in_view
     struct Disturbed {   // (from here commands are recorded: the program's descriptor pushes are pushed again after)
         ~Disturbed() { descriptors_disturbed(); }
     } disturbed;
+    const bool packed_fg = opts.hdr == 0 && packed_color_supported() && make_packed_prep();
     const VkImageUsageFlags copied = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    if (!make_image(cmd, s.color, VK_FORMAT_R16G16B16A16_SFLOAT, rw, rh) ||
+    if (!make_image(cmd, s.color, packed_fg ? VK_FORMAT_B10G11R11_UFLOAT_PACK32 : VK_FORMAT_R16G16B16A16_SFLOAT, rw, rh) ||
         !make_image(cmd, s.depth, VK_FORMAT_R32_SFLOAT, rw, rh, copied) ||
         !make_image(cmd, s.motion, VK_FORMAT_R16G16_SFLOAT, rw, rh, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | copied))
         return;
@@ -1486,9 +1521,11 @@ void fg_inputs(VkCommandBuffer cmd, bool known, Texture* in, VkImageView in_view
             w[i].dstBinding = i, w[i].descriptorCount = 1, w[i].pImageInfo = &info[i];
             w[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         }
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.prep);
-        vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.prep_layout, 0, 5, w);
-        vkCmdPushConstants(cmd, s.prep_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+        const VkPipeline fg_prep = packed_fg ? s.prep_packed : s.prep;
+        const VkPipelineLayout fg_prep_layout = packed_fg ? s.prep_packed_layout : s.prep_layout;
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, fg_prep);
+        vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, fg_prep_layout, 0, 5, w);
+        vkCmdPushConstants(cmd, fg_prep_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
         vkCmdDispatch(cmd, (rw + 7) / 8, (rh + 7) / 8, 1);
     }
     full_barrier(cmd);
@@ -1673,13 +1710,20 @@ bool draw_engine(VkCommandBuffer cmd, State& s, int mode, const Camera& cam, uin
     const bool placed = s.pre_last != pre;   // (for the log: place_told)
     if (s.pre_last != pre) s.pre_last = pre, s.last_frame = 0, moved = drawn;
     if (ready == 2) s.engines_made++, s.last_frame = 0, moved = 0;   // (made just now: a new history)
+    // (an engine made for HDR colour, as prepare made it this frame: the game's native HDR goes past 1, and the LDR pass's
+    // clamp cut every highlight at the paper white, a flat picture. It is given linear light and gives it back: the HDR pair)
+    const bool hdr = engine.e->hdr && engine.e->hdr();
+    const bool packed_storage = packed_color_supported();
+    VkFormat color_fmt = temporal_target_format(mode, hdr, pre, rgba, opts.hdr, packed_storage);
+    const bool packed_color = color_fmt == VK_FORMAT_B10G11R11_UFLOAT_PACK32 && make_packed_prep();
+    if (!packed_color) color_fmt = VK_FORMAT_R16G16B16A16_SFLOAT;
     // (NVIDIA DLSS Frame Generation through NGX copies the depth and the motion each frame, vk_dlss.cpp dlss_fg_inputs: a
     // transfer's source too, always, so the Frame generation by row can turn it on at any time)
     const VkImageUsageFlags copied = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-    if (!make_image(cmd, s.color, VK_FORMAT_R16G16B16A16_SFLOAT, iw, ih) ||
+    if (!make_image(cmd, s.color, color_fmt, iw, ih) ||
         !make_image(cmd, s.depth, VK_FORMAT_R32_SFLOAT, iw, ih, copied) ||
         !make_image(cmd, s.motion, VK_FORMAT_R16G16_SFLOAT, iw, ih, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | copied) ||
-        !make_image(cmd, s.output, VK_FORMAT_R16G16B16A16_SFLOAT, dw, dh, VK_IMAGE_USAGE_TRANSFER_DST_BIT))   // (FSR 3.1 copies in)
+        !make_image(cmd, s.output, color_fmt, dw, dh, VK_IMAGE_USAGE_TRANSFER_DST_BIT))   // (FSR 3.1 copies in)
         return no("its images were not made");
 
     // (longshot) the projection without this frame's jitter, for an engine that makes its depth constants from it (FSR 3.1), and
@@ -1716,9 +1760,6 @@ bool draw_engine(VkCommandBuffer cmd, State& s, int mode, const Camera& cam, uin
     pc.jitter[0] = cam.jitter[0], pc.jitter[1] = cam.jitter[1];
     pc.size[0] = (int32_t)rw, pc.size[1] = (int32_t)rh;
     pc.flags = (motion ? 1 : 0) | (show_motion ? 2 : 0) | (fsr_flip ? 8 : 0);
-    // (an engine made for HDR colour, as prepare made it this frame: the game's native HDR goes past 1, and the LDR pass's
-    // clamp cut every highlight at the paper white, a flat picture. It is given linear light and gives it back: the HDR pair)
-    const bool hdr = engine.e->hdr && engine.e->hdr();
     // The network receives perceptual colour after the scene pass: decode it even when its storage is RGBA16F.
     if (rgba && !make_rgba_output()) return no("the RGBA16F output shader was not made");
     // (longshot) the scene before its tone map is linear light already: taken as it is (prep_lin), and given back as it is
@@ -1739,9 +1780,15 @@ bool draw_engine(VkCommandBuffer cmd, State& s, int mode, const Camera& cam, uin
             w[i].dstBinding = i, w[i].descriptorCount = 1, w[i].pImageInfo = &info[i];
             w[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         }
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, prep_pipe);
-        vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, prep_layout, 0, 5, w);
-        vkCmdPushConstants(cmd, prep_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+        if (packed_color) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.prep_packed);
+            vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.prep_packed_layout, 0, 5, w);
+            vkCmdPushConstants(cmd, s.prep_packed_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+        } else {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, prep_pipe);
+            vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, prep_layout, 0, 5, w);
+            vkCmdPushConstants(cmd, prep_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+        }
         vkCmdDispatch(cmd, (rw + 7) / 8, (rh + 7) / 8, 1);
     };
     stage_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
@@ -1771,7 +1818,8 @@ bool draw_engine(VkCommandBuffer cmd, State& s, int mode, const Camera& cam, uin
                       VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT);
     }
     TemporalFrame f;
-    f.color = s.color.shown(), f.depth = s.depth.shown(), f.motion = s.motion.shown(), f.output = s.output.shown();
+    f.color = s.color.shown(), f.depth = s.depth.shown(), f.motion = s.motion.shown();
+    f.output = s.output.shown();
     f.render_w = rw, f.render_h = rh;
     // (the jitter in render pixels, x right and y down)
     dlss_math::jitter_to_pixels(cam.jitter, rw, rh, f.jitter);

@@ -42,7 +42,7 @@ from srccut import block, between  # noqa: E402
 RUN_ALL_ARGS = ["--cxx", "{cxx}", "--headers", "{vulkan_headers}"]
 
 ROOT = Path(__file__).resolve().parents[1]
-LAYER_HELPERS = ("bool hud_layer_wanted(", "bool hudless_wanted(", "bool hud_layer(")
+LAYER_HELPERS = ("bool hud_layer_wanted(", "bool hudless_wanted(", "VkFormat hud_layer_format(", "bool hud_layer(")
 
 PREFIX = r'''
 #include <algorithm>
@@ -69,10 +69,13 @@ constexpr int kMaxMult = 8;
 '''
 
 STUBS = r'''
-struct { int framegen = 2, hdr_peak = 1000; } opts;
+struct { int framegen = 2, hdr_peak = 1000, hdr = 0; } opts;
+struct { bool hdr = false; } dev;
 constexpr uint32_t FG_HUD_COMP_SPV[] = {0};
 [[maybe_unused]] constexpr uint32_t FG_HUD_LAYER_COMP_SPV[] = {1};
 [[maybe_unused]] constexpr uint32_t FG_HUD_COMPOSITE_COMP_SPV[] = {2};
+[[maybe_unused]] constexpr uint32_t FG_HUD_LAYER_RGBA8_COMP_SPV[] = {3};
+[[maybe_unused]] constexpr uint32_t FG_HUD_COMPOSITE_RGBA8_COMP_SPV[] = {4};
 #define BUILTIN_SPV_ARGS(words) words, sizeof words
 struct Texture {   // (vk_texture.h's, the fields framegen_hud_before reads)
     VkImage image = VK_NULL_HANDLE;
@@ -90,8 +93,9 @@ bool layer_pipes_fail = false;
 bool make_pipe(Pipe& p, const uint32_t* code, size_t, std::initializer_list<VkDescriptorType> types, uint32_t push) {
     if (code[0] != 0 && layer_pipes_fail) return false;
     // (the mask pass; the HUD layer's fit; the HUD laid over a made frame)
-    CHECK((code[0] == 0 && types.size() == 5 && push == 20) || (code[0] == 1 && types.size() == 6 && push == 20) ||
-          (code[0] == 2 && types.size() == 3 && push == 12));
+    CHECK((code[0] == 0 && types.size() == 5 && push == 20) ||
+          ((code[0] == 1 || code[0] == 3) && types.size() == 6 && push == 20) ||
+          ((code[0] == 2 || code[0] == 4) && types.size() == 3 && push == 12));
     p.pipe = handle<VkPipeline>(), p.layout = handle<VkPipelineLayout>(), p.set = handle<VkDescriptorSetLayout>();
     return ++made_pipes, true;
 }
@@ -100,6 +104,7 @@ bool make_img(Img& i, uint32_t, uint32_t, VkFormat, VkImageUsageFlags) {
     return ++made_images, true;
 }
 void drop_img(Img& i) { i = {}; }
+void drop_pipe(Pipe& p) { p = {}; }
 void to_general(VkCommandBuffer, VkImage) {}
 void full_barrier(VkCommandBuffer) {}
 // (the copies: from what, into what)
@@ -226,6 +231,7 @@ SUFFIX = r'''
 // (the HUD layer's pipelines made again at the next present: a source without them, main's, has nothing to forget)
 template <class H> void forget_layer_pipes(H& h) {
     if constexpr (requires { h.fit_pipe; }) h.fit_pipe = {};
+    if constexpr (requires { h.fit_pipe_rgba8; }) h.fit_pipe_rgba8 = {};
 }
 int main() {
     check_pq_hud_pixels();
@@ -417,7 +423,8 @@ def main():
     # (the HUD layer's helpers are hud_source's: a source without them has a hud_source that does not call them, and fails
     # below for what it does, not for what it lacks)
     functions = "\n".join(block(fg, m) for m in ("void hud_retire(", "void hud_free_dead(", "bool hud_image(",
-                                                  "bool hud_layer_wanted(", "bool hudless_wanted(", "bool hud_layer(",
+                                                  "bool hud_layer_wanted(", "bool hudless_wanted(",
+                                                  "VkFormat hud_layer_format(", "bool hud_layer(",
                                                   "bool hud_source(", "void framegen_hud_before(",
                                                   "int fsr3fi_frames(")
                           if m in fg or m not in LAYER_HELPERS)
