@@ -1,7 +1,8 @@
 """Input recordings (issue 1113): host/input_movie.h, host/input_movie.c and the places that call them, without the game.
 
 - The format: a recording's runs are written when the pad changes (the flight and free camera cheats' inputs with it) and
-  at least every 600 reads; read back, every read gets the pad it was recorded with, a gap a neutral pad, the end
+  on the first read 600 ticks from a run's start or later. Skipped sample ticks keep the previous pad; on playback,
+  a gap written explicitly in the file gives a neutral pad, and the end gives
   nothing. The native mouse camera's lines are written when it is turned on or off, freed or held, or turned, and read
   back give every camera update its state and only the turned ones their turn. Motion readings are written once each,
   also when their numbers start again, and each motion read gets its own live readings back. Menu choices are given once,
@@ -63,7 +64,39 @@ static MovieTape load(void) {
     CHECK(!bad);
     return t;
 }
+static void append_pad_run(MovieTape *t, const MovieRun *r) {
+    char line[512];
+    CHECK(movie_pad_line(line, sizeof line, r->f, r->frames, &r->pad) > 0);
+    CHECK(movie_parse_line(t, line) > 0);
+}
+
+static void sparse_pad_reads(void) {
+    MovieTape t = {0};
+    MovieRun r = {0}, done;
+    MoviePad held = pad(1, 0, 32767), neutral = pad(0, 0, 0), got;
+    held.stick[2] = 10000;
+    MoviePad released = held;
+    released.bits = 0;
+    CHECK(movie_parse_line(&t, "{\"format\":\"" MOVIE_FORMAT "\",\"fps\":60}") > 0);
+    for (uint32_t f = 0; f <= 16; f += 4) {
+        const MoviePad *sample = f < 12 ? &held : f < 16 ? &released : &neutral;
+        if (movie_rec_step(&r, f, sample, &done)) append_pad_run(&t, &done);
+    }
+    append_pad_run(&t, &r);
+    for (uint32_t f = 0; f <= 16; f++)
+        CHECK(movie_tape_pad(&t, f, &got) && movie_pad_same(&got, f < 12 ? &held : f < 16 ? &released : &neutral));
+    CHECK(!movie_tape_pad(&t, 17, &got));
+    movie_tape_free(&t);
+
+    MovieRun long_hold = {0};
+    CHECK(!movie_rec_step(&long_hold, 0, &held, &done));
+    CHECK(movie_rec_step(&long_hold, MOVIE_RUN_MAX + 4, &held, &done));
+    CHECK(done.f == 0 && done.frames == MOVIE_RUN_MAX + 4 && movie_pad_same(&done.pad, &held));
+    CHECK(long_hold.f == MOVIE_RUN_MAX + 4 && long_hold.frames == 1);
+}
+
 int main(void) {
+    sparse_pad_reads();
     char line[700];
     put(line, snprintf(line, sizeof line, "{\"format\":\"%s\",\"fps\":60,\"start\":7,\"from\":\"play\"}\n", MOVIE_FORMAT));
     /* recording: 10 reads of A, 5 of nothing, 1300 of the stick up (split at 600), 4 of the flight cheat's input, then B */

@@ -80,7 +80,7 @@
 #include <string.h>
 
 #define MOVIE_FORMAT "ls-input-recording/1"
-#define MOVIE_RUN_MAX 600u   /* (a run is written at least every 600 frames: a crash loses 10 s at most) */
+#define MOVIE_RUN_MAX 600u   /* (flush a held pad on the first read 600 ticks or more from its start) */
 #define MOVIE_MOTION_FLOATS 18
 #define MOVIE_CALLS_MAX 1000   /* (a hook's calls in one frame, at most: `i` past it refuses the line) */
 #define MOVIE_ANCHOR_GAP 10      /* (frames without one of Link's updates that make the next an anchor: a load) */
@@ -171,7 +171,7 @@ static inline int movie_note_line(char *out, size_t cap, uint32_t f, const char 
     return n > 0 && (size_t)n < cap ? n : 0;
 }
 
-/* ---- recording: one open run, closed when the pad changes or it reaches MOVIE_RUN_MAX reads ---- */
+/* ---- recording: one open run, closed at a pad change or periodic flush ---- */
 
 typedef struct {
     MoviePad pad;
@@ -179,11 +179,16 @@ typedef struct {
     int open;
 } MovieRun;
 
-/* frame `f`'s pad; returns 1 and fills *done when the run before it ended */
+/* A sampled pad holds until the next read, even when the game clock skips ticks.
+   Returns 1 and fills *done when the run before this read ended. */
 static inline int movie_rec_step(MovieRun *r, uint32_t f, const MoviePad *p, MovieRun *done) {
-    if (r->open && movie_pad_same(&r->pad, p) && r->frames < MOVIE_RUN_MAX && f == r->f + r->frames) {
-        r->frames++;
-        return 0;
+    if (r->open && f >= r->f && f - r->f >= r->frames) {
+        const uint32_t elapsed = f - r->f;
+        if (elapsed < MOVIE_RUN_MAX && movie_pad_same(&r->pad, p)) {
+            r->frames = elapsed + 1;
+            return 0;
+        }
+        r->frames = elapsed;
     }
     const int ended = r->open;
     if (ended) *done = *r;
