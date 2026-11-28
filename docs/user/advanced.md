@@ -52,10 +52,12 @@ whether each started, and why not.
 
 ## Switches: longshot_env.txt
 
-Some workarounds are switches: lines of `NAME=VALUE` in a text file named `longshot_env.txt` in the game folder, read
-when the game starts. It takes only the game's own switches (names starting `RX_`, `HOS_`, `LONGSHOT_`, `EDEN_`,
+To apply a workaround to every build you play with a profile, create `longshot_env.txt` next to its `profile.json`.
+Put one `NAME=VALUE` switch on each line and restart the game. If the profile has no such file, Longshot reads
+`config/longshot_env.txt` in the build folder. Older builds keep the file at the root of that folder. An empty
+profile file skips all build-specific switches. The file takes only the game's own switches (names starting `RX_`, `HOS_`, `LONGSHOT_`, `EDEN_`,
 `NVN_` or `SDL_`) and no paths; the log names any line it left out. A switch that stands in for a menu row wins over
-it while the line is there, and `longshot_options.ini` keeps your menu choice. Delete the line to undo it. On Windows, check
+it while the line is there, and the profile's `settings.ini` keeps your menu choice. Delete the line to undo it. On Windows, check
 that the file isn't really called `longshot_env.txt.txt` (File Explorer: **View → Show → File name extensions**).
 
 The switches worth knowing as a player are on the pages that need them ([common problems](common-issues.md),

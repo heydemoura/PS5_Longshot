@@ -91,7 +91,7 @@ download is genuine.
    driver update can't add it to an older card that doesn't have it.
 3. **AMD cards** have known crashes ([#708](https://github.com/NotRexed/Hookshot/issues/708),
    [#614](https://github.com/NotRexed/Hookshot/issues/614)). To try the other drawing path, add the line
-   `RX_VK_MESH_SHADERS=compute` to `longshot_env.txt` in the game folder (usually a little slower; delete the line to
+   `RX_VK_MESH_SHADERS=compute` to your profile's [`longshot_env.txt`](advanced.md#switches-longshot_envtxt) (usually a little slower; delete the line to
    undo it).
 4. **Read the end of the log.** `longshot_log.txt` in the game folder's `logs` folder has the last run; its last lines
    usually say what failed.

@@ -14,8 +14,12 @@ game's paths are [`host/longshot_profile.h`](../../../host/longshot_profile.h).
 <profile>/
   profile.json          which profile it is (below)
   settings.ini          the game's settings (longshot_options.ini's lines)
+  longshot_env.txt      optional game switches shared across builds
   saves/                the saves alone: save/<uid>/slot_NN/, save-work/
 ```
+
+When the profile has no `longshot_env.txt`, the game reads the build's `config/longshot_env.txt`
+(or `longshot_env.txt` at the build root in older layouts). See [switch precedence](switches.md#how-the-game-reads-them).
 
 A launcher names the folders and keeps which one is current in its own settings; the builder's default profile is
 `$XDG_DATA_HOME/longshot/profiles/default` on a fresh Linux installation (usually under `~/.local/share`). Fresh Windows installs use `%LOCALAPPDATA%\Longshot\data\profiles\default`. A marked portable launcher shares `Longshot/data/profiles/default` with its version executables. Standalone versions keep previously populated `profile/` directories. Nothing else of the game's goes in the profile:

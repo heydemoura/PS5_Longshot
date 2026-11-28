@@ -44,6 +44,11 @@ def main():
                                           "VK_T_LAYER=/y\n", encoding="utf-8")
         (tmp / "precedence.txt").write_text("HOS_T_LAUNCH=file\nHOS_T_TWICE=first\nHOS_T_FRESH=1\nHOS_T_TWICE=second\n",
                                             encoding="utf-8")
+        (game / "config").mkdir()
+        (game / "config" / "longshot_env.txt").write_text("HOS_T_SHARED=organized\n", encoding="utf-8")
+        profile = tmp / "profile"
+        profile.mkdir()
+        (profile / "longshot_env.txt").write_text("HOS_T_SHARED=profile\n", encoding="utf-8")
         exe = str(game / "longshot").replace("\\", "\\\\")
         fixture = r'''#include <stdio.h>
 #include <stdlib.h>
@@ -57,10 +62,15 @@ static int setenv(const char *name, const char *value, int overwrite) {
 }
 static int unsetenv(const char *name) { return setenv(name, "", 1); }
 #endif
+#include <errno.h>
+#include "longshot_profile.h"
+#define SEP '/'
 #define MAX_PATH 260
 #define HOS_PATH_CAP MAX_PATH
 typedef unsigned long DWORD;
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); exit(1); } } while (0)
+static int organized;
+static int hos_organized_build(void) { return organized; }
 static DWORD hos_game_path_a(char *out, DWORD size) {   /* (host/hos_paths.h: the game folder's path) */
     snprintf(out, size, "%s", "''' + exe + r'''");
     return (DWORD)strlen(out);
@@ -126,6 +136,22 @@ int main(int argc, char **argv) {
     setenv("HOS_CONTROL_PEER_SID", "S-1-5-21-7-8-9-1002", 1);
     load_longshot_env();
     CHECK(is("HOS_CONTROL_PEER_SID", "S-1-5-21-7-8-9-1002") && is("HOS_T_BESIDE", "1"));
+    clear();
+    setenv("LONGSHOT_PROFILE", argv[4], 1);
+    load_longshot_env();
+    CHECK(is("HOS_T_SHARED", "profile") && is("HOS_T_BESIDE", NULL));
+    clear();
+    setenv("LONGSHOT_PROFILE", argv[5], 1);
+    load_longshot_env();
+    CHECK(is("HOS_T_SHARED", "beside"));
+    organized = 1;
+    clear();
+    load_longshot_env();
+    CHECK(is("HOS_T_SHARED", "organized"));
+    setenv("LONGSHOT_PROFILE", argv[4], 1);
+    clear();
+    load_longshot_env();
+    CHECK(is("HOS_T_SHARED", "profile"));
     printf("PASS: HOS_ENV_FILE replaces longshot_env.txt; unset or empty reads it as before; the player's file sets only the game's switches, never HOS_CONTROL_PEER_SID, and a note after a value is not part of it; the environment goes over the file\n");
     return 0;
 }
@@ -133,10 +159,10 @@ int main(int argc, char **argv) {
         src = tmp / "fixture.c"
         src.write_text(fixture, encoding="utf-8")
         out = tmp / "fixture"
-        subprocess.run([a.cc, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-Wall", "-Werror", str(src), "-o", str(out)],
+        subprocess.run([a.cc, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-Wall", "-Werror", "-I", str(ROOT / "host"), str(src), "-o", str(out)],
                        check=True)
         before = (game / "longshot_env.txt").read_text(encoding="utf-8")
-        subprocess.run([str(out), str(tmp / "test_env.txt"), str(tmp / "missing.txt"), str(tmp / "precedence.txt")], check=True)
+        subprocess.run([str(out), str(tmp / "test_env.txt"), str(tmp / "missing.txt"), str(tmp / "precedence.txt"), str(profile), str(tmp / "empty-profile")], check=True)
         if (game / "longshot_env.txt").read_text(encoding="utf-8") != before:
             raise SystemExit("the player's longshot_env.txt was changed")
 

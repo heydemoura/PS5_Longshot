@@ -35,6 +35,8 @@ void hos_tracy_start(void) {
 #include "hos_wide_size.h"   /* (the widescreen picture's size, shared with the Insert menu) */
 #include "ws_floor.h"        /* (the game's memory kept in RAM: HOS_WS_FLOOR_MB) */
 #include "../gpu/vk/vk_api.h"
+#include "longshot_profile.h"
+#include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,7 +57,6 @@ const char *hos_version(void);   /* (host/version.c: the one file builder/crates
 #include <sys/prctl.h>
 #include <sys/sysinfo.h>
 #endif
-#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/syscall.h>
@@ -629,7 +630,7 @@ static void recover_writes(void) {
     hos_atomic_remove_stale(path);
 }
 
-/* longshot_env.txt beside the game: NAME=VALUE lines set as environment variables before anything reads them, for the
+/* longshot_env.txt in the profile, or beside the game when the profile has none: NAME=VALUE lines set as environment variables before anything reads them, for the
    switches players are asked to test (RX_VK_NOOPT and the rest). Lines starting with # are notes. On Linux this runs
    before the window, so HOS_HEADLESS and HOS_WINDOW_SIZE are already set when the window is made.
    HOS_ENV_FILE=<path> reads that file instead: a scripted or A/B test run brings its own switches and leaves the
@@ -677,14 +678,22 @@ static int env_line_allowed(const char *name, const char *value) {
 static void load_longshot_env(void) {
     char path[HOS_PATH_CAP + 32];
     const char *other = getenv("HOS_ENV_FILE");
+    FILE *f = NULL;
     if (other && *other) {
-        snprintf(path, sizeof path, "%s", other);
+        f = fopen(other, "r");
     } else {
-        DWORD n = hos_game_path_a(path, HOS_PATH_CAP);
-        while (n && path[n - 1] != 92 && path[n - 1] != 47) n--;
-        snprintf(path+n, sizeof path-n, "%s", hos_organized_build() ? "config/longshot_env.txt" : "longshot_env.txt");
+        if (longshot_profile_path(getenv(LONGSHOT_PROFILE), SEP, "longshot_env.txt", path, sizeof path)) {
+            f = fopen(path, "r");
+            if (!f && errno != ENOENT) return;
+        }
+        if (!f) {
+            DWORD n = hos_game_path_a(path, HOS_PATH_CAP);
+            if (!n || n >= HOS_PATH_CAP) return;
+            while (n && path[n - 1] != 92 && path[n - 1] != 47) n--;
+            snprintf(path + n, sizeof path - n, "%s", hos_organized_build() ? "config/longshot_env.txt" : "longshot_env.txt");
+            f = fopen(path, "r");
+        }
     }
-    FILE *f = fopen(path, "r");
     if (!f) return;
     /* The environment the game was started with wins over the file: a switch set for one launch (HOS_FULLSCREEN=0 in a
        shell, a script's RX_VK_PACE=1) beats the same name saved in the file. The file's own later lines still replace its

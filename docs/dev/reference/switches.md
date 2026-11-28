@@ -14,10 +14,12 @@ switches are in [profiling](profiling.md). When to add a switch and how to choos
 At start the game takes switches from, in order:
 
 1. **The environment.** A name already set when the game starts wins.
-2. **`longshot_env.txt`** beside `image.bin`, or the file `HOS_ENV_FILE=<path>` names instead. A line for a name the
-   environment already set is left out, and the log says so.
+2. **One switches file.** An explicit `HOS_ENV_FILE` selects that file alone. Otherwise the game reads
+   `<profile>/longshot_env.txt` when present, falling back to `config/longshot_env.txt` in an organized build or
+   `longshot_env.txt` at the root of an older build when the profile has no file or the game starts without a profile. An empty profile file overrides the build file.
+   The log identifies lines skipped because the environment already set their values.
 
-Settings from the Insert menu live in a separate file, [`longshot_options.ini`](#the-options-file). A `player` switch that
+Settings from the Insert menu live in the profile's [`settings.ini`](#the-options-file). A `player` switch that
 stands in for a menu row overrides it for that run only; the options file keeps the player's own value.
 
 ### longshot_env.txt
