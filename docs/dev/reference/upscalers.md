@@ -23,7 +23,12 @@ so new engines are added at the end.
 No vendor library ships with Longshot. Each engine reports why it cannot run (`dlss_why`, `fsr4_why`, `xess_why`), and
 the menu offers only the engines that can.
 
-AMD FSR 4's layers are unrolled and built into a pipeline cache of their own, `cache/longshot_fsr4_pipelines.bin`
+Eligible AMD FSR 4 passes with constant weight tables are unrolled subject to headroom and size limits. On FSR 4.1.2, the
+shader set it was checked against, the expanded unroller folds the network's layers and the postpass; another FSR 4 version
+keeps the previous unroller, for the layers only. A compact folded build wants 1 GiB of memory to spare on AMD's older
+Windows shader compiler (RDNA 1 and 2), where its compile memory was measured, and 8 GiB everywhere else. A layer whose
+plain twin could not be made is left rolled on every configuration. They are built into a
+pipeline cache of their own, `cache/longshot_fsr4_pipelines.bin`
 (`own_cache` in `vk_fsr4.cpp`), apart from the translator's, whose files a new translator drops: an update keeps it.
 `RX_VK_PCACHE_LOAD=0` neither reads nor saves it.
 

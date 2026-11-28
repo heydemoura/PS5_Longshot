@@ -455,6 +455,10 @@ struct DevicePolicy {
     // Adrenalin 26.10.1). RX_VK_FSR4_TUNE can only turn it off: it rewrites AMD's shaders for AMD's GPUs. Read (vk_fsr4.cpp
     // tune::on)
     bool fsr4_tune = false;
+    // AMD's older Windows shader compiler (RDNA 1 and 2, as nan_bits): FSR 4's folded passes may build with 1 GiB of memory to
+    // spare, not 8. Their compile memory (<60 MB each) was measured on this compiler, on an RX 6700 XT; other compilers keep
+    // 8 GiB until it is measured there. Read (vk_fsr4.cpp build_want)
+    bool fsr4_compact_builds = false;
     // The Steam Deck's own APU: its peak clock state while its power level is auto, which the site reads later (+8% to
     // +46% for about 4 W). RX_VK_GPU_CLOCK. Site (gpu_clock.h, vk_gpu_clock.cpp), step 2
     bool gpu_clock_peak = false;
@@ -640,6 +644,8 @@ inline DevicePolicy device_policy(const DeviceFacts& f) {
     p.global_table_loop = f.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA && f.storage_buffer_array_dynamic_indexing;
     p.occ_copy = f.driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && f.discrete();
     p.fsr4_tune = f.amd();
+    p.fsr4_compact_builds = f.windows && f.driver_id == VK_DRIVER_ID_AMD_PROPRIETARY && f.driver_info &&
+                            std::strstr(f.driver_info, "proprietary shader compiler");
     p.gpu_clock_peak = f.amd() && f.deck_apu();
     p.readback_late_newest = f.handheld();
     p.acquire_ahead = true;   // (every driver; not under frame generation or FIFO: vk_replay.cpp acquire_ahead_wanted)
@@ -867,6 +873,7 @@ template <class Line> void device_policy_log(const DevicePolicy& p, const Device
         l.flag("occ_copy", p.occ_copy, p.set(Sw::occ_copy), "101.9154");
         l.flag("intel_side_by_side_auto", p.intel_side_by_side_auto, false, "101.9154");
         l.flag("fsr4_tune", p.fsr4_tune, p.set(Sw::fsr4_tune));
+        l.flag("fsr4_compact_builds", p.fsr4_compact_builds);
         l.flag("gpu_clock_peak", p.gpu_clock_peak);
         l.flag("readback_late_newest", p.readback_late_newest);
         l.flag("acquire_ahead", p.acquire_ahead, p.set(Sw::acquire_ahead));

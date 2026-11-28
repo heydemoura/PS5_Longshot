@@ -47,7 +47,7 @@ amd_retry_no_optimizer amd_cloth_no_optimizer fault_gate_serial task_mesh_fallba
 pcache_fetch_lock split_before_draw astc_on_cpu inline_deku_web_loads networks_left_out dma_buf_imports nv_checkpoints
 allowance_at_count_rule
 mirrors ub_snapshot split_ub_flush native_float_add warp64 mesh_shared_warp batch_submits mma_unroll_try global_table_loop occ_copy
-intel_side_by_side_auto fsr4_tune gpu_clock_peak readback_late_newest acquire_ahead pcache_small_pc bc_small_runs small_vram_textures astc_bc_all
+intel_side_by_side_auto fsr4_tune fsr4_compact_builds gpu_clock_peak readback_late_newest acquire_ahead pcache_small_pc bc_small_runs small_vram_textures astc_bc_all
 room_in_blocks_rule squeeze_damped linux_hold_caps_budget dlss_cnn auto_render_third rtx rdna4 threaded_auto_render
 threaded_auto_recorder drop_modules_small_ram native_zstd_keep_core""".split()
 # The numbers: the field and how the fixture prints it (sizes in whole MB; -1: no limit)
@@ -122,7 +122,7 @@ PCS = [
                 12272, 11500, 32600, 12, 12, 6, 1, 1, 0, 0, 0, 1, 1, 64, 64, 0xFF),
          on="bc_small_runs acquire_ahead fetch_bounds networks_left_out nan_bits mesh_fallback_strict_fmul bc_copy_per_layer gather_offset frag_shuffle_fallback position_invariant mesh_no_optimizer "
             "amd_retry_no_optimizer amd_cloth_no_optimizer fault_gate_serial task_mesh_fallback allowance_at_count_rule "
-            "mirrors split_ub_flush warp64 fsr4_tune room_in_blocks_rule threaded_auto_render threaded_auto_recorder",
+            "mirrors split_ub_flush warp64 fsr4_tune fsr4_compact_builds room_in_blocks_rule threaded_auto_render threaded_auto_recorder",
          num=(0, 0, 0, 2, 0, 4, 7158, 2048, 768, 512, 1437, -1, 256, 24, 64, 32, 97, 4, 4, 4, 6, 6, 3)),
     # (the card has the float add, but no run on AMD has shown it right: the loop. RDNA 4 tries the software matrix
     # multiplies' unrolled forms on AMD's proprietary driver; the study doubts the fragment shuffles' fallback and the
@@ -295,7 +295,7 @@ PCS = [
          facts=(0x1002, 0x731F, "AMD_PROPRIETARY", 0x800161, "DISCRETE_GPU", "25.9.1 " + AMD_OLD, "AMD Radeon RX 5700", 1, 0,
                 8176, 7378, 16300, 12, 12, 6, 0, 1, 0, 0, 0, 1, 1, 64, 64, 0x20),
          on="bc_small_runs acquire_ahead fetch_bounds networks_left_out nan_bits mesh_fallback_strict_fmul bc_copy_per_layer gather_offset frag_shuffle_fallback position_invariant mesh_no_optimizer "
-            "amd_cloth_no_optimizer fault_gate_serial allowance_at_count_rule mirrors split_ub_flush warp64 fsr4_tune "
+            "amd_cloth_no_optimizer fault_gate_serial allowance_at_count_rule mirrors split_ub_flush warp64 fsr4_tune fsr4_compact_builds "
             "astc_bc_all room_in_blocks_rule squeeze_damped threaded_auto_render threaded_auto_recorder",
          num=(0, 0, 0, 2, 0, 4, 4769, 2044, 614, 461, 922, -1, 256, 12, 32, 16, 97, 1, 4, 4, 6, 6, 3)),
     # (ASTC on the GPU in bounded chunks: 4,096 MB cap for 32 GB RAM; RX_VK_ASTC_CPU=1 raises it to 7,162 MB. The process may
@@ -305,7 +305,7 @@ PCS = [
          facts=(0x1002, 0x164E, "AMD_PROPRIETARY", 0x800161, "INTEGRATED_GPU", "26.10.1 " + AMD_OLD, "AMD Radeon(TM) Graphics", 1, 0,
                 16300, 10232, 32600, 24, 8, 4, 1, 1, 0, 0, 0, 1, 1, 64, 64, 0xFF),
          on="bc_small_runs acquire_ahead fetch_bounds networks_left_out nan_bits mesh_fallback_strict_fmul bc_copy_per_layer gather_offset frag_shuffle_fallback position_invariant mesh_no_optimizer "
-            "amd_cloth_no_optimizer fault_gate_serial allowance_at_count_rule split_ub_flush warp64 fsr4_tune "
+            "amd_cloth_no_optimizer fault_gate_serial allowance_at_count_rule split_ub_flush warp64 fsr4_tune fsr4_compact_builds "
             "astc_bc_all threaded_auto_render threaded_auto_recorder",
          num=(0, 0, 0, 2, 0, 16, 4096, 3072, 768, 512, 512, -1, 256, 0, 64, 32, 90, 1, 6, 4, 8, 6, 4)),
     # (Krackan Point gfx1152: native mesh and native float atomics from 0x8001a0 on Windows)

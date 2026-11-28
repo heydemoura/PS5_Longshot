@@ -967,7 +967,7 @@
       },
       "reviewed_source": {
         "repository": "https://git.magicbean.dev/MagicBeanDev/Longshot",
-        "revision": "3b699a6c4388fa781e60d83132f9a2178cced653",
+        "revision": "sha256:15493f4ffd7e183125ce6ae0052ea801ccdd04a7f7af4da79ea2b3e89885c911",
         "files": {
           "assets/longshot.png": "9186c5ea9c3c5d4b22725d3dbffd4eb81a8965f66cebbcfa1c492423b9defb2b",
           "game/game.h": "f8c17f88f983c01c47e0ae3e411c6b85b72fca563f958414187c2b46dd13829b",
@@ -980,7 +980,7 @@
           "gpu/vk/astc_bc_policy.h": "a6e0dd80a463e2ab6a8d7029bee303dc278e0fac2590bb3622f191b81ff8b5be",
           "gpu/vk/auto_settings.h": "a71f31cd0061f1d0af7fec591db702262785c14db337fb5f1bca79eea26026f4",
           "gpu/vk/compat/longshot_env.h": "c94ec5b5dbf99b0e365e1efc6cab3306db99d7c12a872b049630b0035d9b7bbc",
-          "gpu/vk/device_policy.h": "73ee6a7fb1f55a0f05c575e8cb0ccd43ec1605c4cf4a91c5f9b678343d26937a",
+          "gpu/vk/device_policy.h": "f2f90551b2ab9009edfb350a6b355e414977f90e5acf2e0d6a84ac189da28e6f",
           "gpu/vk/display_modes.h": "beea7b04494ed72b564eb462be979029c4aa81cc661154ec88c28b7050149c3f",
           "gpu/vk/dlss_nr_settings.h": "2bbe19e4c500d487cda60e009f8a056d6383a5389cbdd58503ff8d82e6443717",
           "gpu/vk/dlss_nr_support.h": "cf8e758b8cc9964ab5b82afb7880dbb12a74032b5ca71aa2f5ab5c6e5b69058b",
