@@ -235,6 +235,7 @@ HOS_SITE_ENGINE(ui_titleReset, "ui.titleReset", hos_site_ui_title_reset)
 HOS_SITE_ENGINE(ui_pictureConstants, "ui.pictureConstants", hos_site_ui_picture_constants)
 HOS_SITE_ENGINE(ui_pictureDraw, "ui.pictureDraw", hos_site_ui_picture_draw)
 HOS_SITE_ENGINE(ui_layoutBuilt, "ui.layoutBuilt", hos_site_ui_layout_built)
+HOS_SITE_ENGINE(ui_listSetup, "ui.listSetup", hos_site_ui_list_setup)
 
 /* The frame's real time at the step divides (inline rules: host/nn_vi.c owns both values) */
 HOS_VALUE(frame_seconds, "frame.seconds", uint32_t, hos_frame_seconds_bits)

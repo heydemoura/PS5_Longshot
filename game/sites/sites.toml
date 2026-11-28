@@ -1196,3 +1196,11 @@ at = "after"
 shape = "data"
 thread = "worker"
 args = ["x19:ptr:layout"]
+
+[[site]]
+name = "ui.listSetup"
+doc = "A list's engine is about to be set up, counting its item slots from its pane's width (f_8151eb00, after mov x19, x0; x19 the engine)"
+at = "after"
+shape = "data"
+thread = "worker"
+args = ["x19:ptr:engine"]

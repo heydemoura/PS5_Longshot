@@ -318,6 +318,10 @@ int main(int argc, char **argv) {
 #define LIST (BASE + 0x4e00)
         layout_named(LIST, "PaShortCutSlideList_00");
         const uint64_t list = pane_in(LIST, 55, "N_SlideList_00", 0, 3840, 1, 7);
+        /* (the list's engine: its owner, whose layout is the list's, and its own pane's index) */
+        const uint64_t engine = BASE + 0x23000, owner = BASE + 0x23400, stray = BASE + 0x23800;
+        put64(engine + 0x10, owner), put64(owner + 0x60, LIST), put32(engine + 0x28, 55);
+        put64(stray + 0x10, owner), put32(stray + 0x28, 64);   /* (an index past the layout's panes) */
         /* (a list inside a scissor: the scissor moves with the list, which is then moved once, not cut off at the scissor's old edge) */
         const uint64_t sc = pane_in(MENU, 46, "S_List_00", -1060, 1600, 1, 4), grp = pane_in(MENU, 47, "N_List_00", -1060, 0, 1, 0),
                        bg = pane_in(MENU, 48, "P_ListBg_00", -1060, 1600, 1, 1);
@@ -331,7 +335,16 @@ int main(int argc, char **argv) {
                 msc = place(sc, mroot, -1060) + 1060, place(grp, sc, -1060 + msc), mbg = place(bg, grp, -1060 + msc) + 1060;
                 place(proot, 0, 0); place(strip, proot, 0); place(page0, strip, 0); place(page1, strip, 4280); place(split, strip, 4280); }
             if (pass == 1) {
-                hos_wide_ui_built(&c, LIST);
+                /* The engine counts its item slots from its pane's width as it is set up, before the layout is built: the list
+                   is already wide then, or its slots end at the 16:9 width and the items past them are not drawn. */
+                hos_wide_ui_list_setup(&c, stray);
+                hos_wide_ui_list_setup(&c, 0);
+                CHECK(getf(list + PANE_W) == 3840);
+                hos_wide_ui_list_setup(&c, engine);
+                CHECK(near(getf(list + PANE_W), 3840 / hos_wide_squeeze));
+                hos_wide_ui_list_setup(&c, engine);   /* set up again (reopened) */
+                CHECK(near(getf(list + PANE_W), 3840 / hos_wide_squeeze));
+                hos_wide_ui_built(&c, LIST);   /* then built: not widened twice */
                 CHECK(near(getf(list + PANE_W), 3840 / hos_wide_squeeze));
                 hos_wide_ui_built(&c, LIST);   /* construction called twice must not compound the width */
                 CHECK(near(getf(list + PANE_W), 3840 / hos_wide_squeeze));
@@ -383,6 +396,8 @@ int main(int argc, char **argv) {
                 CHECK(near(drawn_width(mback), 3840 / hos_wide_squeeze));
             } else {
                 place(list, 0, 0);
+                CHECK(near(getf(list + PANE_W), 3840));
+                hos_wide_ui_list_setup(&c, engine);   /* (not Extended: the game's width) */
                 CHECK(near(getf(list + PANE_W), 3840));
                 CHECK(getf(mleft + 0x4c) == -1920 && drawn_width(mback) == 3840 && getf(page1 + 0x4c) == 4280);
                 CHECK(getf(oback + 0x4c) == 1626);   /* (kept whole: the game's) */
@@ -445,22 +460,25 @@ def main():
     backend = (ROOT / "host" / "rx_backend.c").read_text(encoding="utf-8")
 
     check("hos_wide_ui_tick();" in backend, "the host does not plan the HUD each present")
+    sites_c = (ROOT / "game" / "oot_wide_sites.c").read_text(encoding="utf-8")
+    check("hos_wide_ui_list_setup(c, c->x[19]);" in sites_c, "ui.listSetup no longer passes the list's engine (x19)")
     check('getenv("HOS_WIDE_UI")' in host, "HOS_WIDE_UI no longer turns the HUD's moves off")
 
     # (the pane sites, at the instructions main's nx2/oot_wide.py UI_SITES put its C after: function + offset, main + 0x80020000)
     at = {name: int(site(name).function[2:], 16) + site(name).offset for name in (
         "ui.calcDirty", "ui.paneDirty", "ui.paneNoParent", "ui.paneParent", "ui.panePlaced", "ui.paneSize",
-        "ui.pictureConstants", "ui.pictureDraw", "ui.layoutBuilt")}
+        "ui.pictureConstants", "ui.pictureDraw", "ui.layoutBuilt", "ui.listSetup")}
     check(at == {"ui.calcDirty": 0x8154a730, "ui.paneDirty": 0x8154caa0, "ui.paneNoParent": 0x8154cd98,
                  "ui.paneParent": 0x8154cdd4, "ui.panePlaced": 0x8154ce64, "ui.paneSize": 0x8154ac40,
-                 "ui.pictureConstants": 0x815506f4, "ui.pictureDraw": 0x81550740, "ui.layoutBuilt": 0x81545ca0},
+                 "ui.pictureConstants": 0x815506f4, "ui.pictureDraw": 0x81550740, "ui.layoutBuilt": 0x81545ca0,
+                 "ui.listSetup": 0x8151eb4c},
           "the pane transform sites moved")
     api = (ROOT / "game" / "options.h").read_text(encoding="utf-8")   # (the game's option ids)
     opt = re.search(r"HOS_OPT_WIDE_MENUS = (\d+), HOS_WIDE_MENUS_EXTENDED = (\d+)", api)
     check(opt is not None, "game/options.h no longer names the Ultrawide menus option")
     check(opt.groups() == ("102", "3"), "the Ultrawide menus option or its Extended value moved: update FIXTURE_HEAD")
     for name in ("hos_wide_ui_parent(uint64_t parent)", "hos_wide_ui_placed(Ctx *c, uint64_t pane)",
-                 "hos_wide_ui_size(Ctx *c, uint64_t pane)"):
+                 "hos_wide_ui_size(Ctx *c, uint64_t pane)", "hos_wide_ui_list_setup(Ctx *c, uint64_t engine)"):
         check(("void " + name) in host, "the host's %s has another signature" % name.split("(")[0])
 
     body = "".join(line for line in host.splitlines(keepends=True) if not line.startswith("#include"))

@@ -1260,3 +1260,10 @@ function = "f_81545b60"
 offset = 0x140
 signature_offset = 0x13c
 signature = "94000000/fc000000 91004260 910003e1"   # (bl *; add x0, x19, #0x10; mov x1, sp)
+
+[[site]]
+name = "ui.listSetup"
+function = "f_8151eb00"
+offset = 0x4c
+signature_offset = 0x40
+signature = "d10223a1 d10243a2 52800044 aa0003f3"   # (sub x1, x29, #0x88; sub x2, x29, #0x90; mov w4, #2; mov x19, x0)
