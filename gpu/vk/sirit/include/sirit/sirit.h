@@ -762,6 +762,10 @@ public:
     /// Dot product of floating-point vector Operand 1 and vector Operand 2.
     Id OpDot(Id result_type, Id operand_1, Id operand_2);
 
+    /// (longshot) SPV_VALVE_mixed_float_dot_product: Accumulator (f32) + Vector 1 . Vector 2, each vector two f16, the sum rounded
+    /// once (opcode 6916, capability DotProductFloat16AccFloat32VALVE 6912: numbers, the SPIR-V headers in use have neither yet)
+    Id OpFDot2MixAcc32VALVE(Id result_type, Id vector_1, Id vector_2, Id accumulator);
+
     // Extensions
 
     /// Execute an instruction in an imported set of extended instructions.

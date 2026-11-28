@@ -120,7 +120,7 @@ std::vector<uint32_t> build_shader(const std::function<void(TestShader&)>& body)
 
 // one dispatch of a 32-lane shader over words (in and out), groups of 32 lanes
 bool run_shader(const std::vector<uint32_t>& code, std::vector<uint32_t>& data, uint32_t groups = 1,
-                const char* what = "cooperative matrix test") {
+                const char* what = "cooperative matrix test", bool full_subgroups = false) {
     const VkDeviceSize size = data.size() * 4;
     VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bi.size = size;
@@ -175,6 +175,10 @@ bool run_shader(const std::vector<uint32_t>& code, std::vector<uint32_t>& data, 
         if (extern_guarded_shader_module(&smi, &module) != VK_SUCCESS) module = VK_NULL_HANDLE;
         cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, module, "main", nullptr};
         if (dev.sg32_stages & VK_SHADER_STAGE_COMPUTE_BIT) cpi.stage.pNext = &lanes;
+        // (full_subgroups: as vk_draw.cpp pin_subgroup gives a pinned program whose workgroup is whole subgroups, the one a
+        // test with workgroup memory tiles a subgroup stands for)
+        if (full_subgroups && (dev.sg32_stages & VK_SHADER_STAGE_COMPUTE_BIT) && dev.vk13.computeFullSubgroups)
+            cpi.stage.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
         cpi.layout = layout;
         pr = module ? extern_guarded_compute(VK_NULL_HANDLE, &cpi, &pipeline) : VK_ERROR_INITIALIZATION_FAILED;
     }
@@ -453,27 +457,38 @@ namespace {
 // a tie between 2048 and 2050), 48 * 1365 + 2^-8 * (+-2^-8) = 65520 +- 2^-16 (a tie between 65504 and infinity). A driver that
 // rounds such a sum to f16 once, folding the conversion into the FMA, gives the other neighbour for 2049 + 2^-16 and 65520 -
 // 2^-16, and the loop is kept. (The test module has none of the game programs' float-control execution modes: it stands for
-// them while those leave f16 denormals alone, profile support_fp16_denorm_* unset, as now.)
+// them while those leave f16 denormals alone, profile support_fp16_denorm_* unset, as now.) Every eighth warp from the fourth is
+// built for the Dot2 form, whose pair dot product rounds two products and their sum once where the loop rounds twice (see
+// software_test_input). And B through workgroup memory is tried in 128-lane workgroups, four subgroups a tile each, as the
+// game's networks have them, against the same form's words through shuffles.
 constexpr uint32_t kSoftwareTestLanes = 32 * 256;
+constexpr uint32_t kSoftwareStagedLanes = 128;   // (a staged test workgroup: four 32-lane subgroups)
 
 /// lane gid (workgroup * 32 + lane): D of words [8 gid, 8 gid + 8) (A 4, B 2, C 2) through the form's function, to words
-/// 8 * kSoftwareTestLanes + 2 gid
-std::vector<uint32_t> software_test_shader(Shader::Backend::SPIRV::SoftwareMmaForm form, bool quad) {
+/// 8 * kSoftwareTestLanes + 2 gid. staged: B through a workgroup memory tile per subgroup (mma_software.h SoftwareMmaStagedB), in
+/// workgroups of kSoftwareStagedLanes, laid out as emit_spirv_warp.cpp DefineSoftwareMatrixFunction lays them (a plain array)
+std::vector<uint32_t> software_test_shader(Shader::Backend::SPIRV::SoftwareMmaForm form, bool quad, bool staged = false) {
     using namespace Sirit;
     using Shader::Backend::SPIRV::DefineSoftwareMma;
     Module m{0x00010600};
-    // (f16 only in the form that converts to it: the others run where the device has no f16 shaders)
-    const bool f16 = form == Shader::Backend::SPIRV::SoftwareMmaForm::UnrolledF16;
+    // (f16 only in the forms that convert to it: the others run where the device has no f16 shaders)
+    const bool dot2 = form == Shader::Backend::SPIRV::SoftwareMmaForm::Dot2;
+    const bool f16 = form == Shader::Backend::SPIRV::SoftwareMmaForm::UnrolledF16 || dot2;
     m.AddCapability(spv::Capability::Shader);
     if (f16) m.AddCapability(spv::Capability::Float16);
+    if (dot2) {
+        m.AddExtension(Shader::Backend::SPIRV::kMixedFloatDotProductExtension);
+        m.AddCapability(Shader::Backend::SPIRV::kDotProductFloat16AccFloat32VALVE);
+    }
     m.AddCapability(spv::Capability::GroupNonUniform);
     m.AddCapability(spv::Capability::GroupNonUniformShuffle);
     if (quad) m.AddCapability(spv::Capability::GroupNonUniformQuad);
     m.SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
     const Id void_t = m.TypeVoid(), u32 = m.TypeUInt(32), f32 = m.TypeFloat(32);
     const Id uvec3 = m.TypeVector(u32, 3);
+    const Id f16_t = f16 ? m.TypeFloat(16) : Id{};
     const Shader::Backend::SPIRV::SoftwareMmaTypes types{u32, m.TypeVector(u32, 2), m.TypeVector(u32, 4), f32, m.TypeVector(f32, 2),
-                                                         f16 ? m.TypeFloat(16) : Id{}, m.TypeBool()};
+                                                         f16_t, m.TypeBool(), f16 ? m.TypeVector(f16_t, 2) : Id{}};
     const Id runtime = m.TypeRuntimeArray(u32);
     m.Decorate(runtime, spv::Decoration::ArrayStride, 4U);
     const Id block = m.TypeStruct(runtime);
@@ -487,7 +502,17 @@ std::vector<uint32_t> software_test_shader(Shader::Backend::SPIRV::SoftwareMmaFo
     const Id lane_var = m.AddGlobalVariable(m.TypePointer(spv::StorageClass::Input, u32), spv::StorageClass::Input);
     m.Decorate(lane_var, spv::Decoration::BuiltIn, spv::BuiltIn::SubgroupLocalInvocationId);
     const Id u32_ptr = m.TypePointer(spv::StorageClass::StorageBuffer, u32);
-    const Id fn = DefineSoftwareMma(m, types, lane_var, form, quad);
+    Shader::Backend::SPIRV::SoftwareMmaStagedB tiles{};
+    if (staged) {   // (no stride, as DefineSoftwareMatrixFunction's)
+        const Id array =
+            m.TypeArray(types.u32x4, m.Constant(u32, kSoftwareStagedLanes / 32 * Shader::Backend::SPIRV::kSoftwareMmaTileVectors));
+        tiles.tile = m.AddGlobalVariable(m.TypePointer(spv::StorageClass::Workgroup, array), spv::StorageClass::Workgroup);
+        tiles.subgroup_id = m.AddGlobalVariable(m.TypePointer(spv::StorageClass::Input, u32), spv::StorageClass::Input);
+        m.Decorate(tiles.subgroup_id, spv::Decoration::BuiltIn, spv::BuiltIn::SubgroupId);
+        tiles.u32_pointer = m.TypePointer(spv::StorageClass::Workgroup, u32);
+        tiles.u32x4_pointer = m.TypePointer(spv::StorageClass::Workgroup, types.u32x4);
+    }
+    const Id fn = DefineSoftwareMma(m, types, lane_var, form, quad, staged ? &tiles : nullptr);
     const Id main = m.OpFunction(void_t, spv::FunctionControlMask::MaskNone, m.TypeFunction(void_t));
     m.AddLabel();
     const auto c32 = [&](uint32_t v) { return m.Constant(u32, v); };
@@ -497,13 +522,15 @@ std::vector<uint32_t> software_test_shader(Shader::Backend::SPIRV::SoftwareMmaFo
     std::array<Id, 8> w;
     for (uint32_t k = 0; k < 8; k++) w[k] = m.OpLoad(u32, word(in, k));
     const Id d = m.OpFunctionCall(types.u32x2, fn, m.OpCompositeConstruct(types.u32x4, w[0], w[1], w[2], w[3]),
-                                  m.OpCompositeConstruct(types.u32x2, w[4], w[5]), m.OpCompositeConstruct(types.u32x2, w[6], w[7]));
+                            m.OpCompositeConstruct(types.u32x2, w[4], w[5]), m.OpCompositeConstruct(types.u32x2, w[6], w[7]));
     const Id out = m.OpIAdd(u32, c32(8 * kSoftwareTestLanes), m.OpIMul(u32, gid, c32(2)));
     for (uint32_t k = 0; k < 2; k++) m.OpStore(word(out, k), m.OpCompositeExtract(u32, d, k));
     m.OpReturn();
     m.OpFunctionEnd();
-    m.AddEntryPoint(spv::ExecutionModel::GLCompute, main, "main", buf, gid_var, lane_var);
-    m.AddExecutionMode(main, spv::ExecutionMode::LocalSize, 32U, 1U, 1U);
+    std::vector<Id> interfaces{buf, gid_var, lane_var};
+    if (staged) interfaces.insert(interfaces.end(), {tiles.tile, tiles.subgroup_id});
+    m.AddEntryPoint(spv::ExecutionModel::GLCompute, main, "main", interfaces);
+    m.AddExecutionMode(main, spv::ExecutionMode::LocalSize, staged ? kSoftwareStagedLanes : 32U, 1U, 1U);
     return m.Assemble();
 }
 
@@ -534,24 +561,77 @@ std::vector<uint32_t> software_test_input() {
             lane[4] = b | small << 16;               // (column g: k 6 and 7)
         }
     }
+    for (uint32_t warp = 4; warp < kSoftwareTestLanes / 32; warp += 8) {
+        // (for the Dot2 form: k 4 gives x = a4 * b4, k 6 and 7 the products p and q, x + p an f32 tie that q, far smaller, decides
+        // when the pair is rounded once. 2049 + 2^-13 + 2^-20 is f16 2050 rounded once, 2048 rounded twice (2049 + 2^-13 -> 2049,
+        // then an f16 tie to even). Kind 1 has p and q the other way round; kind 2 is 2051 - 2^-13 - 2^-20 (once 2050, twice 2052))
+        const uint32_t kind = warp / 8 % 3;
+        const uint32_t a4 = kind < 2 ? 0x4200 /* 3 */ : 0x4700 /* 7 */, b4 = kind < 2 ? 0x6156 /* 683 */ : 0x5c94 /* 293 */;
+        // (A's k 6 and 7, B's k 6 and 7: 2^-7 * 2^-6 = 2^-13, 2^-10 * 2^-10 = 2^-20)
+        const uint32_t a67 = kind == 0 ? 0x2000 | 0x1400u << 16 : kind == 1 ? 0x1400 | 0x2000u << 16 : 0xa000 | 0x9400u << 16;
+        const uint32_t b67 = kind == 0 ? 0x2400 | 0x1400u << 16 : kind == 1 ? 0x1400 | 0x2400u << 16 : 0x2400 | 0x1400u << 16;
+        for (uint32_t t = 0; t < 32; t++) {
+            uint32_t* lane = &data[(warp * 32 + t) * 8];
+            for (uint32_t k = 0; k < 8; k++) lane[k] = 0;
+            if (t % 4 == 2) lane[0] = lane[1] = a4, lane[4] = b4;     // (k 4 of rows g and g + 8, and of column g)
+            if (t % 4 == 3) lane[0] = lane[1] = a67, lane[4] = b67;   // (k 6 and 7)
+        }
+    }
     return data;
 }
 
 constexpr size_t kSoftwareFormDidNotRun = ~size_t(0);
 
-/// The two forms' words the same (any NaN is a NaN). *differ: the words that are not, or kSoftwareFormDidNotRun when the device
-/// could not run the form (false then too)
-bool software_forms_agree(Shader::Backend::SPIRV::SoftwareMmaForm form, bool quad, const std::vector<uint32_t>& loop, size_t* differ) {
-    std::vector<uint32_t> data = software_test_input();
-    *differ = kSoftwareFormDidNotRun;
-    if (!run_shader(software_test_shader(form, quad), data, kSoftwareTestLanes / 32, "software matrix test")) return false;
+/// How a form's words differ from the ones it is compared with: differ, the words that are not the same (any NaN is a NaN); off,
+/// the words with a half more than 2 f16 ulps off, of the other sign, a NaN against a number or an infinity against a finite
+/// value (0x7bff and 0x7c00 are one apart in bits, not in value): what a lane or layout mistake gives, not a rounding. Both
+/// kSoftwareFormDidNotRun when the device could not run the form
+struct SoftwareWords {
+    size_t differ = kSoftwareFormDidNotRun, off = kSoftwareFormDidNotRun;
+    bool ran() const { return differ != kSoftwareFormDidNotRun; }
+};
+
+/// The form's words for the test's fragments (in data, past the fragments: software_test_shader), or false when the device could
+/// not run it
+bool software_form_words(Shader::Backend::SPIRV::SoftwareMmaForm form, bool quad, bool staged, std::vector<uint32_t>& data) {
+    data = software_test_input();
+    return run_shader(software_test_shader(form, quad, staged), data,
+                      kSoftwareTestLanes / (staged ? kSoftwareStagedLanes : 32), "software matrix test", staged);
+}
+
+SoftwareWords software_words_compare(const std::vector<uint32_t>& got, const std::vector<uint32_t>& want) {
     const auto nan_as_one = [](uint32_t h) { return (h & 0x7c00) == 0x7c00 && (h & 0x3ff) ? 0x7e00u : h; };
-    *differ = 0;
+    // (finite f16 bits of one sign are in the order of their values: ulps apart is the bits' difference; +0 and -0 count as one.
+    // An infinity or a NaN is near only its own kind: 65504 is one bit from infinity)
+    const auto within = [&](uint32_t a, uint32_t b) {
+        a = nan_as_one(a), b = nan_as_one(b);
+        if ((a & 0x7fff) == 0 && (b & 0x7fff) == 0) return true;
+        if ((a ^ b) & 0x8000 || ((a & 0x7c00) == 0x7c00) != ((b & 0x7c00) == 0x7c00)) return false;
+        if ((a & 0x7c00) == 0x7c00) return a == b;
+        return (a > b ? a - b : b - a) <= 2;
+    };
+    SoftwareWords r;
+    r.differ = r.off = 0;
     for (uint32_t i = 0; i < 2 * kSoftwareTestLanes; i++) {
-        const uint32_t got = data[8 * kSoftwareTestLanes + i], want = loop[8 * kSoftwareTestLanes + i];
-        *differ += nan_as_one(got & 0xffff) != nan_as_one(want & 0xffff) || nan_as_one(got >> 16) != nan_as_one(want >> 16);
+        const uint32_t g = got[8 * kSoftwareTestLanes + i], w = want[8 * kSoftwareTestLanes + i];
+        r.differ += nan_as_one(g & 0xffff) != nan_as_one(w & 0xffff) || nan_as_one(g >> 16) != nan_as_one(w >> 16);
+        r.off += !within(g & 0xffff, w & 0xffff) || !within(g >> 16, w >> 16);
     }
-    return *differ == 0;
+    return r;
+}
+
+/// RX_VK_MMA_DOT2 (the extension is asked for in vk_main.cpp the same way, where the unrolled forms are tried): unset or 1, the
+/// Dot2 form is tried where the device has the f16 pair dot product and used where no word of the self-test is far from the
+/// loop's (SoftwareWords::off 0: each within 2 f16 ulps); 0, not tried
+bool software_dot2_wanted(bool mixed_dot_f16, const char* env) {
+    return mixed_dot_f16 && (!env || !env_value_off(env));
+}
+
+/// RX_VK_MMA_STAGE_B: 0, B through shuffles; 1, through workgroup memory on any GPU whose compute subgroups are pinned to 32 lanes;
+/// unset, on RADV, where the shuffles are ds_bpermute_b32 through the LDS anyway (the Steam Deck). Used only where the self-test
+/// gives the same words as through shuffles
+bool software_stage_b_wanted(VkDriverId driver, bool compute_pinned_32, const char* env) {
+    return compute_pinned_32 && (env ? !env_value_off(env) : driver == VK_DRIVER_ID_MESA_RADV);
 }
 
 /// RX_VK_MMA_UNROLL=0: the loop; 1: the unrolled forms tried on any GPU; unset: on RADV and on AMD RDNA 4 (is_rdna4)
@@ -561,10 +641,48 @@ bool software_unroll_wanted(VkDriverId driver, bool rdna4, const char* env) {
     return env ? !env_value_off(env) : def;
 }
 
+/// (mma_software.h SoftwareMmaStagedB) B through workgroup memory for the chosen form, where it gives that form's own words
+/// (words, through shuffles) in 128-lane workgroups; else the shuffles stay. Only with full compute subgroups
+/// (computeFullSubgroups, as wmma16_init): a subgroup with lanes missing would have a SubgroupId past the workgroup's tiles and
+/// lanes missing at its barriers. Sets mma_software_staged_b and mma_software_full_subgroups, which choose_software_form has
+/// turned off
+void choose_staged_b(Shader::Backend::SPIRV::SoftwareMmaForm form, bool quad, const std::vector<uint32_t>& words) {
+    namespace spirv = Shader::Backend::SPIRV;
+    const char* env = std::getenv("RX_VK_MMA_STAGE_B");
+    const bool pinned = dev.sg32_stages & VK_SHADER_STAGE_COMPUTE_BIT;
+    if (!software_stage_b_wanted(dev.driver_id, pinned, env)) {
+        logf("vk: software matrix multiplies: B through shuffles (%s)", env && env_value_off(env) ? "RX_VK_MMA_STAGE_B=0"
+                                                                       : !pinned ? "compute subgroups not pinned to 32 lanes"
+                                                                                 : "not RADV, RX_VK_MMA_STAGE_B=1 tries workgroup memory");
+        return;
+    }
+    if (!dev.vk13.computeFullSubgroups) {   // (vk_draw.cpp pin_subgroup asks REQUIRE_FULL_SUBGROUPS only with it)
+        logf("vk: software matrix multiplies: B through shuffles (no full compute subgroups)");
+        return;
+    }
+    std::vector<uint32_t> data;
+    if (!software_form_words(form, quad, true, data)) {
+        logf("vk: software matrix multiplies: B through workgroup memory: its test did not run: B through shuffles");
+        return;
+    }
+    const SoftwareWords r = software_words_compare(data, words);
+    if (r.differ) {
+        logf("vk: software matrix multiplies: B through workgroup memory gave %zu of %u words other than through shuffles: "
+             "B through shuffles", r.differ, 2 * kSoftwareTestLanes);
+        return;
+    }
+    spirv::mma_software_staged_b = dev.props.limits.maxComputeSharedMemorySize;
+    spirv::mma_software_full_subgroups = true;
+    logf("vk: software matrix multiplies: B through workgroup memory, 256 bytes a subgroup: the shuffles' words for %u lanes "
+         "(RX_VK_MMA_STAGE_B=0: through shuffles)", kSoftwareTestLanes);
+}
+
 void choose_software_form() {
     using Shader::Backend::SPIRV::SoftwareMmaForm;
     namespace spirv = Shader::Backend::SPIRV;
     spirv::mma_software_form = (uint32_t)SoftwareMmaForm::Loop;
+    spirv::mma_software_staged_b = 0;
+    spirv::mma_software_full_subgroups = false;
     const char* env = std::getenv("RX_VK_MMA_UNROLL");
     if (!software_unroll_wanted(dev.driver_id, is_rdna4(dev.props.vendorID, dev.props.deviceID, dev.props.deviceName), env)) {
         logf("vk: software matrix multiplies looped (%s)",
@@ -579,31 +697,56 @@ void choose_software_form() {
     vkGetPhysicalDeviceProperties2(dev.physical, &p2);
     const bool quad = (sg.supportedOperations & VK_SUBGROUP_FEATURE_QUAD_BIT) && (sg.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) &&
                       sg.quadOperationsInAllStages;
-    std::vector<uint32_t> loop = software_test_input();
-    if (!run_shader(software_test_shader(SoftwareMmaForm::Loop, false), loop, kSoftwareTestLanes / 32, "software matrix test")) {
+    std::vector<uint32_t> loop;
+    if (!software_form_words(SoftwareMmaForm::Loop, false, false, loop)) {
         logf("vk: software matrix multiplies looped (the loop's test did not run)");
         return;
     }
-    size_t differ = 0;
-    for (const SoftwareMmaForm form : {SoftwareMmaForm::UnrolledF16, SoftwareMmaForm::Unrolled}) {
-        const char* name = form == SoftwareMmaForm::UnrolledF16 ? "unrolled, f16 rounding by conversion" : "unrolled, f16 rounding in integers";
-        // (the f16 form's conversions need f16 shaders: RADV gives Polaris, RX 400/500, none)
-        if (form == SoftwareMmaForm::UnrolledF16 && !dev.vk12.shaderFloat16) {
+    const char* dot2_env = std::getenv("RX_VK_MMA_DOT2");
+    for (const SoftwareMmaForm form : {SoftwareMmaForm::Dot2, SoftwareMmaForm::UnrolledF16, SoftwareMmaForm::Unrolled}) {
+        const char* name = form == SoftwareMmaForm::Dot2          ? "unrolled, f16 pair dot products, f16 rounding by conversion"
+                           : form == SoftwareMmaForm::UnrolledF16 ? "unrolled, f16 rounding by conversion"
+                                                                  : "unrolled, f16 rounding in integers";
+        // (the f16 forms' conversions need f16 shaders: RADV gives Polaris, RX 400/500, none)
+        if (form != SoftwareMmaForm::Unrolled && !dev.vk12.shaderFloat16) {
             logf("vk: software matrix multiplies: %s not tried (the GPU has no f16 shaders)", name);
             continue;
         }
-        if (software_forms_agree(form, quad, loop, &differ)) {
+        if (form == SoftwareMmaForm::Dot2 && !software_dot2_wanted(dev.mixed_dot_f16, dot2_env)) {
+            // (vk_main.cpp asks for the extension only with Vulkan headers that have it, 1.4.345 on)
+#ifdef VK_VALVE_shader_mixed_float_dot_product
+            const char* missing = "no f16 pair dot product into f32 on this GPU";
+#else
+            const char* missing = "this build's Vulkan headers have no f16 pair dot product";
+#endif
+            logf("vk: software matrix multiplies: %s not tried (%s)", name,
+                 dot2_env && env_value_off(dot2_env) ? "RX_VK_MMA_DOT2=0" : missing);
+            continue;
+        }
+        std::vector<uint32_t> words;
+        const SoftwareWords r = software_form_words(form, quad, false, words) ? software_words_compare(words, loop) : SoftwareWords{};
+        // (Dot2 rounds a K pair once, the loop twice: on these fragments its words are within 2 f16 ulps of the loop's, where a
+        // lane or layout mistake is off by whole values)
+        const bool within_rounding = form == SoftwareMmaForm::Dot2 && r.off == 0;
+        if (r.ran() && (r.differ == 0 || within_rounding)) {
             spirv::mma_software_form = (uint32_t)form;
             spirv::mma_software_quad = quad;
-            logf("vk: software matrix multiplies %s%s: the loop's words for %u lanes (RX_VK_MMA_UNROLL=0: looped)", name,
-                 quad ? ", A through quad broadcasts" : "", kSoftwareTestLanes);
+            char how[160];
+            if (r.differ == 0)
+                snprintf(how, sizeof how, "the loop's words for %u lanes", kSoftwareTestLanes);
+            else
+                snprintf(how, sizeof how, "%zu of %u words other than the loop's, all within 2 f16 ulps (RX_VK_MMA_DOT2=0: not tried)",
+                         r.differ, 2 * kSoftwareTestLanes);
+            logf("vk: software matrix multiplies %s%s: %s (RX_VK_MMA_UNROLL=0: looped)", name,
+                 quad ? ", A through quad broadcasts" : "", how);
+            choose_staged_b(form, quad, words);
             return;
         }
-        if (differ == kSoftwareFormDidNotRun)
+        if (!r.ran())
             logf("vk: software matrix multiplies: %s: its test did not run: not used", name);
         else
-            logf("vk: software matrix multiplies: %s gave %zu of %u words other than the loop's: not used", name, differ,
-                 2 * kSoftwareTestLanes);
+            logf("vk: software matrix multiplies: %s gave %zu of %u words other than the loop's (%zu more than 2 f16 ulps off): not used",
+                 name, r.differ, 2 * kSoftwareTestLanes, r.off);
     }
     logf("vk: software matrix multiplies looped");
 }
@@ -681,6 +824,11 @@ bool shared_warp_wanted(bool by_policy, const char* env) {
     return env && *env ? !env_value_off(env) : by_policy;
 }
 } // namespace
+
+bool software_dot2_extension_wanted(VkDriverId driver, const VkPhysicalDeviceProperties& props) {
+    return software_unroll_wanted(driver, is_rdna4(props.vendorID, props.deviceID, props.deviceName), std::getenv("RX_VK_MMA_UNROLL")) &&
+           software_dot2_wanted(true, std::getenv("RX_VK_MMA_DOT2"));
+}
 
 void coopmat_init() {
     // (amd-fix) NaN guard on float colour outputs (mma_layout.h frag_nan_guard), on every card since v2.0.6 as NX2navi's patch 0027

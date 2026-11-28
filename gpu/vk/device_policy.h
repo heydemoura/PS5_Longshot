@@ -442,6 +442,11 @@ struct DevicePolicy {
     // Steam Deck and an RX 9060 XT); a test shader on the device then says which is used. RX_VK_MMA_UNROLL. Site
     // (vk_coopmat.cpp), step 7
     bool mma_unroll_try = false;
+    // RADV: the software matrix multiplies' B through a workgroup memory tile a subgroup instead of 16 shuffles (measured on the
+    // Steam Deck, where the shuffles are ds_bpermute_b32 through the LDS anyway), where compute subgroups can be pinned to 32
+    // lanes (sg32_stages: not GCN's, nor Vega's) and are full and a test shader on the device gives the shuffles' words. RX_VK_MMA_STAGE_B. Site (vk_coopmat.cpp
+    // software_stage_b_wanted, choose_staged_b), step 7
+    bool mma_stage_b_try = false;
     // Mesa's Intel driver, with dynamic indexing of storage buffer arrays: the tables searched in loops, as Mesa inlines
     // the written-out form (Windows not tried). RX_VK_GM_LOOP. Site (vk_coopmat.cpp table_loop_wanted), step 7
     bool global_table_loop = false;
@@ -641,6 +646,7 @@ inline DevicePolicy device_policy(const DeviceFacts& f) {
     // (corrected: GCN by the one definition, radv_gcn. To go back: f.radv() && !(f.sg32_stages == 0 && f.subgroup_size > 32))
     p.batch_submits = f.radv() && !f.radv_gcn() && !(f.rdna4() && f.discrete());
     p.mma_unroll_try = f.radv() || (f.rdna4() && f.driver_id == VK_DRIVER_ID_AMD_PROPRIETARY);
+    p.mma_stage_b_try = f.radv() && (f.sg32_stages & VK_SHADER_STAGE_COMPUTE_BIT);
     p.global_table_loop = f.driver_id == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA && f.storage_buffer_array_dynamic_indexing;
     p.occ_copy = f.driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && f.discrete();
     p.fsr4_tune = f.amd();
@@ -869,6 +875,7 @@ template <class Line> void device_policy_log(const DevicePolicy& p, const Device
         l.flag("mesh_shared_warp_default", p.mesh_shared_warp);
         l.flag("batch_submits", p.batch_submits, p.set(Sw::batch_submits));
         l.flag("mma_unroll_try", p.mma_unroll_try);
+        l.flag("mma_stage_b_try", p.mma_stage_b_try);
         l.flag("global_table_loop", p.global_table_loop);
         l.flag("occ_copy", p.occ_copy, p.set(Sw::occ_copy), "101.9154");
         l.flag("intel_side_by_side_auto", p.intel_side_by_side_auto, false, "101.9154");

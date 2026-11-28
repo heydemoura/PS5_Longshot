@@ -5,7 +5,7 @@
 // HMMA_nx2 (emit_spirv_warp.cpp EmitMatrixMulAddF16), and built the same way by the device's self-test (vk_coopmat.cpp), which
 // is why it takes a plain Sirit module and the types it needs rather than the translator's EmitContext.
 //
-// Two forms compute the same words:
+// The forms (the first three compute the same words):
 // - Loop: Lichii's (zortos293/Lichii, emit_spirv_tensor.cpp, GPL-3.0). The 8 steps (4 K-pairs in each half of K) in a loop the
 //   driver is asked not to unroll; A and B from other lanes through shuffles, the f16 rounding in integer operations.
 // - Unrolled: the steps written out (in a loop that runs once: see below). A lane's rows of A are in its own quad (lanes 4g..4g+3), so A comes through quad broadcasts
@@ -19,6 +19,29 @@
 //   unrolled one only where its words are the loop's. The shuffle keeps them apart only while the driver keeps a shuffle by
 //   xor 0: one that folds it away rounds once again, and the tie inputs then make the self-test keep the loop (slower, said
 //   only in the log).
+// - Dot2: UnrolledF16 with A's and B's words left packed, two f16 a word, and each K pair one OpFDot2MixAcc32VALVE
+//   (VK_VALVE_shader_mixed_float_dot_product) into the f32 sum: on RADV v_dot2c_f32_f16 with A's quad broadcast folded into it as
+//   DPP, 32 a multiply where UnrolledF16 has 64 v_fma_mix_f32 and 16 DPP moves (ACO's listing on the Steam Deck: the self-test's
+//   bench body 172 lines -> 133). Not always the loop's words: v_dot2 rounds a pair's two products and their sum once, the loop
+//   after each product, so a pair's partial sum differs from the loop's by at most one f32 rounding (of that sum). That is not a
+//   bound in f16 ulps of the result: where the K group's later terms cancel most of the sum, the difference can be many f16 ulps,
+//   and where the sum lands beside an f16 tie it rounds the other way (the self-test's double-rounding warps find that every
+//   time). vk_coopmat.cpp uses it where, on the self-test's fragments, every word is within 2 f16 ulps of the loop's, same sign,
+//   NaN and infinity where the loop's are: a lane or layout mistake is off by whole values, not ulps. That the game's pictures do
+//   not change is for an image comparison against the loop, not for this check. The loop is not the console's rounding either:
+//   a tensor core adds a group's products before rounding, as v_dot2 does.
+//
+// And B either way through the subgroup (16 shuffles a multiply: on AMD 16 ds_bpermute_b32, the largest cost left once Dot2
+// has halved the multiply-adds) or, with staged (SoftwareMmaStagedB), through a 256-byte tile of workgroup memory per subgroup:
+// each lane writes its two words (8 adjacent bytes) and reads the 16 its columns need, which are four aligned 16-byte runs
+// (lanes 8i..8i+7 hold columns 2i and 2i + 1), so 2 stores and 4 loads instead of 16 shuffles, with the same words: only where
+// the bytes move changes, not the arithmetic. A subgroup barrier (no workgroup barrier: the tile is the subgroup's own, and
+// HMMA runs in any control flow the warp is converged in) orders the writes before the reads, and the previous multiply's reads
+// before them. A subgroup barrier needs the whole subgroup there, converged: with a lane missing (a partial subgroup) or one
+// that has exited or taken another branch it is undefined, as the WMMA16 tiles' barriers are (mma_layout.h
+// mma_wmma16_full_subgroups). So only for compute programs whose subgroups are 32 lanes and full (computeFullSubgroups,
+// mma_software_full_subgroups; emit_spirv_warp.cpp), called where the guest's warp is converged as HMMA requires, and only where
+// the device's self-test gives the unstaged form's words (vk_coopmat.cpp).
 //
 // On the Steam Deck (RADV), one multiply a lane over a 1280x800 dispatch: 0.469 ms looped, 0.363 ms unrolled with the integer
 // rounding, 0.177 ms unrolled with the conversion (a fully fused conversion, not the same words, 0.153 ms). OoT's gameplay network
@@ -36,17 +59,49 @@ enum class SoftwareMmaForm : uint32_t {
     Loop = 0,          // (Lichii's: the steps in a loop, shuffles, integer rounding)
     Unrolled = 1,      // (written out, A through quad broadcasts, integer rounding)
     UnrolledF16 = 2,   // (written out, A through quad broadcasts, the GPU's f16 conversion rounds)
+    Dot2 = 3,          // (UnrolledF16 with each K pair one f16 pair dot product into f32, OpFDot2MixAcc32VALVE)
 };
+
+/// (longshot) The Dot2 form's OpFDot2MixAcc32VALVE needs these (VK_VALVE_shader_mixed_float_dot_product's
+/// shaderMixedFloatDotProductFloat16AccFloat32). As numbers: the SPIR-V headers in use do not have them yet
+inline constexpr spv::Capability kDotProductFloat16AccFloat32VALVE = static_cast<spv::Capability>(6912);
+inline constexpr const char* kMixedFloatDotProductExtension = "SPV_VALVE_mixed_float_dot_product";
 
 struct SoftwareMmaTypes {
     Sirit::Id u32, u32x2, u32x4, f32, f32x2, f16, boolean;
+    Sirit::Id f16x2{};   // (the Dot2 form's: a word's two f16 as the dot product takes them)
 };
+
+/// (longshot) B through workgroup memory (see above): tile is a Workgroup array variable holding 16 u32x4 a subgroup, subgroup_id
+/// the SubgroupId input. The subgroups must be 32 lanes and full; the caller adds the variables to the entry point
+struct SoftwareMmaStagedB {
+    Sirit::Id tile, subgroup_id;
+    Sirit::Id u32_pointer, u32x4_pointer;   // (Workgroup pointers)
+};
+/// (longshot) A subgroup's tile: its 32 lanes' two B words each, as u32x4
+inline constexpr uint32_t kSoftwareMmaTileVectors = 16;
+inline constexpr uint32_t kSoftwareMmaTileBytes = kSoftwareMmaTileVectors * 16;
+/// (longshot) B through workgroup memory's indices, written once for the emitter (Ops over SPIR-V ids, DefineSoftwareMma) and for
+/// tests/test_mma_software.py (Ops over plain numbers: every lane must read the words the shuffles hand it). The subgroup's tile
+/// starts at u32x4 SubgroupId * kSoftwareMmaTileVectors; lane l stores its B word w at u32x4 tile + l / 2, component 2 (l % 2) + w;
+/// it loads its four runs j at u32x4 tile + 4 (l % 4) + j; and B's word from lane 8 (l % 4) + from (from 0-7), half upper, is
+/// component software_tile_component(from, upper) of run software_tile_run(from). Ops: imm, add, and_, shl, shr
+template <class Ops, class V>
+V software_tile_base(Ops& o, V subgroup_id) { return o.shl(subgroup_id, 4); }
+template <class Ops, class V>
+V software_tile_own(Ops& o, V tile, V lane) { return o.add(tile, o.shr(lane, 1)); }
+template <class Ops, class V>
+V software_tile_half(Ops& o, V lane) { return o.shl(o.and_(lane, 1), 1); }
+template <class Ops, class V>
+V software_tile_columns(Ops& o, V tile, V lane) { return o.add(tile, o.shl(o.and_(lane, 3), 2)); }
+constexpr uint32_t software_tile_run(uint32_t from) { return from / 2; }
+constexpr uint32_t software_tile_component(uint32_t from, uint32_t upper) { return from % 2 * 2 + upper; }
 
 /// The function (A: 4 words, B: 2, C: 2) -> D: 2 words, as the console's fragments hold them, two f16 a word. lane_variable is the
 /// SubgroupLocalInvocationId input; quad: OpGroupNonUniformQuadBroadcast may be used (the caller adds GroupNonUniformQuad), else
 /// A's lanes are shuffled to. The caller adds GroupNonUniform and GroupNonUniformShuffle.
 inline Sirit::Id DefineSoftwareMma(Sirit::Module& m, const SoftwareMmaTypes& t, Sirit::Id lane_variable, SoftwareMmaForm form,
-                                   bool quad) {
+                                   bool quad, const SoftwareMmaStagedB* staged = nullptr) {
     using Sirit::Id;
     const Id u32ty = t.u32, f32ty = t.f32;
     const auto imm = [&](uint32_t v) { return m.Constant(u32ty, v); };
@@ -85,6 +140,8 @@ inline Sirit::Id DefineSoftwareMma(Sirit::Module& m, const SoftwareMmaTypes& t, 
     const Id matrix_c = m.OpFunctionParameter(t.u32x2);
     m.AddLabel();
     const bool loop = form == SoftwareMmaForm::Loop;
+    const bool dot2 = form == SoftwareMmaForm::Dot2;
+    if (loop) staged = nullptr;   // (the loop keeps Lichii's shuffles)
     // (a function's variables come first in its first block; the counter first in either form, as in Lichii's)
     const Id counter = m.AddLocalVariable(m.TypePointer(spv::StorageClass::Function, u32ty), spv::StorageClass::Function);
     Id result{};
@@ -119,6 +176,37 @@ inline Sirit::Id DefineSoftwareMma(Sirit::Module& m, const SoftwareMmaTypes& t, 
         }
         return value;
     };
+    // (staged: the subgroup's tile, word 2 l + w lane l's B word w, so lanes 8i..8i+7, the ones this lane's columns 2i and 2i + 1
+    // come from, are its u32x4 4i..4i+3: those four, in order. The barrier before the stores keeps the previous multiply's loads
+    // before them)
+    struct TileOps {   // (software_tile_*'s arithmetic as SPIR-V)
+        Sirit::Module& m;
+        Id u32;
+        Id imm(uint32_t v) { return m.Constant(u32, v); }
+        Id add(Id a, Id b) { return m.OpIAdd(u32, a, b); }
+        Id and_(Id a, uint32_t b) { return m.OpBitwiseAnd(u32, a, imm(b)); }
+        Id shl(Id a, uint32_t b) { return m.OpShiftLeftLogical(u32, a, imm(b)); }
+        Id shr(Id a, uint32_t b) { return m.OpShiftRightLogical(u32, a, imm(b)); }
+    };
+    const auto load_b_from_tile = [&] {
+        TileOps o{m, u32ty};
+        const Id semantics = imm(0x108);   // (AcquireRelease | WorkgroupMemory)
+        const auto barrier = [&] { m.OpControlBarrier(subgroup(), subgroup(), semantics); };
+        const auto element = [&](Id pointer, Id index, auto... rest) {
+            return m.OpAccessChain(pointer, staged->tile, index, rest...);
+        };
+        const Id lane = and_(m.OpLoad(u32ty, lane_variable), 31);
+        const Id tile = software_tile_base(o, m.OpLoad(u32ty, staged->subgroup_id));
+        const Id own = software_tile_own(o, tile, lane);
+        const Id half = software_tile_half(o, lane);
+        barrier();
+        for (uint32_t w = 0; w < 2; ++w) m.OpStore(element(staged->u32_pointer, own, add(half, imm(w))), inputs[4 + w]);
+        barrier();
+        const Id columns = software_tile_columns(o, tile, lane);
+        std::array<Id, 4> runs;
+        for (uint32_t j = 0; j < 4; ++j) runs[j] = m.OpLoad(t.u32x4, element(staged->u32x4_pointer, add(columns, imm(j))));
+        return runs;
+    };
 
     if (!loop) {
         read_lane();
@@ -141,21 +229,30 @@ inline Sirit::Id DefineSoftwareMma(Sirit::Module& m, const SoftwareMmaTypes& t, 
         m.OpLoopMerge(end, next, spv::LoopControlMask::DontUnroll);
         m.OpBranchConditional(more, body, end);
         m.AddLabel(body);
+        const std::array<Id, 4> b_runs = staged ? load_b_from_tile() : std::array<Id, 4>{};
+        // (Dot2: the words stay packed, A's and B's K pair low half first in both, so one dot product is the pair's two
+        // multiply-adds; the others unpack them to f32 and add each product in turn)
+        const auto pair = [&](Id word) { return dot2 ? m.OpBitcast(t.f16x2, word) : unpack(word); };
         for (uint32_t upper = 0; upper < 2; ++upper) {   // (K 0-7, then 8-15: B's word and A's two of that half)
             for (uint32_t component = 0; component < 4; ++component) {   // (the K pair 2 * component of that half)
                 std::array<Id, 2> bs;   // (B's column 2i + col, from lane 8i + component + 4 col)
-                for (uint32_t col = 0; col < 2; ++col)
-                    bs[col] = unpack(m.OpGroupNonUniformShuffle(u32ty, subgroup(), inputs[4 + upper],
-                                                                add(warp_base, add(col_base, imm(component + col * 4)))));
+                for (uint32_t col = 0; col < 2; ++col) {
+                    const uint32_t from = component + col * 4;
+                    bs[col] = pair(staged ? m.OpCompositeExtract(u32ty, b_runs[software_tile_run(from)], software_tile_component(from, upper))
+                                          : m.OpGroupNonUniformShuffle(u32ty, subgroup(), inputs[4 + upper],
+                                                                       add(warp_base, add(col_base, imm(from)))));
+                }
                 for (uint32_t row = 0; row < 2; ++row) {   // (A's row g + 8 row, from lane 4g + component: this lane's quad)
                     const Id a = inputs[upper * 2 + row];
-                    const Id as = unpack(quad ? m.OpGroupNonUniformQuadBroadcast(u32ty, subgroup(), a, imm(component))
-                                              : m.OpGroupNonUniformShuffle(u32ty, subgroup(), a, add(warp_base, add(row_base, imm(component)))));
-                    for (uint32_t col = 0; col < 2; ++col) acc[row * 2 + col] = multiply_add(acc[row * 2 + col], as, bs[col]);
+                    const Id as = pair(quad ? m.OpGroupNonUniformQuadBroadcast(u32ty, subgroup(), a, imm(component))
+                                            : m.OpGroupNonUniformShuffle(u32ty, subgroup(), a, add(warp_base, add(row_base, imm(component)))));
+                    for (uint32_t col = 0; col < 2; ++col)
+                        acc[row * 2 + col] = dot2 ? m.OpFDot2MixAcc32VALVE(f32ty, as, bs[col], acc[row * 2 + col])
+                                                  : multiply_add(acc[row * 2 + col], as, bs[col]);
                 }
             }
-            // HMMA.F16 rounds after each K=8 group, including the midpoint of K=16.
-            for (auto& v : acc) v = form == SoftwareMmaForm::UnrolledF16 ? round_half_f16(v) : round_half(v);
+            // HMMA.F16 rounds after each K=8 group, including the midpoint of K=16 (Dot2 with the conversion, as UnrolledF16).
+            for (auto& v : acc) v = form == SoftwareMmaForm::Unrolled ? round_half(v) : round_half_f16(v);
         }
         std::array<Id, 2> packed;
         for (uint32_t row = 0; row < 2; ++row)

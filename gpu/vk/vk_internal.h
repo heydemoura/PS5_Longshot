@@ -107,7 +107,10 @@ struct Device {
          view_2d_of_3d = false, // (VK_EXT_image_2d_view_of_3d: a 3D texture a 2D sample instruction reads)
          memory_priority = false, // (VK_EXT_memory_priority with its feature, asked for by RX_VK_MEMORY_PRIORITY: vk_vma.cpp)
          coop_matrix = false,   // (VK_KHR_cooperative_matrix with its feature)
-         native_mma = false;    // (HMMA on it: the cooperative matrix test passed, vk_coopmat.cpp)
+         native_mma = false,    // (HMMA on it: the cooperative matrix test passed, vk_coopmat.cpp)
+         // (longshot) VK_VALVE_shader_mixed_float_dot_product with shaderMixedFloatDotProductFloat16AccFloat32: the software
+         // multiplies' Dot2 form (mma_software.h; v_dot2_f32_f16 on RADV, RDNA 2 and later)
+         mixed_dot_f16 = false;
     bool float_atomic_add = false;   // (longshot) VK_EXT_shader_atomic_float's shaderBufferFloat32AtomicAdd: the translator's float adds
     bool eds3_polygon = false, eds3_clamp = false, eds3_blend = false, eds3_a2c = false;
     bool swapchain_colorspace = false;   // (longshot) VK_EXT_swapchain_colorspace: HDR10 surfaces are listed
@@ -334,6 +337,10 @@ void checkpoints_report();
 /// VK_AMD_buffer_marker's buffer, for RX_VK_CHECKPOINTS on a device without the NV checkpoints (vk_draw.cpp)
 void buffer_markers_init();
 void coopmat_init();   // vk_coopmat.cpp (once the device is made)
+/// Whether create_device asks for VK_VALVE_shader_mixed_float_dot_product: where the software multiplies' Dot2 form can be tried,
+/// by the same rules choose_software_form uses (vk_coopmat.cpp software_unroll_wanted, software_dot2_wanted: RX_VK_MMA_UNROLL,
+/// RX_VK_MMA_DOT2), as whether they run in software is known only once the device is made
+bool software_dot2_extension_wanted(VkDriverId driver, const VkPhysicalDeviceProperties& props);
 /// A marker of another kind of GPU work (m: mirror sync, b: write-back, u: texture upload, g: GPU unswizzle; key: its
 /// pool or texture), RX_VK_CHECKPOINTS
 void checkpoint_mark(VkCommandBuffer cmd, uint64_t key, char kind);

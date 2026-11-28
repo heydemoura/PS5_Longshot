@@ -1503,6 +1503,7 @@ uint64_t translator_stamp() {
         // NaN guard, the matrix layout measured on this device. Without them a cache made on one GPU was used on another (a laptop's
         // integrated and dedicated GPUs), and RX_VK_NO_INVARIANT / RX_VK_NAN_GUARD did nothing for programs already cached)
         using namespace Shader::Backend::SPIRV;
+        const bool staged_b = mma_software && mma_software_staged_b && mma_software_full_subgroups;   // (vk_coopmat.cpp choose_staged_b)
         // (and the vendor fixes of the translation, device_policy.h: out-of-bounds fetches, NaN tests, the gather offset)
         const uint32_t flags = (position_invariant ? 1u : 0u) | (frag_nan_guard ? 2u : 0u) | (mma_software ? 4u : 0u) |
                                (global_table_loop ? 8u : 0u) | (fetch_bounds ? 16u : 0u) | (nan_bits ? 32u : 0u) |
@@ -1513,8 +1514,12 @@ uint64_t translator_stamp() {
                                (mesh_fallback_shared_warp ? 8192u : 0u) | (mesh_fallback_shared_warp_check ? 16384u : 0u) |
                                (mesh_fallback_strict_fmul ? 32768u : 0u) |
                                (mma_wmma16 ? 65536u : 0u) | (mma_wmma16_fast ? 131072u : 0u) |
-                               (mma_wmma16 && mma_wmma16_fused ? 262144u : 0u) | (uint32_t)graphics_table_loads << 19;
+                               // (graphics_table_loads is 0, 1 or 2: bits 19 and 20)
+                               (mma_wmma16 && mma_wmma16_fused ? 262144u : 0u) | (uint32_t)graphics_table_loads << 19 |
+                               // (and B through workgroup memory, bit 21, past graphics_table_loads' two; its limit below)
+                               (staged_b ? 2097152u : 0u);
         add(&flags, sizeof flags);
+        if (staged_b) add(&mma_software_staged_b, sizeof mma_software_staged_b);
         add(mma_order_a.data(), sizeof(uint32_t) * mma_order_a.size());
         add(mma_order_b.data(), sizeof(uint32_t) * mma_order_b.size());
         add(mma_order_c.data(), sizeof(uint32_t) * mma_order_c.size());

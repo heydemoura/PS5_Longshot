@@ -46,7 +46,7 @@ BOOLS = """fetch_bounds nan_bits mesh_fallback_strict_fmul bc_copy_per_layer gat
 amd_retry_no_optimizer amd_cloth_no_optimizer fault_gate_serial task_mesh_fallback intel_compile_gate compute_builds_serial
 pcache_fetch_lock split_before_draw astc_on_cpu inline_deku_web_loads networks_left_out dma_buf_imports nv_checkpoints
 allowance_at_count_rule
-mirrors ub_snapshot split_ub_flush native_float_add warp64 mesh_shared_warp batch_submits mma_unroll_try global_table_loop occ_copy
+mirrors ub_snapshot split_ub_flush native_float_add warp64 mesh_shared_warp batch_submits mma_unroll_try mma_stage_b_try global_table_loop occ_copy
 intel_side_by_side_auto fsr4_tune fsr4_compact_builds gpu_clock_peak readback_late_newest acquire_ahead pcache_small_pc bc_small_runs small_vram_textures astc_bc_all
 room_in_blocks_rule squeeze_damped linux_hold_caps_budget dlss_cnn auto_render_third rtx rdna4 threaded_auto_render
 threaded_auto_recorder drop_modules_small_ram native_zstd_keep_core""".split()
@@ -156,7 +156,7 @@ PCS = [
          facts=(0x1002, 0x73BF, "MESA_RADV", 0, "DISCRETE_GPU", "Mesa 26.2.5", "AMD Radeon RX 6800 XT (RADV NAVI21)", 0, 0,
                 16368, 16000, 32000, 16, 16, 8, 1, 1, 1, 0, 0, 1, 1, 64, 64, 0xFF),
          on="bc_small_runs acquire_ahead fetch_bounds networks_left_out gather_offset position_invariant dma_buf_imports allowance_at_count_rule mirrors "
-            "split_ub_flush warp64 batch_submits mma_unroll_try fsr4_tune room_in_blocks_rule "
+            "split_ub_flush warp64 batch_submits mma_unroll_try mma_stage_b_try fsr4_tune room_in_blocks_rule "
             "threaded_auto_render threaded_auto_recorder",
          num=(0, 2, 0, 1, 85, 4, 11000, 3072, 768, 512, 2000, -1, 256, 24, 64, 32, 97, 5, 6, 4, 8, 6, 4)),
     # (RDNA 4 on RADV: no batched submits, the gaps between held submits let its clock drop)
@@ -164,7 +164,7 @@ PCS = [
          facts=(0x1002, 0x7550, "MESA_RADV", 0, "DISCRETE_GPU", "Mesa 26.2.6", "AMD Radeon RX 9070 XT (RADV GFX1201)", 0, 0,
                 16304, 15300, 32600, 16, 16, 8, 1, 1, 1, 0, 0, 1, 1, 64, 64, 0xFF),
          on="acquire_ahead bc_small_runs fetch_bounds networks_left_out gather_offset position_invariant dma_buf_imports allowance_at_count_rule mirrors "
-            "split_ub_flush warp64 mma_unroll_try fsr4_tune room_in_blocks_rule rdna4 "
+            "split_ub_flush warp64 mma_unroll_try mma_stage_b_try fsr4_tune room_in_blocks_rule rdna4 "
             "threaded_auto_render threaded_auto_recorder",
          num=(0, 2, 0, 1, 85, 4, 11000, 3072, 768, 512, 1912, -1, 256, 24, 64, 32, 97, 5, 6, 4, 8, 6, 4)),
     # (GCN: no batched submits, the phi limit. Its heap is 8192 MB exactly: the small blocks (<= 8 GB) and the large
@@ -197,7 +197,7 @@ PCS = [
          facts=(0x1002, 0x163F, "MESA_RADV", 0, "INTEGRATED_GPU", "Mesa 25.1.0", "AMD Custom GPU 0405 (RADV VANGOGH)", 0, 1,
                 7168, 6800, 14800, 8, 8, 4, 1, 1, 1, 0, 0, 1, 1, 64, 64, 0xFF),
          on="bc_small_runs acquire_ahead fetch_bounds networks_left_out gather_offset position_invariant dma_buf_imports allowance_at_count_rule "
-            "split_ub_flush warp64 batch_submits mma_unroll_try fsr4_tune gpu_clock_peak readback_late_newest small_vram_textures astc_bc_all "
+            "split_ub_flush warp64 batch_submits mma_unroll_try mma_stage_b_try fsr4_tune gpu_clock_peak readback_late_newest small_vram_textures astc_bc_all "
             "squeeze_damped linux_hold_caps_budget threaded_auto_render threaded_auto_recorder drop_modules_small_ram",
          num=(0, 2, 0, 1, 85, 16, 2560, 1792, 566, 425, 512, -1, 256, 0, 32, 16, 90, 1, 2, 2, 4, 4, 2)),
     # (corrected, twice: mesh_mode is Automatic (0), so its own mesh shaders, as the deadlock of issue 2245 is RADV's and

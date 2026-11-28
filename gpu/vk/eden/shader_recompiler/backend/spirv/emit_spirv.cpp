@@ -18,6 +18,7 @@
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/program.h"
 #include "shader_recompiler/backend/spirv/mma_layout.h"   // (longshot)
+#include "shader_recompiler/backend/spirv/mma_software.h"   // (longshot: the Dot2 form's capability)
 
 namespace Shader::Backend::SPIRV {
 namespace {
@@ -545,6 +546,10 @@ void SetupCapabilities(const Profile& profile, const Info& info, EmitContext& ct
     if (info.uses_cooperative_matrix && mma_software) {   // (longshot: DefineSoftwareMatrixFunction's)
         ctx.AddCapability(spv::Capability::GroupNonUniform);
         ctx.AddCapability(spv::Capability::GroupNonUniformShuffle);
+        if (mma_software_form == static_cast<uint32_t>(SoftwareMmaForm::Dot2)) {   // (its OpFDot2MixAcc32VALVE)
+            ctx.AddExtension(kMixedFloatDotProductExtension);
+            ctx.AddCapability(kDotProductFloat16AccFloat32VALVE);
+        }
     }
     if (info.uses_quad_shuffles) {
         if (profile.support_quad_shuffles) {
@@ -695,10 +700,10 @@ void PatchMeshInstructions(std::vector<u32>& code, const EmitContext& ctx) {
 
 std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info, IR::Program& program, Bindings& bindings) {
     EmitContext ctx{profile, runtime_info, program, bindings};
-    if (program.info.uses_cooperative_matrix && mma_software) DefineSoftwareMatrixFunction(ctx);
+    if (program.info.uses_cooperative_matrix && mma_software) DefineSoftwareMatrixFunction(ctx, program);
     if (program.info.uses_cooperative_matrix && !mma_software && mma_wmma16) {
         if (!DefineWmma16MatrixFunction(ctx, program))
-            DefineSoftwareMatrixFunction(ctx);   // (the tiles do not fit the shared memory)
+            DefineSoftwareMatrixFunction(ctx, program);   // (the tiles do not fit the shared memory)
         else if (mma_wmma16_fused)
             DefineWmma16PairFunction(ctx, program);
     }

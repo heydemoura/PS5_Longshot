@@ -477,6 +477,15 @@ bool create_device() {
         optional(VK_AMD_BUFFER_MARKER_EXTENSION_NAME, dev.buffer_marker);
     optional(VK_EXT_DEVICE_FAULT_EXTENSION_NAME, dev.device_fault);
     optional(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME, dev.coop_matrix);
+    // (longshot) f16 pair dot products into f32 (v_dot2_f32_f16 on RADV): the software multiplies' Dot2 form, vk_coopmat.cpp
+    // choose_software_form. Asked for only where that form can be tried, by its own rules (software_dot2_extension_wanted:
+    // RADV and AMD RDNA 4 on AMD's proprietary driver, RX_VK_MMA_UNROLL and RX_VK_MMA_DOT2 over them), as whether the
+    // multiplies run in software (no cooperative matrices, or their tests failing) is known only once the device is made.
+    // Only with Vulkan headers that have it (1.4.345 does)
+#ifdef VK_VALVE_shader_mixed_float_dot_product
+    if (software_dot2_extension_wanted(fadd_driver.driverID, dev.props))
+        optional(VK_VALVE_SHADER_MIXED_FLOAT_DOT_PRODUCT_EXTENSION_NAME, dev.mixed_dot_f16);
+#endif
     // (longshot) the GPU's own float add on storage buffers: the game's RED/ATOM.ADD.F32 become one OpAtomicFAddEXT instead
     // of a compare-exchange loop, which gives up after CAS_LOOP_MAX_TRIES attempts and loses that add (eden
     // spirv_emit_context.cpp DefineStorageBuffers). By default with NVIDIA's driver, AMD's Windows driver on 0x1114 from 0x8001a0, and Intel's Windows driver on the
@@ -608,6 +617,10 @@ bool create_device() {
     if (dev.memory_priority) *tail = &mem_priority, tail = &mem_priority.pNext;
     VkPhysicalDeviceCooperativeMatrixFeaturesKHR coop{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
     if (dev.coop_matrix) *tail = &coop, tail = &coop.pNext;
+#ifdef VK_VALVE_shader_mixed_float_dot_product
+    VkPhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE mixed_dot{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MIXED_FLOAT_DOT_PRODUCT_FEATURES_VALVE};
+    if (dev.mixed_dot_f16) *tail = &mixed_dot, tail = &mixed_dot.pNext;
+#endif
     VkPhysicalDeviceShaderAtomicFloatFeaturesEXT afloat{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT};
     if (atomic_float) *tail = &afloat, tail = &afloat.pNext;
     VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptor_buffer{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
@@ -626,6 +639,15 @@ bool create_device() {
     dev.view_2d_of_3d = dev.view_2d_of_3d && v2d3d.sampler2DViewOf3D;
     dev.memory_priority = dev.memory_priority && mem_priority.memoryPriority;
     coop.cooperativeMatrixRobustBufferAccess = VK_FALSE;
+#ifdef VK_VALVE_shader_mixed_float_dot_product
+    {   // (only the f16 one into f32 on: the one the Dot2 form emits)
+        dev.mixed_dot_f16 = dev.mixed_dot_f16 && mixed_dot.shaderMixedFloatDotProductFloat16AccFloat32;
+        mixed_dot.shaderMixedFloatDotProductFloat16AccFloat32 = dev.mixed_dot_f16 ? VK_TRUE : VK_FALSE;
+        mixed_dot.shaderMixedFloatDotProductFloat16AccFloat16 = VK_FALSE;
+        mixed_dot.shaderMixedFloatDotProductBFloat16Acc = VK_FALSE;
+        mixed_dot.shaderMixedFloatDotProductFloat8AccFloat32 = VK_FALSE;
+    }
+#endif
     dev.coop_matrix = dev.coop_matrix && coop.cooperativeMatrix &&
                       f12.vulkanMemoryModel && f12.vulkanMemoryModelDeviceScope;
     {   // (only the float add on buffers on: the one the translator emits)
