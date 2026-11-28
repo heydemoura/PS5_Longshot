@@ -1,6 +1,7 @@
 /* The widescreen picture's size, worked out the same way by host/hos_main.c (hos_wide_out, at the start) and by the Insert
    menu's Output and Render resolution rows (gpu/vk/vk_menu.cpp, the sizes they show): the Output resolution's height kept, the
-   width at the screen's ratio (whole multiples of 8 pixels), then at most hos_wide_max_px() pixels with the shape kept.
+   width at the screen's ratio (whole multiples of 8 pixels), then at most hos_wide_max_px() pixels with the shape kept
+   (hos_wide_picture keeps an output that is already a valid size of that shape, such as 7680 x 2160).
    Header only, C and C++. */
 #ifndef HOS_WIDE_SIZE_H
 #define HOS_WIDE_SIZE_H
@@ -9,9 +10,12 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-/* The host and the menu accept the same custom output shapes and pixel budget. */
+/* The host and the menu accept the same custom output shapes and pixel budget. The budget is 7680 x 2160's
+   pixels (a 32:9 monitor's native size, the 57-inch dual-4K picture). It was 5120 x 2880's: 7680 x 2160 is past
+   that, so the menu dropped the mode and offered 6256 x 1760, the 32:9 shape scaled to 5120 x 2160's pixels.
+   5120 x 2880 and every smaller accepted size still fit. 7680 x 4320 does not. */
 static inline int hos_output_size_valid(uint32_t w, uint32_t h) {
-    return w >= 640 && h >= 360 && (uint64_t)w * h <= 5120ULL * 2880 &&
+    return w >= 640 && h >= 360 && (uint64_t)w * h <= 7680ULL * 2160 &&
            (uint64_t)w * 4 >= (uint64_t)h * 5 && (uint64_t)w * 9 <= (uint64_t)h * 48;
 }
 
@@ -83,6 +87,21 @@ static inline void hos_wide_size(unsigned out_h, double r, double max_px, unsign
         ow = (unsigned)(oh * r / 8) * 8;
     }
     *w = ow, *h = oh;
+}
+
+/* The picture for an output of ow x oh drawn at ratio r (hos_wide_clamp's), at most max_px pixels (hos_wide_size).
+   An output that is already that shape and a size the game accepts keeps its own pixels when that is more than
+   max_px: 7680 x 2160, so a 32:9 monitor's native mode is not scaled to 6256 x 1760. Widening a smaller 16:9
+   output (3840 x 2160 at 32:9 on a 5120 x 1440 screen) is a different shape from its output and stays on the
+   5120 x 2160 budget. An explicit HOS_WIDE_MAX_PX is the budget for a native output too. */
+static inline void hos_wide_picture(unsigned ow, unsigned oh, double r, double max_px, unsigned *w, unsigned *h) {
+    const char *e = getenv("HOS_WIDE_MAX_PX");
+    hos_wide_size(oh, r, max_px, w, h);
+    if (e && atof(e) >= 640.0 * 360.0) return;
+    if (!oh || !hos_output_size_valid(ow, oh)) return;
+    const double got = (double)ow / (double)oh;
+    const double off = got > r ? got / r - 1.0 : r / got - 1.0;
+    if (off <= 0.02 && (uint64_t)ow * oh > (uint64_t)(*w) * (*h)) *w = ow, *h = oh;
 }
 
 #endif

@@ -1536,7 +1536,7 @@ const char* output_field_apply() {
         if (!size_text(output_field.text, &w, &h)) return "Type the width, an x, then the height: 3440x1440.";
         w &= ~7u, h &= ~7u;
         if (!hos_output_size_valid(w, h))
-            return "Not a size the game can draw: at least 640x360, at most 5120x2880's pixels, from 5:4 to 48:9 in shape.";
+            return "Not a size the game can draw: at least 640x360, at most 7680x2160's pixels, from 5:4 to 48:9 in shape.";
     }
     if (request_native_preview({w, h}, true)) {
         output_field_show();

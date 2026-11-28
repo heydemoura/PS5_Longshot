@@ -75,7 +75,7 @@ int main(int argc, char **argv) {
         # (at the 4K output: a 21:9 screen's native picture, 5120 x 2160, host/hos_wide_size.h's most pixels; a 32:9 one kept
         # to those pixels, its shape kept)
         ("2.3704", 2160, "5120x2160 3840x1620 2.3704 0.7500 0.1250"),  # 21:9 (5120 x 2160): native
-        ("3.5556", 2160, "6256x1760 4696x1320 3.5545 0.5001 0.2499"),  # 32:9 (7680 x 2160): 5120 x 2160's pixels
+        ("3.5556", 2160, "6256x1760 4696x1320 3.5545 0.5001 0.2499"),  # 32:9 ratio at a 16:9 2160 output: still 5120 x 2160's pixels
         ("5.333333", 2160, "7680x1440 5760x1080 5.3333 0.3333 0.3333"),  # 48:9 (11520 x 2160): 5120 x 2160's pixels, exactly 48:9
     )
     with tempfile.TemporaryDirectory(prefix="widescreen-") as tmp:
@@ -92,6 +92,8 @@ int main(int argc, char **argv) {
         for width, height, expect in (
             (5760, 1080, "5760x1080 4320x810 5.3333 0.3333 0.3333"),
             (7680, 1440, "7680x1440 5760x1080 5.3333 0.3333 0.3333"),
+            # (the output is already 7680x2160, a size the game accepts: kept, not scaled to 6256x1760)
+            (7680, 2160, "7680x2160 5760x1620 3.5556 0.5000 0.2500"),
         ):
             got = subprocess.check_output([str(exe), "1.7778", str(height), str(width)], text=True, env=env).strip()
             if got != expect:

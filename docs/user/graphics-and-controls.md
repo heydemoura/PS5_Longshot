@@ -242,7 +242,7 @@ helper asks you to.
 - **Aspect ratio** lists the shapes of your screen's resolutions, your monitor's own marked "(monitor's)", and **Output
   resolution** that shape's sizes, your screen's own marked "(native)". A size larger than your screen is drawn at that
   size and scaled down. For a size the menu doesn't offer, type it in **Custom output size** (`<width>x<height>`, each
-  side a multiple of 8, from 640x360 up to 5120x2880's pixels, between 5:4 and 48:9); the menu says why it refuses one.
+  side a multiple of 8, from 640x360 up to 7680x2160's pixels, between 5:4 and 48:9); the menu says why it refuses one.
   For three 16:9 monitors, use `5760x1080` or `7680x1440` with a window that spans all three.
 - **Frame generation by** chooses who makes the extra frames: **DLSS FG** (NVIDIA DLSS Frame Generation, RTX 40 and
   newer, the default where it runs: up to 6x on an RTX 50, 2x on an RTX 40), **FSR 3.1 FG** (AMD's, on any GPU, the

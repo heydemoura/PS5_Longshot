@@ -270,7 +270,7 @@ SW(HOS_WAKE_LAT, diag, bool, "off", "Every 5 s, per thread: how event and queue 
 SW(HOS_WATCH, diag, string, "off", "Sets CPU data breakpoints on up to 4 guest addresses listed in the named file, when it exists.")
 SW(HOS_WEB_SPIN_SLEEP, kill, bool, "web build: sleeps use a timed wait, then a short spin", "=1 spins the whole sleep, as before.")
 SW(HOS_WIDE_KEEP, diag, string, "the renderer's keep mask (the Ultrawide menus row)", "A hex mask (bits 0 to 4) forced over the renderer's choice of which menus stay 16:9 on a wide screen; bit 4, the system overlay's screen, then also stands at Extended.")
-SW(HOS_WIDE_MAX_PX, tune, float, "5120 x 2160 pixels (11059200)", "Sets the most pixels a widescreen picture may take.")
+SW(HOS_WIDE_MAX_PX, tune, float, "5120 x 2160 pixels (11059200); with it unset, a valid output size already of the picture's shape keeps its own pixels past that (7680 x 2160, 5120 x 2800)", "Sets the most pixels a widescreen picture may take, a native output of the picture's shape too.")
 SW(HOS_WIDE_UI, player, bool, "the Insert menu's HUD layout row", "Stands over the menu's HUD layout row: 0 turns the HUD's widescreen moves off; the row is then held and says so.")
 SW(HOS_WIDE_UI_LOG, diag, int, "0: no log", "Logs the first n changes of the widescreen HUD plan, each root layout and the plan's time.")
 SW(HOS_WINDOW_NOACTIVATE, diag, bool, "off: the window opens in front", "=1 opens the window behind the one in front, so test runs do not take the keyboard.")
