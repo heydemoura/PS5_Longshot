@@ -63,6 +63,8 @@ void *hos_sdl_window(const char *title, int width, int height, int hidden) {
     return &window_token;
 }
 int hos_sdl_show_window(void *window) { (void)window; return 1; }
+/* (the mouse's cursor over the window, hidden while a controller or the keys are used: the console has none) */
+void hos_sdl_cursor(int shown) { (void)shown; }
 void hos_sdl_fullscreen(void *window, int on) { (void)window, (void)on; }
 void hos_sdl_relative_mouse(void *window, int on) { (void)window, (void)on; }
 int hos_sdl_desktop_size(int *width, int *height) {

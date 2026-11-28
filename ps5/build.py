@@ -77,7 +77,7 @@ def cc_wrapper(cxx=False):
     return ["sh", os.path.join(VULKAN, "tooling", "prospero-clang18")] + (["-x", "c++"] if cxx else [])
 
 
-def tree_digest(*dirs, ext=(".h", ".hpp", ".inc")):
+def tree_digest(*dirs, ext=(".h", ".hpp", ".inc")):   # (game/*.hpp: the cloth kernels' own)
     h = hashlib.sha1()
     for d in dirs:
         for base, _, files in sorted(os.walk(d)):
@@ -191,6 +191,16 @@ def jobs_for(gen_dir):
         rel = os.path.relpath(s, ROOT).replace(os.sep, "_")[:-2]
         fl = host_fl + ([stamp] if os.path.basename(s) == "hos_main.c" else [])
         out.append((s, os.path.join(OUT, "obj", "host_" + rel + ".o"), fl, host_digest))
+    # (the game's C++, game/*.cpp alone: the Havok cloth's kernels, as upstream's builder compiles them, GAME_CXX in
+    # builder/crates/build-compile/src/plan.rs. -ffp-contract=off is in COMMON: they are bit for bit the game's)
+    # (-Dpreserve_all=: game/cloth_link.cpp marks its slow path preserve_all, a calling convention the SDK's clang 18 does not
+    # have for the console's target ("not supported for this target"). It only spares the hot loop's spills at that call:
+    # without it the function is an ordinary one, the same arithmetic. An empty name in an attribute list is allowed)
+    game_cxx = [f for f in host_fl if f != "-Werror=implicit-function-declaration"] + ["-std=c++17", "-fno-exceptions", "-fno-rtti",
+                                                                                     "-Dpreserve_all="]
+    for f in sorted(os.listdir(GAME)):
+        if f.endswith(".cpp"):
+            out.append((os.path.join(GAME, f), os.path.join(OUT, "obj", "host_game_" + f[:-4] + "_cpp.o"), game_cxx, host_digest))
 
     # libopus (nn::codec's Opus decoder)
     ofl = COMMON + ["-O2", "-DOPUS_BUILD", "-DUSE_ALLOCA", "-DHAVE_LRINTF", "-DHAVE_LRINT"] + \
