@@ -137,6 +137,7 @@ FROZEN = {   # (a key: the value its row saves, as players' files hold them)
     "pipelines_built_line": "&opts.fps_dev_show[7]",
     "present_queue": "&opts.present_queue",
     "quality_preset": "&opts.preset",
+    "mode_auto": "&opts.mode_auto",   # (PS5: Auto resolution (by the load), menu/upscale_auto_ps5.cpp)
     "queue_submits_line": "&opts.fps_dev_show[9]",
     "render_passes_line": "&opts.fps_dev_show[4]",
     "reshade_preset": "&opts.reshade",

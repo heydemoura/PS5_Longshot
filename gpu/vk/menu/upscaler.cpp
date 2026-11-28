@@ -39,6 +39,13 @@ const char* tx_upscaler(int) {
     static const char* t[ur::kUpscalers] = {"Game's own", "NVIDIA DLSS", "NVIDIA DLAA", "AMD FSR 3.1", "AMD FSR 4",
                                             "AMD FSR 4 Native AA", "Off (no upscaling)", "Intel XeSS", "Intel XeSS Native AA"};
     // (by engine: DLAA and FSR 4's and XeSS's native AA are the Render resolution row's Native, upscaler_rows.h engine)
+#ifdef __PROSPERO__   // (the console's Auto, upscale_gov.h: the engine the load has it at)
+    if (opts.upscaler_auto) {
+        static char b[64];
+        snprintf(b, sizeof b, "Auto: %s", t[std::clamp(ur::engine(upscaler()), 0, ur::kUpscalers - 1)]);
+        return b;
+    }
+#endif
     return t[std::clamp(ur::engine(upscaler()), 0, ur::kUpscalers - 1)];
 }
 const char* tx_resolution(int v) {

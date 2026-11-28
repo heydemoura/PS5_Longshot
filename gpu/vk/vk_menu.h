@@ -55,6 +55,10 @@ struct Options {
     int dlss = 0;         // the Upscaler (its name from before FSR: options files and the tests' stand-ins keep it): 0 the game's
                           // own network, 1 NVIDIA DLSS, 2 NVIDIA DLAA (a build with NVIDIA's SDK only), 3 AMD FSR 3.1 (vk_fsr3.cpp),
                           // 4 AMD FSR 4, 5 its native AA (a build with FSR 4 only). upscaler_rows.h; vk_temporal.cpp. Saved as dlss
+    int upscaler_auto = 0;   // (PS5) the Upscaler row at Auto: the engine by the GPU's load (upscale_gov.h; saved as
+                             // upscaler_auto). opts.dlss is then the engine the governor is at
+    int mode_auto = 0;       // (PS5) the Resolution mode row at Auto: Quality to Performance by the GPU's load (saved as
+                             // mode_auto). opts.resolution is then the stop the governor is at
     int dlss_model = 0;   // DLSS's network, by its preset: 0 K (transformer; E, the CNN, under 7 GB of video memory), 1 M, 2 L
                           // (second-generation transformer), 3 NVIDIA's default (upscaler_rows.h model_preset; vk_dlss.cpp).
                           // RX_VK_DLSS_PRESET over it
@@ -179,6 +183,7 @@ constexpr int kAutoPreset = 6;   // (the Quality preset Auto (this PC): menu_aut
 
 void menu_init();             // (the options from the file, once)
 void menu_auto_for_gpu(const VkPhysicalDeviceProperties& props, ::auto_settings::Hardware hw);   // (the card chosen: Auto's profile)
+void menu_upscale_gov_tick(double gpu_ms, double draws, double fps);   // (PS5: the upscaler by the GPU's load, upscale_gov.h)
 void menu_auto_tune(double gpu_ms, double draws, double fps);   // (the replay's 120-present windows: Auto (this PC) measured in play)
 /// (longshot) The V-Sync row as this run applies it: RX_VK_FIFO=1 is On and RX_VK_IMMEDIATE=1 Off, whatever the row says
 /// (for the run only: the row keeps the player's choice). 0 Auto, 1 On, 2 Off

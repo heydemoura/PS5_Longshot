@@ -62,6 +62,7 @@
 #include "vk_reflex.h"
 #include "vk_antilag.h"
 #include "upscaler_rows.h"
+#include "upscale_gov.h"   // (PS5: the Upscaler row's Auto, the upscaler by the GPU's load)
 #include "menu_module.h"   // (#1633: the model, the rows modules describe and the order of every row)
 #include "menu/audio.h"   // (the Audio module's, still used here: the options file's lines, set_row, the test's meter)
 #include "menu/display.h"   // (the display module's, still used here: the options file's lines, the screen followed)
@@ -1068,6 +1069,7 @@ void save() {
             bool mine = key == "audio_output_device_id" || key == "audio_output_device_name" || key == "output_device" ||
                         key == "microphone_device" || key == "options_version" || key == "memory_budget" || key == "auto_for" ||
                         key == "auto_tuned" || key == "auto_output" || key == "auto_steps";
+            mine |= key == "upscaler_auto" || key == "mode_auto";   // (PS5: upscale_gov.h)
             mine |= key == "sprint_auto_bind";
             mine |= key == "fullscreen_monitor_id";
             mine |= key == "fullscreen_monitor_name";
@@ -1115,6 +1117,8 @@ void save() {
                                  : opts.gpu_device == 0 && gpu_card_missing ? gpu_saved_card : std::string();
         if (!card.empty()) fprintf(f, "gpu_device_id=%s\n", card.c_str());
         if (auto_for) fprintf(f, "auto_for=%016llx\n", (unsigned long long)auto_for);   // (the hardware Auto (this PC) chose for)
+        if (opts.upscaler_auto) fprintf(f, "upscaler_auto=1\n");   // (PS5: the Upscaler row at Auto, upscale_gov.h)
+        if (opts.mode_auto) fprintf(f, "mode_auto=1\n");           // (and the Resolution mode row)
         if (auto_tuned) fprintf(f, "auto_tuned=%016llx\n", (unsigned long long)auto_tuned);   // (and measured in play for)
         // (the tuning's steps so far and whether one went down: the no-seesaw rule and the two steps hold across restarts)
         if (auto_for && auto_tuning.steps) fprintf(f, "auto_steps=%d,%d\n", auto_tuning.steps, auto_tuning.went_down ? 1 : 0);
@@ -1282,6 +1286,11 @@ void set_row(Row& r, int v, int dir, bool keep = true) {
     if (r.setting && r.setting->step_fn && dir && v == *r.value + dir * r.step) v = r.setting->step_fn(*r.value, dir);
     // (the scaling rows: only what can run here; the Render resolution row through the Upscaler's own ascending fixed stops)
     // (the Upscaler by engine; the Render resolution's Native is the engine's full-size form: upscaler_rows.h)
+#ifdef __PROSPERO__   // (the console's row has Auto as one more stop: upscale_gov.h)
+    if (r.value == &opts.dlss && dir) {
+        v = upscale_gov::step_engine_auto(upscaler(), &opts.upscaler_auto, dir, upscalers_available());
+    } else
+#endif
     if (r.value == &opts.dlss) v = ur::step_engine(upscaler(), dir, upscalers_available());
     if (r.value == &opts.resolution) {
         int up = upscaler(), res = *r.value;
@@ -1319,6 +1328,9 @@ void set_row(Row& r, int v, int dir, bool keep = true) {
         }
     }
     if (r.setting && r.setting->on_change) r.setting->on_change(*r.value);   // (#1633: a module's row's own)
+#ifdef __PROSPERO__   // (the Render resolution set by hand, or the game's dynamic one chosen: Auto resolution is left)
+    if (r.value != &opts.mode_auto && opts.resolution != prev_res) opts.mode_auto = 0;
+#endif
     if (r.value == &opts.transition_autosave) sync_transition_autosave();
     if (r.value == &opts.grass_distance) grass_distance_now.store(opts.grass_distance, std::memory_order_relaxed);
     // (longshot: the samplers made again, at once: their anisotropy, and the upscalers' LOD bias, vk_draw.cpp upscale_lod_bias)
@@ -4292,6 +4304,10 @@ void menu_init() {
             v2 |= !strcmp(line, "options_version");
             if (!strcmp(line, "options_version")) version = atoi(eq + 1);
             if (!strcmp(line, "dynamic_resolution")) old_dynres = atoi(eq + 1);
+#ifdef __PROSPERO__
+            if (!strcmp(line, "upscaler_auto")) opts.upscaler_auto = atoi(eq + 1) != 0;
+            if (!strcmp(line, "mode_auto")) opts.mode_auto = atoi(eq + 1) != 0;
+#endif
             if (!strcmp(line, "menu_size") && atoi(eq + 1) == 0) menu_auto = true;
             if (!strcmp(line, "auto_for")) auto_for = strtoull(eq + 1, nullptr, 16);
             if (!strcmp(line, "gpu_device_id")) gpu_saved_card.assign(eq + 1, strcspn(eq + 1, " \t\r\n"));   // (menu_set_gpu_count)
@@ -4799,6 +4815,62 @@ bool walk_to(State state, At at, Step step, int limit) {
 /// frame rate ends it for this run only. Not with Frame generation on (the frames shown are not the game's) nor with another
 /// preset. RX_VK_AUTO_TUNE=0: off. Before the tuning, in play (the upscaler has run, NGX has answered): the Render resolution for
 /// the upscaler that runs, when it is not the one Auto chose (auto_settings.h resolution_for)
+/// (PS5) The upscaler by the GPU's load (upscale_gov.h), each of the replay's 120-present windows: with the Upscaler row or
+/// the Auto resolution row on, a rung down the ladder while the frame rate is under the low line and back up when it is over
+/// the high one, written to opts.dlss and opts.resolution as the rows would. Not while the menu is open (the player is choosing) or
+/// out of play (under 150 draws: a menu of the game's, a movie). RX_VK_UPSCALE_GOV_CYCLE=<n>, a test: the next rung every n
+/// windows, round and round. RX_VK_UPSCALE_GOV_ROOM_MB: the free direct memory under which it does not go up (400)
+#ifdef __PROSPERO__
+extern "C" uint64_t hos_ps5_direct_room(void);   // (host/ps5/win32_ps5.c: the title's free direct memory in all)
+#endif
+void menu_upscale_gov_tick(double gpu_ms, double draws, double fps) {
+#ifdef __PROSPERO__
+    namespace ug = upscale_gov;
+    static const int cycle = env_int("RX_VK_UPSCALE_GOV_CYCLE", 0);
+    static const uint64_t room_line = (uint64_t)env_int("RX_VK_UPSCALE_GOV_ROOM_MB", 400) << 20;
+    static const float low_fps = (float)env_int("RX_VK_UPSCALE_GOV_FPS", 40);
+    static ug::Gov g;
+    static int windows = 0;
+    std::lock_guard lk(menu_mu);
+    if (!opts.upscaler_auto && !opts.mode_auto) return;
+    if (draws < 150 || !(fps > 0) || menu_is_open()) return;
+    ug::Rung l[ug::kMaxRungs];
+    const int n = ug::ladder(opts.upscaler_auto != 0, opts.mode_auto != 0, opts.dlss, opts.resolution, upscalers_available(), l);
+    const int at = ug::rung_of(l, n, opts.dlss, opts.resolution);   // (-1: the rows as the player left them, not on it yet)
+    if (at >= 0) g.rung = at;
+    const uint64_t room = hos_ps5_direct_room();
+    const float frame_ms = (float)(1000.0 / fps);
+    windows++;
+    if (cycle > 0) {
+        if (windows % cycle == 0) g.rung = (g.rung + 1) % n;
+    } else {
+        // (the line: 40 fps, RX_VK_UPSCALE_GOV_FPS=<n> another; under a cap, upscale_gov.h step)
+        const double target = fps_target_ms();
+        ug::In in;
+        in.fps = (float)fps, in.draws = (float)draws, in.low_fps = low_fps, in.cap_fps = target > 0 ? (float)(1000.0 / target) : 0.0f;
+        in.room_ok = room >= room_line, in.skip_to = ug::next_engine(l, n, g.rung);
+        in.need = l[g.rung].up == ur::OFF ? ug::kGainStretch : ug::kGain;
+        g = ug::step(g, n, in);
+    }
+    if (g.rung >= n) g.rung = n - 1;
+    if (at == g.rung) return;
+    static const char* const name[ur::kUpscalers] = {"the game's own", "DLSS", "DLAA", "FSR 3.1", "FSR 4", "FSR 4", "the stretch",
+                                                     "XeSS", "XeSS"};
+    opts.dlss = l[g.rung].up, opts.resolution = l[g.rung].res;
+    env_release(&opts.dlss);
+    env_release(&opts.resolution);
+    samplers_changed();   // (the upscalers' texture LOD bias follows the 3D's share, as when the rows are set)
+    temporal_reset_failure();
+    menu_refresh = true;
+    logf("vk: the upscaler by the load: rung %d of %d, %s at %d%% (from rung %d): %.1f fps, the GPU at %.1f ms of a %.1f ms frame, "
+         "%llu MiB free%s", g.rung, n, name[std::clamp(opts.dlss, 0, ur::kUpscalers - 1)], ur::percent(opts.resolution), at, fps,
+         gpu_ms, frame_ms, (unsigned long long)(room >> 20), g.blocked == ug::kBlocked ? "; the step down bought nothing" : "");
+    save();
+#else
+    (void)gpu_ms, (void)draws, (void)fps;
+#endif
+}
+
 void menu_auto_tune(double gpu_ms, double draws, double fps) {
     static const bool on = env_int("RX_VK_AUTO_TUNE", 1) != 0;
     ::auto_settings::Tuning& tuning = auto_tuning;
