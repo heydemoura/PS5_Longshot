@@ -23,7 +23,8 @@ SDK_REV=55a2de04e3364f0a6c8d6c337dc95436cf091ef0
 MIHAWKGEN_REV=c57232a9f16bcb6df5fe07c9bb631518f2b1cc0e
 # (the headers gpu/vk is compiled with: scripts/linux/deps.sh's pins, which ps5/build.py names)
 VK_HEADERS=v1.4.345 SPIRV_HEADERS=vulkan-sdk-1.4.341.0 VMA=v3.3.0
-PYTHON_PACKAGES=(lz4 numpy capstone "unicorn>=2.1,<2.2" zstandard meson ninja mako pyyaml packaging)
+# (RADV's build; the translation is upstream's builder now, Rust: no Python package of its own)
+PYTHON_PACKAGES=(meson ninja mako pyyaml packaging)
 APT_PACKAGES="git curl wget unzip xz-utils rsync make nasm pkg-config bison flex file ca-certificates python3 python3-venv \
 clang lld llvm llvm-dev libclang-rt-18-dev libclang-dev libclang-cpp-dev libclc-18-dev libllvmspirvlib-18-dev spirv-tools glslang-tools \
 zlib1g-dev libzstd-dev g++"
@@ -67,12 +68,13 @@ run() {   # log-name command...: quiet while it works, the end of its log when i
 step "this PC"
 missing=()
 for command in git curl wget unzip tar xz rsync make nasm pkg-config bison flex python3 clang clang++ llvm-ar \
-        glslangValidator flock sha256sum; do
+        glslangValidator flock sha256sum cargo; do
     command -v "$command" > /dev/null || missing+=("$command")
 done
 if (( ${#missing[@]} )); then
     note "not found: ${missing[*]}"
     note "on Ubuntu or Debian: sudo bash ${BASH_SOURCE[0]} --install-packages"
+    note "cargo: Rust, from https://rustup.rs (the repository's rust-toolchain names the version), with the rust-src component"
     exit 1
 fi
 clang_major=$(clang --version | sed -n 's/.*clang version \([0-9]*\).*/\1/p' | head -1)
@@ -169,8 +171,10 @@ step "FFmpeg and zstd for the console (the game's movies, and the game file's co
 run ffmpeg bash ps5/tools/build-ffmpeg.sh
 run zstd bash ps5/tools/build-zstd.sh
 
-step "the lifter's helper library (third_party/a64-kit)"
-run a64emit "$python" -I third_party/a64-kit/lift/build_emit.py
+step "the game's Rust for the console, and the translator for this PC (cargo; 5 to 15 minutes the first time)"
+run rust-console bash ps5/tools/build-rust.sh
+run rust-builder cargo build --release -p longshot-builder
+[[ -x $root/target/release/longshot-builder ]] || die "cargo did not leave target/release/longshot-builder"
 
 step "the runtime and the renderer, compiled for the console (10 to 20 minutes the first time)"
 [[ -n $jobs ]] || jobs=$(awk -v cores="$(nproc)" '/MemTotal/ { m = int($2 / 1572864); c = cores; j = c < m ? c : m; print j < 1 ? 1 : j }' /proc/meminfo)

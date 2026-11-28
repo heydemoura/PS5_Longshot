@@ -9,9 +9,10 @@ make_kit.py or build_kit.sh) and the PS5_Vulkan submodule's sources. What goes i
     LongshotPS5Builder/
       LongshotPS5Builder.exe | longshot-ps5-builder    the start (Windows: launcher.c; Linux: a shell script, the AppImage's AppRun)
       app/                      the window and the build (app.py, pipeline.py)
-      python/                   CPython (python-build-standalone) with PyQt6 and what the lifter imports
+      python/                   CPython (python-build-standalone) with PyQt6
       tools/                    clang, ld.lld and llvm-nm (llvm-mingw's LLVM, whose clang has the PS5's target), ps5-native-tool
-      kit/                      the title's ready-built part, with the lifter's helper library for this system
+                                and longshot-builder (upstream's builder: it reads the game file and translates it)
+      kit/                      the title's ready-built part
 
 Windows is a portable folder in a zip: unpack it anywhere and start the .exe; there is no installer. Linux is one
 AppImage. Every download is checked against the SHA-256 named here.
@@ -39,8 +40,10 @@ DOWNLOADS = {   # name: (url, sha256)
     "zlib": ("https://github.com/madler/zlib/releases/download/v1.4/zlib-1.4.tar.gz", "02dd159783677a749c04adbdd02b55b8a2bcc7e054f51b76b549199a916ad584"),
     "appimagetool": ("https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage", "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"),
 }
-# (what the lifter imports, requirements.txt's pins, and the window)
-PACKAGES = ["lz4==4.4.5", "numpy==2.5.4", "capstone==5.0.9", "unicorn==2.1.4", "zstandard==0.25.0", "PyQt6==6.12.1"]
+# (the window: the translation is longshot-builder's, which needs no Python)
+PACKAGES = ["PyQt6==6.12.1"]
+# (longshot-builder for Windows is cross-built for llvm-mingw's own target: rustup target add x86_64-pc-windows-gnullvm)
+WINDOWS_RUST_TARGET = "x86_64-pc-windows-gnullvm"
 LLVM_KEEP = {
     "linux-x64": ["bin/clang-23", "bin/clang", "bin/lld", "bin/ld.lld", "bin/llvm-nm", "lib/libclang-cpp.so.23.1",
                   "lib/libLLVM.so.23.1", "lib/clang/23/include", "LICENSE.TXT"],
@@ -56,7 +59,7 @@ Builds the PlayStation 5 title folder of Longshot from your own copy of the game
 
 1. Start %(start)s.
 2. Choose your game file (.nup), the folder to build into and your console (PS5 / PS5 Slim, or PS5 Pro), then Build.
-   The build takes 40 to 70 minutes and 6 GB of disk. On a computer with little memory free, set Memory to use
+   The build takes 40 to 70 minutes and 12 GB of disk. On a computer with little memory free, set Memory to use
    (2 GB at the least): the build keeps within it, more slowly.
 3. Copy the folder it makes (LGSH00001) to /data/homebrew on the console, or send it from the window over FTP.
    Your game file goes to /data/eglantineps5/roms on the console.
@@ -121,11 +124,10 @@ def version():
 
 
 def native_parts(system, vulkan, cache, top, kit):
-    """ps5-native-tool (PS5_Vulkan tooling/native: the ELF made the console's executable, and signed) and the lifter's two
-    helper libraries, for the system, their runtime linked in: a64emit (third_party/a64-kit/lift/a64emit.cpp), and zbic
-    (third_party/zbic), which unpacks the game's main program where the dump has it ZBIC-compressed (nx2/zbic.py). Both
-    are built on first use where there is a compiler; a player has none, so they come ready (v0.1.0 came without zbic:
-    reading a real .nup stopped there)"""
+    """ps5-native-tool (PS5_Vulkan tooling/native: the ELF made the console's executable, and signed), its runtime linked
+    in, and longshot-builder (upstream's builder, Rust: it reads the game file, ZBIC-compressed program and all, and
+    translates it), each for the system, built here by cargo: Linux for this PC, Windows cross-built for
+    WINDOWS_RUST_TARGET with llvm-mingw's linker (not run on a Windows PC yet)"""
     native = os.path.join(vulkan, "tooling", "native")
     if not os.path.exists(os.path.join(native, NATIVE_SOURCES[0])):
         sys.exit("package: no PS5_Vulkan sources at %s (git submodule update --init ps5/deps/PS5_Vulkan, or PS5_VULKAN)" % vulkan)
@@ -133,22 +135,13 @@ def native_parts(system, vulkan, cache, top, kit):
     build = os.path.join(cache, "build-" + system)
     shutil.rmtree(build, ignore_errors=True)
     os.makedirs(build)
-    lift = os.path.join(ROOT, "third_party", "a64-kit", "lift")
-    kit_lift = os.path.join(kit, "src", "third_party", "a64-kit", "lift")
-    emit_src = [os.path.join(lift, "a64emit.cpp"), os.path.join(lift, "suyu", "arm64_to_c.h")]
-    # (build_emit.py's stamp: with it the lifter takes the library as built and asks for no compiler)
-    key = hashlib.sha1(b"".join(open(f, "rb").read() for f in emit_src)).hexdigest()
     if system == "windows-x64":
         mingw = unpack(fetch("llvm-linux", cache), os.path.join(cache, "llvm-linux"))
         cc, cxx = (os.path.join(mingw, "bin", "x86_64-w64-mingw32-" + n) for n in ("clang", "clang++"))
-        tool, lib, extra = os.path.join(top, "tools", "bin", "ps5-native-tool.exe"), os.path.join(kit_lift, "a64emit.dll"), ["-static"]
-        emit_flags = ["-shared", "-static", "-fms-extensions", "-D_CRT_SECURE_NO_WARNINGS"]
-        zbic_lib, zbic_flags = "zbic.dll", ["-shared", "-static"]
+        tool, extra = os.path.join(top, "tools", "bin", "ps5-native-tool.exe"), ["-static"]
     else:
         cc, cxx = "gcc", "g++"
-        tool, lib, extra = os.path.join(top, "tools", "bin", "ps5-native-tool"), os.path.join(kit_lift, "liba64emit.so"), ["-static"]
-        emit_flags = ["-shared", "-fPIC", "-static-libstdc++", "-static-libgcc"]
-        zbic_lib, zbic_flags = "zbic.so", ["-shared", "-fPIC"]
+        tool, extra = os.path.join(top, "tools", "bin", "ps5-native-tool"), ["-static"]
     objs = []
     for f in ZLIB_SOURCES:
         o = os.path.join(build, f[:-2] + ".o")
@@ -156,22 +149,21 @@ def native_parts(system, vulkan, cache, top, kit):
         objs.append(o)
     os.makedirs(os.path.dirname(tool), exist_ok=True)
     run([cxx, "-std=c++20", "-O2", "-w", "-I", zlib] + [os.path.join(native, f) for f in NATIVE_SOURCES] + objs + extra + ["-o", tool])
-    run([cxx, "-std=c++20", "-O2", "-w", emit_src[0]] + emit_flags + ["-o", lib])
-    open(lib + ".sha1", "w").write(key)
-    # (nx2/zbic.py takes the library beside the sources as it is: SRC there is <kit>/src/third_party/zbic)
-    zbic_src = os.path.join(ROOT, "third_party", "zbic")
-    zbic_dir = os.path.join(kit, "src", "third_party", "zbic")
-    os.makedirs(zbic_dir, exist_ok=True)
-    # (compiled by the pinned LLVM on both systems, as Longshot's own builds compile it: the Linux runner's GCC 11 made a
-    # library that read no ZBIC frame (zbic_check.c). On Linux llvm-mingw's clang is told the PC's own target; its C library
-    # is the build PC's)
-    zbic_cc = [cc] if system == "windows-x64" else \
-        [os.path.join(unpack(fetch("llvm-linux", cache), os.path.join(cache, "llvm-linux")), "bin", "clang"), "--target=x86_64-linux-gnu"]
-    run(zbic_cc + ["-O2", "-w", "-DZSTD_ZBIC_SUPPORT=1", "-I", zbic_src, os.path.join(zbic_src, "zstd.c"),
-                   os.path.join(zbic_src, "zbic_api.c"), os.path.join(HERE, "zbic_check.c")] +
-        zbic_flags + ["-o", os.path.join(zbic_dir, zbic_lib)])
-    for f in ("LICENSE", "PROVENANCE.md"):
-        shutil.copy2(os.path.join(zbic_src, f), os.path.join(zbic_dir, f))
+    # (the kit's own copy is the build PC's: each package has its system's in tools/bin, where pipeline.py looks first)
+    kits = os.path.join(kit, "tools", "bin", "longshot-builder")
+    if system == "windows-x64":
+        env = dict(os.environ)
+        env["CARGO_TARGET_%s_LINKER" % WINDOWS_RUST_TARGET.upper().replace("-", "_")] = cc
+        run(["cargo", "build", "--release", "-p", "longshot-builder", "--target", WINDOWS_RUST_TARGET], cwd=ROOT, env=env)
+        shutil.copy2(os.path.join(ROOT, "target", WINDOWS_RUST_TARGET, "release", "longshot-builder.exe"),
+                     os.path.join(top, "tools", "bin", "longshot-builder.exe"))
+    else:
+        # (built here, not taken from the kit: the kit's was linked on the PC that made the kit, whose C library may be
+        # newer than a player's; the packaging PC is the older system on purpose)
+        run(["cargo", "build", "--release", "-p", "longshot-builder"], cwd=ROOT)
+        shutil.copy2(os.path.join(ROOT, "target", "release", "longshot-builder"), os.path.join(top, "tools", "bin", "longshot-builder"))
+    if os.path.exists(kits):
+        os.remove(kits)
     if system == "windows-x64":
         run([cc, "-O2", "-municode", "-mwindows", "-static", os.path.join(HERE, "launcher.c"), "-o", os.path.join(top, "LongshotPS5Builder.exe")])
         # (the build without the window, for a terminal: a batch file runs in the console it is started from and keeps its

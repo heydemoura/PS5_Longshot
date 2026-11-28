@@ -109,6 +109,42 @@ DIRTY_PAGES = []   # (the lift's now: dev lift --dirty-pages 16777216, gen/rt/a6
 # start is the control: every bit set)
 MARK_BITMAP = []   # (the lift's too: dev lift --no-mark-bitmap turns it off)
 
+# The console's lift, as ps5/builder/pipeline.py asks for it and as a developer's own (ps5/README.md): the guest window's
+# base and the page marks' table. gen/rt/a64_config.h says them to the host, which is compiled against it
+LIFT_OPTIONS = ["--memory-base", "0x1000000000", "--dirty-pages", "16777216"]
+# (what `dev lift` with LIFT_OPTIONS writes as gen/rt/a64_config.h, byte for byte: the kit's objects are compiled with no
+# game, so with no lift, against this copy; the builder checks a player's lift wrote the same, pipeline.py lift)
+KIT_CONFIG = (
+    "/* Written by longshot-builder: the choices this lift's IR was written with (builder/crates/llvm Options). The host\n"
+    "   is compiled against them through a64.h: do not define these on the command line. */\n"
+    "#ifndef A64_CONFIG_H\n"
+    "#define A64_CONFIG_H\n"
+    "#define A64_HOST_BASE 0x1000000000ULL   /* where guest address 0 is */\n"
+    "#define A64_DIRTY_PAGES 0x1000000ULL   /* the page marks' table: a byte per 4 KB page */\n"
+    "#define A64_WRITE_TRACK 1   /* (stores mark their pages: always) */\n"
+    "#define A64_MARK_BITMAP 1   /* only stores whose first or last byte is on a GPU page mark */\n"
+    "#define A64_POLLING 1   /* back edges poll for an interrupt */\n"
+    "#endif\n")
+# (the lifted units, LLVM IR: at -O1, the hot ones at RX_HOT_OPT, as longshot-builder compiles them; what the IR was
+# written with is the lift's, so no -D reaches it)
+IR_FLAGS = ["-march=znver2", "-fno-omit-frame-pointer", "-ffunction-sections", "-fdata-sections", "-g0", "-Wno-everything",
+            "-O1", "-x", "ir"]
+# (the lift's own C beside the units: gen/, and its runtime in gen/rt)
+GAME_FILES = ["table.c", "imports.c", "image.c", "rt/a64_rt.c", "rt/a64_fp.c"]
+
+
+def kit_dirs():
+    """--kit: no game, so no lift. GEN is a folder with the lift's runtime alone (builder/rt and KIT_CONFIG), which is all the
+    host reads of gen/"""
+    global GEN, RT
+    GEN = os.path.join(OUT, "kit-gen")
+    RT = os.path.join(GEN, "rt")
+    os.makedirs(RT, exist_ok=True)
+    for f in ("a64.h", "a64_rt.c", "a64_fp.c"):
+        shutil.copy(os.path.join(ROOT, "builder", "rt", f), os.path.join(RT, f))
+    with open(os.path.join(RT, "a64_config.h"), "w", newline="\n") as f:
+        f.write(KIT_CONFIG)
+
 
 def vk_sources():
     """The Vulkan back end's sources, as the old builder's vk_sources listed them: Eden's shader recompiler (gpu/vk/eden),
@@ -128,16 +164,13 @@ def jobs_for(gen_dir):
     """(source, object, flags, header digest) of everything the title links"""
     out = []
     game_digest = tree_digest(RT)
-    # (the lifted units, LLVM IR: at -O1, the hot ones at RX_HOT_OPT, as longshot-builder compiles them; what the IR was
-    # written with is the lift's, so no -D reaches it)
-    ir_fl = ["-march=znver2", "-fno-omit-frame-pointer", "-ffunction-sections", "-fdata-sections", "-g0", "-Wno-everything",
-             "-O1", "-x", "ir"]
+    ir_fl = IR_FLAGS
     c_fl = COMMON + ["-I" + RT, "-I" + GEN, "-I" + HOST, "-I" + GAME, "-fno-strict-aliasing", "-mcx16", "-O2"]
     units = sorted(f for f in os.listdir(GEN) if f.startswith("lifted_") and f.endswith(".ll")) if os.path.isdir(GEN) else []
     for u in units:
         fl = [HOT_OPT if f == "-O1" else f for f in ir_fl] if u.startswith("lifted_hot_") else ir_fl
         out.append((os.path.join(GEN, u), os.path.join(OUT, "obj", "game_" + u[:-3] + ".o"), fl, ""))
-    for s in [os.path.join(GEN, f) for f in ("table.c", "imports.c", "image.c")] + [os.path.join(RT, f) for f in ("a64_rt.c", "a64_fp.c")]:
+    for s in [os.path.join(GEN, *f.split("/")) for f in GAME_FILES]:
         out.append((s, os.path.join(OUT, "obj", "game_" + os.path.basename(s)[:-2] + ".o"), c_fl, game_digest))
 
     # the runtime: host/ as Linux builds it, without SDL's loader (host/ps5/hos_sdl_ps5.c) and the Linux-only files
@@ -269,7 +302,10 @@ def main():
     p.add_argument("--kit", action="store_true",
                    help="only what is not made from the game, compiled for ps5/builder/make_kit.py: no game is needed")
     a = p.parse_args()
-    for need, what in ((os.path.join(GEN, "table.c"), "the lifted game (longshot-builder dev lift: ps5/tools/lift.sh)"),
+    if a.kit:
+        kit_dirs()
+    for need, what in ((None if a.kit else os.path.join(GEN, "table.c"),
+                        "the lifted game (longshot-builder image, then dev lift " + " ".join(LIFT_OPTIONS) + ")"),
                        (RUST_LIB, "the game's Rust for the console (ps5/tools/build-rust.sh)"),
                        (os.path.join(SDK, "bin", "prospero-lld"), "the PS5 payload SDK (PS5_PAYLOAD_SDK)"),
                        (os.path.join(VULKAN, "tools", "radv-link.sh"), "PS5_Vulkan (PS5_VULKAN)"),
@@ -279,8 +315,6 @@ def main():
         if need and not os.path.exists(need):
             sys.exit("ps5/build.py: missing %s: %s" % (what, need))
     os.makedirs(os.path.join(OUT, "obj"), exist_ok=True)
-    if a.kit:
-        sys.exit("ps5/build.py: --kit is not ported to the Rust lift yet")
     gen_dir = os.path.join(OUT, "gen")
     # (the start-up screen shows the title's console icon, the one on the home screen, not the PC build's logo)
     logo_rgba.write(os.path.join(gen_dir, "longshot_logo.h"), os.path.join(ROOT, "ps5", "sce_sys", "icon0.png"))

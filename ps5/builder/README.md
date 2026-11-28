@@ -1,15 +1,16 @@
 # Longshot PS5 Builder
 
 A desktop tool: a player chooses their own game file and gets the PS5 title folder (`LGSH00001`) to copy to
-`/data/homebrew` on the console. Nothing has to be installed: the package carries its own Python, compiler and kit.
+`/data/homebrew` on the console. Nothing has to be installed: the package carries its own Python, compiler, translator
+(upstream's `longshot-builder`) and kit.
 
 | File | What it is |
 |---|---|
-| `build_kit.sh` | The kit from a fresh clone on Linux, with no game: fetches and builds RADV, FFmpeg, the SDK and the rest at pinned revisions, compiles the runtime and the renderer (`ps5/build.py --kit`), runs `make_kit.py`. |
+| `build_kit.sh` | The kit from a fresh clone on Linux, with no game: fetches and builds RADV, FFmpeg, the SDK and the rest at pinned revisions, builds the game's Rust for the console (`ps5/tools/build-rust.sh`) and the translator, compiles the runtime and the renderer (`ps5/build.py --kit`), runs `make_kit.py`. |
 | `make_kit.py` | Lays the kit out in `dist/kit`: everything of the title that is not made from the game, compiled already. No game content. |
-| `pipeline.py` | The build: the game's program read out of the `.nup`, translated to C, compiled, linked with the kit, signed, laid out. Python only, the same on every system. `--game --out --model base|pro [--memory GB] [--jobs N]`; `--check` checks the builder's own parts with no game. |
+| `pipeline.py` | The build: the game's program read out of the `.nup` and translated to LLVM IR (both by `longshot-builder`, for the console's guest window: the kit's `lift_options`), compiled, linked with the kit, signed, laid out; then the two shader lists (`shader_lists.py`, `longshot-builder dev console-lists`). `--game --out --model base|pro [--memory GB] [--jobs N]`; `--check` checks the builder's own parts with no game. |
 | `app.py` | The window (PyQt6): game file, output folder, the console's model, Build, the five steps, a progress bar, the log, Stop, and Send to PS5 over FTP. Runs `pipeline.py` as a process. `--self-test` opens it and runs the check. |
-| `package.py` | The packages, both made on Linux: `--system linux-x64` an AppImage, `--system windows-x64` a portable folder in a zip (cross-built). python-build-standalone, llvm-mingw's LLVM (its clang has the PS5 target), `ps5-native-tool` and the lifter's helper library for the system, the kit. Every download is checked by SHA-256. |
+| `package.py` | The packages, both made on Linux: `--system linux-x64` an AppImage, `--system windows-x64` a portable folder in a zip (cross-built). python-build-standalone, llvm-mingw's LLVM (its clang has the PS5 target), `ps5-native-tool` and `longshot-builder` for the system (cargo; Windows for `x86_64-pc-windows-gnullvm`), the kit. Every download is checked by SHA-256. |
 | `launcher.c` | Windows: `LongshotPS5Builder.exe`, the portable folder's start. No installer. |
 
 ```
@@ -33,6 +34,29 @@ artifacts: a rehearsal. No game file is used anywhere in it.
 
 The Windows package is a folder: unpack the zip anywhere and start `LongshotPS5Builder.exe`. It is not one file: the
 compiler, Python and the kit are 880 MB unpacked, and a single self-unpacking program would unpack them at every start.
+
+## On upstream's Rust builder (2026-11-28)
+
+Upstream replaced its Python lifter (`nx2/`) with `longshot-builder` (Rust), which writes LLVM IR. This builder follows:
+
+| Step | Before | Now |
+|---|---|---|
+| Reading the game | `nx2/nup.py` (Python, with the `zbic` helper library) | `longshot-builder image` |
+| Translating | `nx2/lift.py` to C, with the `a64emit` helper library | `longshot-builder dev lift --memory-base 0x1000000000 --dirty-pages 16777216` to IR |
+| Compiling | 30-odd chunks of C, the giants cut by `nx2/split_giants.py` | the lift's ~500 units of IR as they are (the lifter cuts them by cost) |
+| Linking | the kit's objects | the same, and `lib/liblongshot_rs.a`: the game's Rust, with Rust's standard library built for emulated thread-local storage |
+| Shader lists | `nx2/shader_census.py`, `nx2/pipeline_states.py` | `longshot-builder dev console-lists` (a command added here) |
+
+The kit's objects are compiled with no game, so with no lift: against a copy of the lift's runtime and of the
+`a64_config.h` those options make it write (`ps5/build.py` `KIT_CONFIG`). `pipeline.py` stops a build whose lift wrote
+another.
+
+Measured here (2026-11-28, an arm64 Linux container, 10 cores, 7 GB of memory, `--memory 5 --jobs 4`, the real `.nup`):
+see "State" below. **Not measured yet:** the memory the translation takes by its threads (within `--memory` it is one
+thread for each 2 GB, a guess), the packages (`package.py` was changed and compiles as Python, but no AppImage or zip
+was made from this tree), and anything on Windows.
+
+The figures in the next section are the Python lifter's and the C chunks': kept for the record until measured again.
 
 ## Memory
 
@@ -82,7 +106,7 @@ forest test for its 230 s with 2.0 GB free at the least and no fault. A start as
 shows the title reading the folder's `longshot_env.txt`; the 512-texel line's effect in play was not measured in that
 start (a test run's own switches file takes the place of `longshot_env.txt`, and a player's file may not script input).
 
-## State (2026-11-16)
+## State (2026-11-16, the Python lifter's builder)
 
 - **The kit from a fresh clone** (`build_kit.sh`, no game) has the same runtime objects as a whole build's, but for the
   version stamp. An AppImage made from it built a title from the game's `exefs`; that title has not run on the console
