@@ -5408,7 +5408,9 @@ static bool acknowledge_output_trial_frame(OutputTrialFrame frame) {
     return true;
 }
 
-void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view, bool source_srgb, bool allow_scale, OutputTrialSource trial);
+void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view,
+                              bool source_srgb, bool allow_scale, OutputTrialSource trial,
+                              VkFormat framegen_format = VK_FORMAT_UNDEFINED);
 
 void do_present(const nvn_tex* t, const int crop[4], uint64_t native_generation = 0) {
     OutputTrialSource trial;
@@ -6329,12 +6331,14 @@ static VkSemaphore take_retired_acquire() {
     return semaphore;
 }
 
-void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view, bool source_srgb, bool allow_scale) {
-    present_image_with_trial(src, sw, sh, crop, view, source_srgb, allow_scale, {});
+void present_image(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view, bool source_srgb,
+                   bool allow_scale, VkFormat framegen_format) {
+    present_image_with_trial(src, sw, sh, crop, view, source_srgb, allow_scale, {}, framegen_format);
 }
 
 namespace {
-void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view, bool source_srgb, bool allow_scale, OutputTrialSource trial) {
+void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view,
+                              bool source_srgb, bool allow_scale, OutputTrialSource trial, VkFormat framegen_format) {
 #ifdef TRACY_ENABLE
     HT_SCOPE("present_image");
 #endif
@@ -6559,7 +6563,9 @@ void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int c
     // (Native HDR: scaled in 10 bits (framegen_scale's pq), and read by the HDR pass in every case, through the view in the
     // format the game presents (do_present): at 100% contrast it writes the game's PQ codes as they are. Never blitted from its
     // image: a blit converts from the image's own format, not the picture's)
-    const bool native_pq = present_native_pq.load(std::memory_order_relaxed);
+    const bool native_pq = framegen_format == VK_FORMAT_UNDEFINED
+        ? present_native_pq.load(std::memory_order_relaxed)
+        : framegen_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     const VkImage scaled = allow_scale && src && view ? framegen_scale(f.cmd, view, src, sw, sh, crop, rect.w, rect.h, native_pq) : VK_NULL_HANDLE;
     // (longshot) the Insert menu's HDR: the picture (scaled, or the game's own with its crop) to HDR10, copied in as the SDR one is
     const int colour = menu_colour_vision_mode();

@@ -699,7 +699,7 @@ def cut(text, start, end, what):
 
 
 def fixture(replay, windows, mode):
-    present = block(replay, "void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view, bool source_srgb, bool allow_scale, OutputTrialSource trial) {")
+    present = block(replay, "void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view,\n                              bool source_srgb, bool allow_scale, OutputTrialSource trial, VkFormat framegen_format) {")
     acquire = cut(present, "    // (the presenter thread, RX_VK_PRESENT_THREAD: the present handed over",
                   "    if (vkResetCommandPool(dev.device, f.pool, 0)",
                   "present_image's drain and acquire")

@@ -1,4 +1,4 @@
-// fg_hud.comp sha256 eadbae121c71ea295962ff6c29aac597e95077524758d2a0c18d6729bcb1bb80 (tests/test_fsr3fi_hudless_colour.py --write: glslangValidator -V --target-env vulkan1.3 --vn FG_HUD_COMP_SPV)
+// fg_hud.comp sha256 838235bcce855036b0b2d8f4d9847a6eab57350fc9b6ab2cabef4bfe30338413 (tests/test_fsr3fi_hudless_colour.py --write: glslangValidator -V --target-env vulkan1.3 --vn FG_HUD_COMP_SPV)
 	// 1116.6.0
 	 #pragma once
 const uint32_t FG_HUD_COMP_SPV[] = {

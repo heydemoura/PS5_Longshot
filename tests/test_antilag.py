@@ -31,7 +31,7 @@ source = (ROOT / "gpu" / "vk" / "vk_antilag.cpp").read_text(encoding="utf-8")
 
 
 def present_image_block(text):
-    return block(text, "void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view, bool source_srgb, bool allow_scale, OutputTrialSource trial) {")
+    return block(text, "void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view,\n                              bool source_srgb, bool allow_scale, OutputTrialSource trial, VkFormat framegen_format) {")
 
 
 def cut_def(text, prefix):

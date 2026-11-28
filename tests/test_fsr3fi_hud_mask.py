@@ -72,6 +72,7 @@ STUBS = r'''
 struct { int framegen = 2, hdr_peak = 1000, hdr = 0; } opts;
 struct { bool hdr = false; } dev;
 constexpr uint32_t FG_HUD_COMP_SPV[] = {0};
+constexpr uint32_t FG_HUD_PQ_COMP_SPV[] = {0};
 [[maybe_unused]] constexpr uint32_t FG_HUD_LAYER_COMP_SPV[] = {1};
 [[maybe_unused]] constexpr uint32_t FG_HUD_COMPOSITE_COMP_SPV[] = {2};
 [[maybe_unused]] constexpr uint32_t FG_HUD_LAYER_RGBA8_COMP_SPV[] = {3};
@@ -236,6 +237,7 @@ template <class H> void forget_layer_pipes(H& h) {
 int main() {
     check_pq_hud_pixels();
     const VkCommandBuffer cmd = (VkCommandBuffer)(uintptr_t)1;
+    fg.color_format = VK_FORMAT_R8G8B8A8_UNORM;
     fg.frames[0] = {handle<VkImage>(), nullptr, handle<VkImageView>()};
     fg.frames[1] = {handle<VkImage>(), nullptr, handle<VkImageView>()};
     OutSet set{};
@@ -309,17 +311,22 @@ int main() {
     // Use its mask with the already encoded present, and keep the linear layer out of PQ interpolation.
     const VkFormat original_format = picture.format;
     picture.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+    fg.color_format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     const size_t fits_before_pq = fits.size(), composites_before_pq = overs.size();
     framegen_hud_before(cmd, &picture, 0);
     CHECK(hud_source(cmd, 1, 2560, 1440, 0, 0, 2560, 1440, true));
     CHECK(fsr3fi_frames(cmd, set, 1, 2560, 1440, ++sequence, true, t, slot, 1) == 1);
     CHECK(passes.size() == 5 && passes[4].pc[4] == 1);
+    CHECK(passes[4].pipe == hud.mask_pq.pipe && hud.mask_pq.pipe != hud.mask.pipe);
     CHECK(fsr3fi::given.native_pq && fsr3fi::given.hud_mask && !fsr3fi::given.present);
+    CHECK(fsr3fi::given.color_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32);
     CHECK(fsr3fi::given.color == passes[4].views[3] && fsr3fi::given.color != passes[4].views[4]);
     CHECK(fits.size() == fits_before_pq && overs.size() == composites_before_pq);
     // Back to an sRGB present using the same float target. Never learn from the preceding HDR capture.
+    fg.color_format = VK_FORMAT_R8G8B8A8_UNORM;
     framegen_hud_before(cmd, &picture, 0);
     CHECK(present(0).present && fits.size() == fits_before_pq + 1 && fits.back().pc[4] == 0);
+    CHECK(fsr3fi::given.color_format == VK_FORMAT_R8G8B8A8_UNORM && passes.back().pipe == hud.mask.pipe);
     picture.format = original_format;
 
     // (the picture destroyed since the copy, or moved to another image: nothing to copy from, the HUD guessed)

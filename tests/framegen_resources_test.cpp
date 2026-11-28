@@ -115,6 +115,8 @@ void inspect_disabled() {
     const int before = attempts; CHECK(!init() && attempts == before);
 }
 int run(const std::string& phase) {
+    constexpr auto sdr = VK_FORMAT_R8G8B8A8_UNORM;
+    constexpr auto hdr = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     clear_model();
     if (phase == "samplers") {
         fail_at = 21; CHECK(!init()); inspect_disabled(); return 0;
@@ -125,19 +127,22 @@ int run(const std::string& phase) {
         }
         clear_model(); dev.push_descriptor = false; CHECK(!init() && live.empty()); dev.push_descriptor = true;
     }
-    // Every image or view failure at fixed2x and max8x, after successful pipeline setup.
-    for (int mult : {2, 8}) for (int failed = 1; failed <= 2 * (6 + 3 * mult); ++failed) {
-        clear_model(); opts.framegen = mult; CHECK(init() && live.size() == 17);
-        fail_at = attempts + failed; CHECK(!ensure_size({}, 3440, 1440));
-        CHECK(barriers == 0 && !fg.w && !fg.h && !fg.mult && !fg.have_prev && !fg.recorded);
-        inspect_disabled();
+    // Every image or view failure at fixed2x and max8x, in either colour format.
+    for (VkFormat format : {sdr, hdr}) {
+        for (int mult : {2, 8}) for (int failed = 1; failed <= 2 * (6 + 3 * mult); ++failed) {
+            clear_model(); opts.framegen = mult; CHECK(init() && live.size() == 17);
+            fail_at = attempts + failed; CHECK(!ensure_size({}, 3440, 1440, format));
+            CHECK(barriers == 0 && !fg.w && !fg.h && !fg.mult && !fg.have_prev && !fg.recorded);
+            CHECK(fg.color_format == VK_FORMAT_UNDEFINED);
+            inspect_disabled();
+        }
     }
     // Resize must drain old work before releasing it, then roll back a partially allocated replacement.
-    clear_model(); opts.framegen = 2; CHECK(init()); CHECK(ensure_size({}, 1720, 720));
+    clear_model(); opts.framegen = 2; CHECK(init()); CHECK(ensure_size({}, 1720, 720, sdr));
     CHECK(live.size() == 53 && barriers == 12 && framegen_on());
-    const int count = attempts; CHECK(ensure_size({}, 1720, 720) && attempts == count);
+    const int count = attempts; CHECK(ensure_size({}, 1720, 720, sdr) && attempts == count);
     submitted = true; idle = false; fail_at = attempts + 8;
-    CHECK(!ensure_size({}, 3440, 1440)); CHECK(waits == 2 && idle);
+    CHECK(!ensure_size({}, 3440, 1440, sdr)); CHECK(waits == 2 && idle);
     CHECK(!fg.w && !fg.h && !fg.mult && !fg.have_prev && !fg.recorded); inspect_disabled();
     // The independent scale setup must also release each partial pipeline/sampler on failure.
     for (int failure = 1; failure <= 5; ++failure) {

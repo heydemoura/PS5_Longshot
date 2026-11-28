@@ -35,6 +35,7 @@ using namespace mkwvk;
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); std::exit(1); } } while (0)
 using VkImage = uint64_t;
 using VkImageView = uint64_t;
+enum VkFormat { VK_FORMAT_UNDEFINED = 0, VK_FORMAT_A2B10G10R10_UNORM_PACK32 = 64 };
 constexpr VkImage VK_NULL_HANDLE = 0;
 constexpr int VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL = 1;
 constexpr int VK_IMAGE_ASPECT_COLOR_BIT = 1;
@@ -95,6 +96,7 @@ void actual_present(VkImage src, uint32_t sw, uint32_t sh, const int* crop, VkIm
     struct { int cmd; } f{1};
     VkImage dst = 2;
     [[maybe_unused]] const bool allow_scale = true, source_srgb = false;
+    [[maybe_unused]] const VkFormat framegen_format = VK_FORMAT_UNDEFINED;
     [[maybe_unused]] const unsigned index = 0;
 ''' + block + r'''
 }

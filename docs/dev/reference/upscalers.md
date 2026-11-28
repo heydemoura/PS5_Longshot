@@ -248,6 +248,10 @@ who makes the frames. `framegen_record` in [`vk_framegen.cpp`](../../../gpu/vk/v
 With DLSS FG chosen and no upscaler picture (the game's menus, movies, loading screens), the set is shown as the game's
 frame alone (`dlss_fg_holds`, `FgMaker::DlssPaused`), not handed to another maker.
 
+The shared frame-generation history and output images use `RGB10A2` for Native HDR (PQ) and `RGBA8` for SDR input.
+The format follows the frames through generation and presentation. A format change drains the pending sets and restarts
+interpolation history. If the device cannot use the 10-bit storage images, Longshot presents the original HDR frames.
+
 FSR 3.1 interpolation ([`vk_fsr3fi.cpp`](../../../gpu/vk/vk_fsr3fi.cpp)) is AMD's passes compiled from patched copies
 of the SDK headers (`FI_PATCHES` in `scripts/shaders.py`; `third_party/` is unchanged). The patches read each made
 frame's place `t` from the constant block's padding word, so any multiplier works, not only the midpoint. Optical flow

@@ -1682,6 +1682,7 @@ struct Fg {
     unsigned most = 1;                // (the most frames it makes between two of the game's: MultiFrameCountMax)
     NVSDK_NGX_Parameter* params = nullptr;
     NVSDK_NGX_Handle* feature = nullptr;
+    VkFormat color_format = VK_FORMAT_UNDEFINED;
     uint32_t fw = 0, fh = 0;          // (the picture its feature was made for)
     int create_failures = 0;
     int refusals = 0;                 // (sets NGX refused in a row: kFgRefusalsOff of them give frame generation up)
@@ -2093,7 +2094,8 @@ void dlss_fg_inputs(VkCommandBuffer cmd, const TemporalFrame& f, const float pro
     }
 }
 
-int dlss_fg_frames(VkCommandBuffer cmd, VkImage color, VkImageView color_view, uint32_t w, uint32_t h, int count,
+int dlss_fg_frames(VkCommandBuffer cmd, VkImage color, VkImageView color_view, VkFormat color_format,
+                   uint32_t w, uint32_t h, int count,
                    const VkImage* out, const VkImageView* out_views, bool blend, uint64_t sequence) {
     if (!fg_possible()) return skip(FG_SKIP_OFF);
     Fg& g = fgs();
@@ -2137,12 +2139,12 @@ int dlss_fg_frames(VkCommandBuffer cmd, VkImage color, VkImageView color_view, u
     }
     if (g.inputs == g.used || !g.rw) return g.no_inputs++, skip(FG_SKIP_INPUTS);
     g.used = g.inputs;
-    if (g.feature && (g.fw != w || g.fh != h)) fg_release(g);
+    if (g.feature && (g.fw != w || g.fh != h || g.color_format != color_format)) fg_release(g);
     if (!g.feature) {
         if (g.create_failures >= 3) return g.refused++, skip(FG_SKIP_REFUSED);
         NVSDK_NGX_DLSSG_Create_Params cp{};
         cp.Width = w, cp.Height = h;
-        cp.NativeBackbufferFormat = VK_FORMAT_R8G8B8A8_UNORM;   // (the window's picture, vk_framegen.cpp's frames)
+        cp.NativeBackbufferFormat = color_format;   // (the window's picture, vk_framegen.cpp's frames)
         cp.RenderWidth = g.rw, cp.RenderHeight = g.rh;
         // (frame generation's own size keys, which NGX takes over the generic ones the helper sets: it warned about those)
         NVSDK_NGX_Parameter_SetUI(g.params, NVSDK_NGX_DLSSG_Parameter_Width, w);
@@ -2162,14 +2164,14 @@ int dlss_fg_frames(VkCommandBuffer cmd, VkImage color, VkImageView color_view, u
             if (g.create_failures >= 3) g.start_failed = true;
             return g.refused++, skip(FG_SKIP_REFUSED);
         }
-        g.fw = w, g.fh = h;
+        g.fw = w, g.fh = h, g.color_format = color_format;
         g.held = true;
         g.last_sequence = 0;
-        logf("vk: DLSS Frame Gen (NGX): feature made for %ux%u from %ux%u inputs, %d made frame(s) a set", w, h, g.rw, g.rh,
-             count);
+        logf("vk: DLSS Frame Gen (NGX): feature made for %ux%u from %ux%u inputs, %d made frame(s) a set, color format %u",
+             w, h, g.rw, g.rh, count, (unsigned)color_format);
     }
     const VkImageSubresourceRange one{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    NVSDK_NGX_Resource_VK back = NVSDK_NGX_Create_ImageView_Resource_VK(color_view, color, one, VK_FORMAT_R8G8B8A8_UNORM, w, h, false);
+    NVSDK_NGX_Resource_VK back = NVSDK_NGX_Create_ImageView_Resource_VK(color_view, color, one, color_format, w, h, false);
     NVSDK_NGX_Resource_VK depth = NVSDK_NGX_Create_ImageView_Resource_VK(g.depth.view, g.depth.image, one, g.depth.format, g.rw,
                                                                          g.rh, false);
     NVSDK_NGX_Resource_VK mvecs = NVSDK_NGX_Create_ImageView_Resource_VK(g.motion.view, g.motion.image, one, g.motion.format,
@@ -2191,7 +2193,7 @@ int dlss_fg_frames(VkCommandBuffer cmd, VkImage color, VkImageView color_view, u
     std::memcpy(o.cameraPos, g.pos, sizeof g.pos), std::memcpy(o.cameraUp, g.up, sizeof g.up);
     std::memcpy(o.cameraRight, g.right, sizeof g.right), std::memcpy(o.cameraFwd, g.fwd, sizeof g.fwd);
     o.cameraNear = g.near_z, o.cameraFar = g.far_z, o.cameraFOV = g.fov, o.cameraAspectRatio = g.aspect;
-    o.colorBuffersHDR = false;
+    o.colorBuffersHDR = color_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
     o.depthInverted = g.depth_reversed;   // (the chain's depth: [0, 1], reversed for FSR 3.1 on the chain: depth_reversed)
     o.cameraMotionIncluded = true;      // (its motion is the whole of it: camera and actors)
     // (a new history after a present NGX did not make, a cut the chain saw, or a new feature)
@@ -2236,7 +2238,7 @@ int dlss_fg_frames(VkCommandBuffer cmd, VkImage color, VkImageView color_view, u
     fg_barrier(cmd);
     for (int k = 1; k <= count; k++) {
         NVSDK_NGX_Resource_VK made = NVSDK_NGX_Create_ImageView_Resource_VK(out_views[k - 1], out[k - 1], one,
-                                                                            VK_FORMAT_R8G8B8A8_UNORM, w, h, true);
+                                                                            color_format, w, h, true);
         ep.pOutputInterpFrame = &made;
         o.multiFrameIndex = (unsigned)k;
         ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);   // (NGX records into cmd itself)
@@ -2346,7 +2348,8 @@ bool dlss_fg_runs(int) { return false; }
 int dlss_fg_most() { return 0; }
 void dlss_fg_device_extensions(std::vector<const char*>&, const std::vector<VkExtensionProperties>&) {}
 void dlss_fg_inputs(VkCommandBuffer, const TemporalFrame&, const float*, const float*, const float*, bool) {}
-int dlss_fg_frames(VkCommandBuffer, VkImage, VkImageView, uint32_t, uint32_t, int, const VkImage*, const VkImageView*, bool,
+int dlss_fg_frames(VkCommandBuffer, VkImage, VkImageView, VkFormat, uint32_t, uint32_t, int, const VkImage*,
+                   const VkImageView*, bool,
                    uint64_t) {
     return 0;
 }

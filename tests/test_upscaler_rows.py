@@ -135,7 +135,7 @@ def main():
     # the Window scaling filter's sizes: only from the game's frames. The start-up screen is drawn at the window's size
     # (present_image with no source): taken as the picture's, the row read "Not needed" while the output was another size
     replay = (ROOT / "gpu" / "vk" / "vk_replay.cpp").read_text(encoding="utf-8")
-    present = function(replay, "void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view, bool source_srgb, bool allow_scale, OutputTrialSource trial) {")
+    present = function(replay, "void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view,\n                              bool source_srgb, bool allow_scale, OutputTrialSource trial, VkFormat framegen_format) {")
     note = present.index("menu_note_present_sizes(")
     if "if (src) {" not in present[:note] or present.rindex("if (src) {", 0, note) < present.rindex("\n    }", 0, note):
         raise SystemExit("present_image: the start-up screen's frames (no src) count as the game's picture for the filter row")

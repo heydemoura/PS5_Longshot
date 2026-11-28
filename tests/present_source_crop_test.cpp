@@ -40,8 +40,11 @@ uint32_t allocated_w = 0, allocated_h = 0;
 namespace fsr3fi { bool wanted = false; bool frames_wanted() { return wanted; } }
 // (NVIDIA DLSS Frame Generation through NGX, vk_dlss.cpp: not asked for here, so the sets are the renderer's own)
 bool dlss_fg_wanted() { return false; }
-int dlss_fg_frames(VkCommandBuffer, VkImage, VkImageView, uint32_t, uint32_t, int, const VkImage*, const VkImageView*, bool,
-                   uint64_t) { return 0; }   // (asked every present at 2x and up: makes none here)
+int dlss_fg_frames(VkCommandBuffer, VkImage, VkImageView, VkFormat format, uint32_t, uint32_t, int, const VkImage*,
+                   const VkImageView*, bool, uint64_t) {
+    CHECK(format == fg.color_format);
+    return 0;
+}
 uint64_t reflex_frame() { return 0; }   // (vk_reflex.cpp: NVIDIA Reflex not on here)
 // (who made each set's frames, for the Insert menu's Frame generation by row: the last one noted)
 enum class FgMaker { None, BuiltIn, Dlss, Fsr3, DlssPaused };
@@ -74,10 +77,11 @@ void vkCmdClearColorImage(VkCommandBuffer, VkImage, VkImageLayout, const VkClear
     CHECK(c->float32[0] == 0 && c->float32[1] == 0 && c->float32[2] == 0 && c->float32[3] == 1); ++clears;
 }
 bool init() { ++initializations; return true; }
+bool init_pq_framegen() { return true; }
 int multiplier() { return 2; }
-bool ensure_size(VkCommandBuffer, uint32_t w, uint32_t h) {
+bool ensure_size(VkCommandBuffer, uint32_t w, uint32_t h, VkFormat format) {
     // (the sets are made for the row's multiplier, which framegen_record then takes from fg.mult, as the real one)
-    ++sizes; allocated_w = w; allocated_h = h; fg.mult = multiplier(); return true;
+    ++sizes; allocated_w = w; allocated_h = h; fg.mult = multiplier(); fg.color_format = format; return true;
 }
 int64_t now_ns() { return 1000000; }
 // (compat/longshot_env.h's reading of a switch's value: RX_VK_FG_GAME_CLOCK, read by framegen_record, is unset here)
@@ -89,7 +93,7 @@ void full_barrier(VkCommandBuffer) {}
 void pass(VkCommandBuffer, const Pipe& p, std::initializer_list<std::pair<VkImageView, VkSampler>>,
           uint32_t, uint32_t, const void* pc = nullptr, uint32_t bytes = 0) {
     ++dispatches;
-    if (&p == &fg.copy) { CHECK(bytes == sizeof copy_pc); std::memcpy(copy_pc, pc, bytes); }
+    if (&p == &fg.copy || &p == &fg.copy_pq) { CHECK(bytes == sizeof copy_pc); std::memcpy(copy_pc, pc, bytes); }
     if (&p == &hdr.pipe) { CHECK(bytes == 48); std::memcpy(hdr_uv, pc, sizeof hdr_uv); }
 }
 void vkCmdCopyImage(VkCommandBuffer, VkImage, VkImageLayout, VkImage, VkImageLayout,

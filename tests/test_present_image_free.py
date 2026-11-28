@@ -232,7 +232,7 @@ def main():
     p.add_argument("--cxx", default="clang++")
     a = p.parse_args()
     replay = (a.source / "gpu/vk/vk_replay.cpp").read_text(encoding="utf-8")
-    present = block(replay, "void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view, bool source_srgb, bool allow_scale, OutputTrialSource trial) {")
+    present = block(replay, "void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view,\n                              bool source_srgb, bool allow_scale, OutputTrialSource trial, VkFormat framegen_format) {")
     acquire = between(present, "    uint32_t index = 0;", "    if (vkResetCommandPool(dev.device, f.pool, 0)")
     submit = between(present, "    if (vkEndCommandBuffer(f.cmd) == VK_ERROR_DEVICE_LOST) device_lost();",
                      "    std::unique_lock qk(dev.present_mu);")

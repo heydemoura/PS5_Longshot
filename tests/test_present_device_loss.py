@@ -23,9 +23,9 @@ def main():
     p.add_argument("--cxx", default="g++")
     a = p.parse_args()
     text = (a.source / "gpu/vk/vk_replay.cpp").read_text(encoding="utf-8")
-    entry = re.search(r"^void present_image_with_trial\([^\n]*?\) \{$", text, re.M)
+    entry = re.search(r"^void present_image_with_trial\([^;{}]*\) \{$", text, re.M)
     if not entry:
-        entry = re.search(r"^void present_image\([^\n]*?\) \{$", text, re.M)
+        entry = re.search(r"^void present_image\([^;{}]*\) \{$", text, re.M)
     if not entry:
         raise SystemExit("FAIL: native present routine is missing")
     present = text[entry.start():]

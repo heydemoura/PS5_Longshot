@@ -71,7 +71,7 @@ def main():
     need("FpsRender" in body(replay, "void submit_q("), "the submits' replay is not timed as the renderer's")
     need("st_wait_ns +=" in body(replay, "Recording& begin_recording(") and "slot_wait_ns()" in body(
         (vk / "vk_fps.cpp").read_text(encoding="utf-8"), "void fps_presented()"), "the recording slot's wait is not a GPU wait")
-    need("fps_wait(fps_stats::kPace" in body(replay, "void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view, bool source_srgb, bool allow_scale, OutputTrialSource trial) {"), "the swapchain's acquire is not the pacing's")
+    need("fps_wait(fps_stats::kPace" in body(replay, "void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view,\n                              bool source_srgb, bool allow_scale, OutputTrialSource trial, VkFormat framegen_format) {"), "the swapchain's acquire is not the pacing's")
     # (a present that returned only once the frame's copy, not done when it was called, was done waited for the GPU, not vsync:
     # NVIDIA on Linux; read with two fence reads, nothing waited for)
     out = body(replay, "static bool present_out(uint32_t index, std::unique_lock<decltype(dev.present_mu)>& qk, OutputTrialSource trial, bool preview_path) {")

@@ -1,3 +1,4 @@
+// fg_copy.comp sha256 21cc508cbd4543fda79ad01ee5d5030628004e0115419b9c002ac2cc5bb04e12 (tests/test_framegen_hdr.py --write: glslangValidator -V --target-env vulkan1.3 --vn FG_COPY_COMP_SPV)
 	// 1116.6.0
 	 #pragma once
 const uint32_t FG_COPY_COMP_SPV[] = {

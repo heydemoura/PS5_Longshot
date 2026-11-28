@@ -132,7 +132,8 @@ void dlss_fg_inputs(VkCommandBuffer cmd, const TemporalFrame& f, const float pro
 /// At the present (vk_framegen.cpp framegen_record): `count` frames between the last picture and this one (color, the
 /// window's, w x h RGBA8) into out[0..count). Returns count, or 0 when it did not make them (the renderer's own methods do).
 /// blend: there is a picture before this one; sequence: the present's count (one skipped makes a new history)
-int dlss_fg_frames(VkCommandBuffer cmd, VkImage color, VkImageView color_view, uint32_t w, uint32_t h, int count,
+int dlss_fg_frames(VkCommandBuffer cmd, VkImage color, VkImageView color_view, VkFormat color_format,
+                   uint32_t w, uint32_t h, int count,
                    const VkImage* out, const VkImageView* out_views, bool blend, uint64_t sequence);
 /// Frame generation at Off or Auto (no fixed multiplier: dlss_fg_frames is not asked): its feature, if made, let go and its
 /// memory back, as when the Frame generation by row changes. Each such present (vk_replay.cpp); nothing to do is one load

@@ -38,8 +38,10 @@
 
 #include "vk_builtin_spv.h"   // (RX_VK_SHADER_DIR)
 #include "shaders/fg_copy_comp_spv.h"
+#include "shaders/fg_copy_pq_comp_spv.h"
 #include "shaders/fg_flow_comp_spv.h"
-#include "shaders/fg_hud_comp_spv.h"   // (AMD FSR 3.1's interpolation source with the HUD marked: hud_source)
+#include "shaders/fg_hud_comp_spv.h"
+#include "shaders/fg_hud_pq_comp_spv.h"   // (AMD FSR 3.1's interpolation source with the HUD marked: hud_source)
 #include "shaders/fg_hud_composite_comp_spv.h"   // (the HUD over FSR 3.1's made frames: fsr3fi_frames)
 #include "shaders/fg_hud_composite_rgba8_comp_spv.h"
 #include "shaders/fg_hud_layer_comp_spv.h"   // (how see-through the HUD is: hud_source)
@@ -49,6 +51,7 @@
 #include "shaders/fg_scale_comp_spv.h"
 #include "shaders/fg_scale_pq_comp_spv.h"   // (fg_scale.comp with FG_SCALE_PQ: an RGB10A2 destination)
 #include "shaders/fg_synth_comp_spv.h"
+#include "shaders/fg_synth_pq_comp_spv.h"
 #include "shaders/hdr_encode_comp_spv.h"
 #include "shaders/crt_downsample_comp_spv.h"
 #include "shaders/crt_lottes_comp_spv.h"
@@ -131,6 +134,9 @@ struct State {
     std::atomic<bool> failed{false};   // also read by Reflex's game-thread eligibility check
     uint32_t w = 0, h = 0;
     Pipe copy, luma, flow, median, synth;
+    Pipe copy_pq, synth_pq;
+    bool pq_failed = false;
+    VkFormat color_format = VK_FORMAT_UNDEFINED;
     VkSampler nearest = VK_NULL_HANDLE, linear = VK_NULL_HANDLE;
     Img frames[2], lumas[2], flows[2];
     OutSet sets[3];   // (one shown, one waiting its place on the line, one being made: the pacer never holds the game back)
@@ -427,7 +433,7 @@ bool make_pipe(Pipe& p, const uint32_t* code, size_t bytes, std::initializer_lis
 
 // The optional interpolation is disabled after setup fails: retain none of its unused setup objects.
 void drop_setup() {
-    for (Pipe* p : {&fg.copy, &fg.luma, &fg.flow, &fg.median, &fg.synth}) drop_pipe(*p);
+    for (Pipe* p : {&fg.copy, &fg.luma, &fg.flow, &fg.median, &fg.synth, &fg.copy_pq, &fg.synth_pq}) drop_pipe(*p);
     if (fg.nearest) vkDestroySampler(dev.device, fg.nearest, nullptr);
     if (fg.linear) vkDestroySampler(dev.device, fg.linear, nullptr);
     fg.nearest = fg.linear = VK_NULL_HANDLE;
@@ -541,17 +547,40 @@ void drop_size() {
     for (OutSet& set : fg.sets)
         for (Img& t : set.frame) drop_img(t);
     fg.w = fg.h = 0;
+    fg.color_format = VK_FORMAT_UNDEFINED;
     fg.mult = 0;
     fg.have_prev = false;
     fg.recorded = nullptr;
 }
 
-bool ensure_size(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
-    if (fg.w == w && fg.h == h && fg.mult == multiplier()) return true;
-    {   // (the display thread is done with the old sets first)
-        std::unique_lock lk(fg.mu);
-        fg.cv.wait(lk, [] { return fg.jobs.empty() && !fg.sets[0].busy && !fg.sets[1].busy && !fg.sets[2].busy; });
-    }
+bool init_pq_framegen() {
+    if (fg.copy_pq.pipe) return true;
+    if (fg.pq_failed) return false;
+    constexpr VkFormat format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    VkFormatProperties properties{};
+    vkGetPhysicalDeviceFormatProperties(dev.physical, format, &properties);
+    constexpr VkFormatFeatureFlags required = VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT |
+                                             VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+    const VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    if ((properties.optimalTilingFeatures & required) == required && dev.features.shaderStorageImageExtendedFormats &&
+        make_pipe(fg.copy_pq, BUILTIN_SPV_ARGS(FG_COPY_PQ_COMP_SPV), {S, I}, 16) &&
+        make_pipe(fg.synth_pq, BUILTIN_SPV_ARGS(FG_SYNTH_PQ_COMP_SPV), {S, S, S, I}, 4))
+        return true;
+    drop_pipe(fg.copy_pq);
+    drop_pipe(fg.synth_pq);
+    fg.pq_failed = true;
+    logf("vk: frame interpolation: 10-bit HDR buffers unavailable; presenting the original HDR frames");
+    return false;
+}
+
+void drain_framegen_sets() {
+    std::unique_lock lk(fg.mu);
+    fg.cv.wait(lk, [] { return fg.jobs.empty() && !fg.sets[0].busy && !fg.sets[1].busy && !fg.sets[2].busy; });
+}
+
+bool ensure_size(VkCommandBuffer cmd, uint32_t w, uint32_t h, VkFormat color_format) {
+    if (fg.w == w && fg.h == h && fg.mult == multiplier() && fg.color_format == color_format) return true;
+    drain_framegen_sets();   // (the display thread is done with the old sets first)
     {
         std::lock_guard qk(dev.present_mu);   // (every queue idle: the present queue's too, device_wait_idle_locked)
         device_wait_idle_locked();
@@ -561,14 +590,14 @@ bool ensure_size(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
     const VkImageUsageFlags rw = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     bool ok = true;
     for (int i = 0; i < 2; i++) {
-        ok = ok && make_img(fg.frames[i], w, h, VK_FORMAT_R8G8B8A8_UNORM, rw | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+        ok = ok && make_img(fg.frames[i], w, h, color_format, rw | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
         ok = ok && make_img(fg.lumas[i], qw, qh, VK_FORMAT_R16_SFLOAT, rw);
         ok = ok && make_img(fg.flows[i], cw, ch, VK_FORMAT_R16G16B16A16_SFLOAT, rw);
     }
     const int mult = multiplier();
     for (OutSet& set : fg.sets)
         for (int k = 0; k < mult; k++)
-            ok = ok && make_img(set.frame[k], w, h, VK_FORMAT_R8G8B8A8_UNORM,
+            ok = ok && make_img(set.frame[k], w, h, color_format,
                                 rw | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     if (!ok) {
         fg.failed = true;
@@ -579,6 +608,9 @@ bool ensure_size(VkCommandBuffer cmd, uint32_t w, uint32_t h) {
         return false;
     }
     fg.w = w, fg.h = h, fg.mult = mult;
+    fg.color_format = color_format;
+    if (color_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32)
+        logf("vk: frame interpolation: 10-bit PQ color buffers (%ux%u, Vulkan format %u)", w, h, (unsigned)color_format);
     for (int i = 0; i < 2; i++) {
         to_general(cmd, fg.frames[i].image), to_general(cmd, fg.lumas[i].image), to_general(cmd, fg.flows[i].image);
     }
@@ -880,7 +912,7 @@ void display_main() {
         antilag_present_frame = (timed ? j.set->game[f] : f == j.set->made) ? j.set->antilag_id : 0;
         present_defer_into = &s.pending[k];
         const int64_t t0 = now_ns();
-        present_image(j.set->frame[f].image, fg.w, fg.h, nullptr, j.set->frame[f].view);
+        present_image(j.set->frame[f].image, fg.w, fg.h, nullptr, j.set->frame[f].view, false, true, fg.color_format);
         present_defer_into = nullptr;
         // (as it came: taken within 3 ms of its coming, and its first copy not held in present_image over 3 ms, waiting for a
         // frame slot, a swapchain image or a new swapchain. A wait there grows with the delay; the
@@ -1094,7 +1126,7 @@ void display_main() {
                 // (NVIDIA Reflex: the set's game frame is presented as the game frame it was made at, made frames as none)
                 reflex_present_frame = (timed ? j.set->game[f] : f == j.set->made) ? j.set->reflex_id : 0;
                 antilag_present_frame = (timed ? j.set->game[f] : f == j.set->made) ? j.set->antilag_id : 0;
-                present_image(j.set->frame[f].image, fg.w, fg.h, nullptr, j.set->frame[f].view);
+                present_image(j.set->frame[f].image, fg.w, fg.h, nullptr, j.set->frame[f].view, false, true, fg.color_format);
             }
             fg_latency_note(j.at, t, timed ? j.set->game[f] : f == j.set->made, j.set->reflex_id,
                             s.ahead ? s.pending[k].swapchain : VK_NULL_HANDLE, s.ahead ? s.pending[k].swapchain_generation : 0);   // (RX_VK_FG_LATENCY_LOG)
@@ -1444,6 +1476,9 @@ namespace {
 struct HudState {
     std::mutex mu;   // (framegen_hud_before is called from the replay's workers)
     bool init = false, failed = false;
+    Pipe mask_pq;
+    bool mask_pq_failed = false;
+    VkFormat source_format = VK_FORMAT_UNDEFINED;
     Pipe mask;
     // (the picture after the upscale, and as presented: its format and size; two of each, this frame's at k and the frame
     // before's at k ^ 1, for the HUD layer's fit: prev says the frame before's are there and its pair)
@@ -1457,8 +1492,8 @@ struct HudState {
     Img layer;   // (the HUD's colour and how see-through it is, the crop's size, RGBA8 in SDR / RGBA16F in HDR)
     bool layered = false;   // (this present's layer made: fsr3fi_frames lays the HUD over the made frames with it)
     uint64_t layers = 0;    // (presents with it: the 600-present line)
-    Img source;          // (the interpolation source: the frame's crop, RGBA8, the HUD's alpha 0)
-    Img hudless;         // (the same crop of the picture before the HUD, RGBA8: FSR 3.1's HUD-less colour)
+    Img source;          // (the interpolation source: the frame's crop in fg.color_format, the HUD's alpha 0)
+    Img hudless;         // (the same crop of the picture before the HUD, FSR 3.1's HUD-less colour)
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t pw = 0, ph = 0, sw = 0, sh = 0;
     VkImage picture = VK_NULL_HANDLE;   // (the picture copied: framegen_hud_before's, its image)
@@ -1590,14 +1625,23 @@ bool hud_source(VkCommandBuffer cmd, int cur, uint32_t sw, uint32_t sh, int x0, 
             return hud.prev = false;
         }
     }
-    if (hud.sw != w || hud.sh != h) {   // (the layer's fit is the crop's: started again)
+    if (pq && hud.mask_pq_failed) return hud.prev = false;
+    if (pq && !hud.mask_pq.pipe) {
+        const VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        if (!make_pipe(hud.mask_pq, BUILTIN_SPV_ARGS(FG_HUD_PQ_COMP_SPV), {S, S, S, I, I}, 20)) {
+            hud.mask_pq_failed = true;
+            logf("vk: fsr3fi: the 10-bit HUD mask pipeline was not made; using the 10-bit frame without a HUD mask");
+            return hud.prev = false;
+        }
+    }
+    if (hud.sw != w || hud.sh != h || hud.source_format != fg.color_format) {   // (the layer's fit is the crop's: started again)
         hud_retire(hud.source), hud_retire(hud.hudless), hud_retire(hud.fit), hud_retire(hud.layer);
-        hud.sw = w, hud.sh = h, hud.prev = false;
+        hud.sw = w, hud.sh = h, hud.source_format = fg.color_format, hud.prev = false;
     }
     const VkImageUsageFlags rw = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
     if (!hud_image(cmd, hud.after[k], sw, sh, hud.format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT) ||
-        !hud_image(cmd, hud.source, w, h, VK_FORMAT_R8G8B8A8_UNORM, rw | VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ||
-        !hud_image(cmd, hud.hudless, w, h, VK_FORMAT_R8G8B8A8_UNORM, rw | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
+        !hud_image(cmd, hud.source, w, h, fg.color_format, rw | VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ||
+        !hud_image(cmd, hud.hudless, w, h, fg.color_format, rw | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
         hud.failed = true;
         logf("vk: fsr3fi: the HUD mask's images (%ux%u) were not made: the HUD guessed", w, h);
         return hud.prev = false;
@@ -1609,7 +1653,7 @@ bool hud_source(VkCommandBuffer cmd, int cur, uint32_t sw, uint32_t sh, int x0, 
     full_barrier(cmd);
     // (pq: the native HDR picture, already encoded as the frame is; else linear, sRGB-encoded under the HUD: fg_hud.comp)
     const int32_t pc[5] = {x0, y0, (int32_t)w, (int32_t)h, pq ? 1 : 0};
-    pass(cmd, hud.mask,
+    pass(cmd, pq ? hud.mask_pq : hud.mask,
          {{fg.frames[cur].view, fg.nearest},
           {hud.before[k].view, fg.nearest},
           {hud.after[k].view, fg.nearest},
@@ -1695,7 +1739,7 @@ int fsr3fi_frames(VkCommandBuffer cmd, OutSet& set, int cur, uint32_t uw, uint32
         in.color = hud.source.view, in.color_image = hud.source.image;
         in.hud_mask = true;
     }
-    in.color_format = VK_FORMAT_R8G8B8A8_UNORM;   // (ensure_size, for fg.frames)
+    in.color_format = fg.color_format;
     in.native_pq = native_pq;
     in.max_luminance = native_pq ? (float)std::clamp(opts.hdr_peak, 400, 10000) : 1.0f;
     in.width = uw, in.height = uh;
@@ -1740,7 +1784,17 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
                      int64_t game_at, int64_t game_wait) {
     const PresentSourceRect source = present_source_rect(sw, sh, crop);
     const int x0 = (int)source.x, y0 = (int)source.y, w = (int)source.w, h = (int)source.h;
-    if (!src || w <= 0 || h <= 0 || !init() || !ensure_size(cmd, (uint32_t)w, (uint32_t)h)) return false;
+    const VkFormat color_format = native_pq ? VK_FORMAT_A2B10G10R10_UNORM_PACK32 : VK_FORMAT_R8G8B8A8_UNORM;
+    if (!src || w <= 0 || h <= 0 || !init()) return false;
+    if (native_pq && !init_pq_framegen()) {
+        // Finish older sets before the caller presents this frame directly. Do not blend across the fallback.
+        drain_framegen_sets();
+        fg.have_prev = false;
+        return false;
+    }
+    if (!ensure_size(cmd, (uint32_t)w, (uint32_t)h, color_format)) return false;
+    const Pipe& copy_pipe = native_pq ? fg.copy_pq : fg.copy;
+    const Pipe& synth_pipe = native_pq ? fg.synth_pq : fg.synth;
     if (!fg.thread_started) {
         fg.thread_started = true;
         std::thread(display_main).detach();
@@ -1776,7 +1830,7 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
     const uint32_t qw = (uw + 3) / 4, qh = (uh + 3) / 4, cw = (qw + 3) / 4, ch = (qh + 3) / 4;
     full_barrier(cmd);
     const int32_t pc[4] = {x0, y0, w, h};
-    pass(cmd, fg.copy, {{src, fg.nearest}, {fg.frames[cur].view, VK_NULL_HANDLE}}, uw, uh, pc, sizeof pc);
+    pass(cmd, copy_pipe, {{src, fg.nearest}, {fg.frames[cur].view, VK_NULL_HANDLE}}, uw, uh, pc, sizeof pc);
     pass(cmd, fg.luma, {{fg.frames[cur].view, fg.nearest}, {fg.lumas[cur].view, VK_NULL_HANDLE}}, qw, qh);
     // (AMD FSR 3.1's source with the HUD marked, when it is asked: read by fsr3fi_frames below)
     hud_source(cmd, cur, sw, sh, x0, y0, uw, uh, native_pq);
@@ -1823,7 +1877,7 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
                                     {fg.flows[0].view, VK_NULL_HANDLE}}, cw, ch);
                 pass(cmd, fg.median, {{fg.flows[0].view, fg.nearest}, {fg.flows[1].view, VK_NULL_HANDLE}}, cw, ch);
             }
-            pass(cmd, fg.synth, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
+            pass(cmd, synth_pipe, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
                                  {fg.flows[1].view, fg.nearest}, {set->frame[k].view, VK_NULL_HANDLE}},
                  uw, uh, &t[k], 4);
         }
@@ -1844,7 +1898,8 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         VkImage outs[kMaxMult];
         VkImageView views[kMaxMult];
         for (int k = 0; k < m - 1; k++) outs[k] = set->frame[k].image, views[k] = set->frame[k].view;
-        set->made = dlss_fg_frames(cmd, fg.frames[cur].image, fg.frames[cur].view, uw, uh, m - 1, outs, views, blend, sequence);
+        set->made = dlss_fg_frames(cmd, fg.frames[cur].image, fg.frames[cur].view, color_format,
+                                   uw, uh, m - 1, outs, views, blend, sequence);
     }
     FgMaker maker = set->made ? FgMaker::Dlss : FgMaker::None;
     // (longshot) DLSS FG chosen, on a temporal Upscaler, and no picture from it for this set (the game's own menus, movies and
@@ -1868,7 +1923,7 @@ bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t
         pass(cmd, fg.median, {{fg.flows[0].view, fg.nearest}, {fg.flows[1].view, VK_NULL_HANDLE}}, cw, ch);
         for (int k = 1; k < m; k++) {
             const float t = (float)k / (float)m;
-            pass(cmd, fg.synth, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
+            pass(cmd, synth_pipe, {{fg.frames[prev].view, fg.linear}, {fg.frames[cur].view, fg.linear},
                                  {fg.flows[1].view, fg.nearest}, {set->frame[k - 1].view, VK_NULL_HANDLE}},
                  uw, uh, &t, 4);
         }
