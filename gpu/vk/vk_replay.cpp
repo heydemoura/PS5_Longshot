@@ -2221,8 +2221,8 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
         }
         case NOP_DRAW_MESH: {
             const auto d = payload<nvn_p_draw_mesh>(a, avail);
-            static int logged_mesh;
-            if (logged_mesh++ < 8)
+            static int logged_mesh;   // (counted only while it logs, as mesh_program_locked's)
+            if (logged_mesh < 8 && ++logged_mesh)
                 logf("vk: mesh draw kind %d: %d %d %d, indirect %#llx count %#llx max %d stride %d", d.kind, d.x, d.y,
                      d.z, (unsigned long long)d.indirect, (unsigned long long)d.count_addr, d.max, d.stride);
             DrawArgs da;

@@ -2056,8 +2056,8 @@ const Program* mesh_program_locked(const NvnState& s, const uint8_t color_types[
         else if (c->stage == 7) mesh = c;
         else if (c->stage == 1) fsc = c;
     }
-    static int logged;
-    if (logged++ < 6) log_program_stages(s, "mesh draw");
+    static int logged;   // (counted only while it logs: on every mesh draw it would overflow and log every draw again)
+    if (logged < 6 && ++logged) log_program_stages(s, "mesh draw");
     if (!mesh) return nullptr;
     const bool fallback = dev.uses_mesh_fallback(task != nullptr);
     const uint64_t key = mesh_key(task.get(), *mesh, fsc.get(), prim.get(), color_types);
