@@ -85,6 +85,7 @@ VkResult vkEndCommandBuffer(VkCommandBuffer) { return VK_SUCCESS; }
 VkResult vkResetFences(VkDevice, uint32_t, const VkFence*) { return VK_SUCCESS; }
 VkResult vkQueueSubmit2(VkQueue, uint32_t, const VkSubmitInfo2*, VkFence) { return VK_SUCCESS; }
 VkResult vkWaitForFences(VkDevice, uint32_t, const VkFence*, uint32_t, uint64_t) { return VK_TIMEOUT; }   // (the GPU behind)
+void vkDestroyCommandPool(VkDevice, VkCommandPool, const void*) {}
 void vkDestroyImageView(VkDevice, VkImageView, const void*) {}
 void vkFreeMemory(VkDevice, VkDeviceMemory, const void*) {}
 void queue_flush_locked() {}
@@ -94,6 +95,7 @@ struct Texture {
     VkImage image = &the_image;
     VmaAllocation allocation = &the_alloc;
     uint64_t gpu = 0x100000, guest_size = 4096, bytes = 1 << 20, pad = 0, last_value = 0, pool_key = 0;
+    uint32_t id = 7;   // (its creation number: destroy_later names it to gone_note)
     std::vector<VkDeviceMemory> sparse_chunks;
     std::unordered_map<uint64_t, VkImageView> views;
     struct BlockAttachment { VkImage image; VmaAllocation allocation; int format; uint32_t level; };
@@ -106,6 +108,10 @@ static void destroy_buffer(VkBuffer, VmaAllocation) {}
 static uint64_t pool_cap() { return 256ull << 20; }
 static std::set<VkImage> freed, pooled;
 static void destroy_image(VkImage i, VmaAllocation) { if (i) freed.insert(i); }
+// (vk_vma.cpp: the image handed to the reaper's thread, which destroys it; here at once)
+static void destroy_image_later(VkImage i, VmaAllocation, std::vector<VkImageView>, VkBuffer, VmaAllocation,
+                                std::vector<VkDeviceMemory>) { if (i) freed.insert(i); }
+static std::atomic<uint64_t> dead_pooled_n{0};   // (vk_texture.cpp: the render targets' images on their way to the pool)
 struct { bool in_pass = false; } compact;
 
 namespace {
@@ -117,6 +123,7 @@ void pool_put(Dead& d) { pooled.insert(d.image); }
 bool flush_record(Flush& f, VkCommandBuffer = VK_NULL_HANDLE) { f.buf = &a_buffer; return f.ok = true; }
 bool flush_finish(Flush& f, bool gpu_ok) { f.buf = VK_NULL_HANDLE; return f.ok && gpu_ok; }
 /* FLUSH_TEXTURES */
+/* GONE */
 /* DESTROY_LATER */
 void dead_list(uint64_t completed) {
 /* DEAD_LOOP */
@@ -136,7 +143,7 @@ int main(int argc, char** argv) {
     flush_textures(batch);
     if (batch[0].ok) { std::printf("FAIL: the stub's precondition: the write-back's wait did not time out\n"); return 1; }
     const uint64_t gen = destroy_gen;
-    destroy_later(t);   // (the eviction, as texture_frame does after the write-backs)
+    destroy_later(t, completed);   // (the eviction, as texture_frame does after the write-backs)
     if (destroy_gen == gen || dead.empty()) {
         std::printf("FAIL: the stub's precondition: destroy_later did not retire the texture (no new destroy generation)\n");
         return 1;
@@ -185,11 +192,14 @@ def main():
     source = (ROOT / "gpu/vk/vk_texture.cpp").read_text(encoding="utf-8")
     wait = block(source, "bool readback_submit_wait()")
     frame = block(source, "void texture_frame(uint64_t completed)")
-    fixture = (FIXTURE.replace("/* DEAD */", block(source, "struct Dead {") + ";")
+    # (gone_note, which destroy_later calls since the handle tables' stale log: the real one, with its log)
+    gone = source[source.index("constexpr uint32_t kGoneLog"):source.index("void gone_note(uint32_t id)")] + \
+        block(source, "void gone_note(uint32_t id)")
+    fixture = (FIXTURE.replace("/* GONE */", gone).replace("/* DEAD */", block(source, "struct Dead {") + ";")
                .replace("/* READBACK */", between(source, "// (a command buffer of its own for the read-backs", wait) + wait)
                .replace("/* FLUSH */", block(source, "struct Flush {") + ";")
                .replace("/* FLUSH_TEXTURES */", block(source, "void flush_textures(std::vector<Flush>& fs)"))
-               .replace("/* DESTROY_LATER */", block(source, "void destroy_later(Texture& tex)"))
+               .replace("/* DESTROY_LATER */", block(source, "void destroy_later(Texture& tex, uint64_t completed)"))
                .replace("/* DEAD_LOOP */", block(frame, "    for (auto it = dead.begin(); it != dead.end();)")))
     with tempfile.TemporaryDirectory(prefix="longshot-readback-source-") as temp:
         cpp, exe = Path(temp) / "fixture.cpp", Path(temp) / "fixture.exe"

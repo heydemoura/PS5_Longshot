@@ -58,6 +58,9 @@ int temporal_mode() { return mode==ur::OFF ? ur::GAME : mode; }
 bool temporal_off() { return mode==ur::OFF; }
 bool scene_tonemap_on() { return tone; }
 int env_switch(const char*) { return enabled; }
+// (the FPS counter footer's record, upscale_route.h: nobody reads it here, so nothing is published for it)
+namespace upscale_route { enum class Route { Network, StandIn, Blit, Engine, Stretch }; }
+static void route_drawn(upscale_route::Route, int, uint32_t, uint32_t, uint32_t, uint32_t) {}
 uint64_t texture_frame_no() { return 10; }
 int dispatches=0, bound_pipe=0, bound_layout=0, disturbed=0, creates=0;
 uint32_t groups_x=0,groups_y=0;
@@ -117,7 +120,7 @@ int main() {
  in.format=out.format=122;assert(run(in,out));assert(bound_pipe==11 && bound_layout==12);
 }
 '''
-    signatures = ['bool temporal_scene_format(', 'bool temporal_colour_pair(', 'bool stretch(']
+    signatures = ['bool temporal_scene_format(', 'bool temporal_colour_pair(', 'bool stretch_record(', 'bool stretch(']
     # On the unfixed source this helper is absent and stretch rejects RGBA before dispatch.
     # Compile that real implementation too, so the baseline fails at the native-path assertion.
     if 'bool make_rgba_stretch(' in source:

@@ -40,7 +40,9 @@ ADDR64 = r"""#ifndef A64_ADDR64
 #endif
 #if A64_ADDR64
 #define A64_PTR(a) (A64_MEM + (uint64_t)(a))
+#ifndef A64_DIRTY_PAGES   /* (a build whose guest window is smaller passes its own: ps5/build.py, the PS5's 64 GiB) */
 #define A64_DIRTY_PAGES (1ull << 27)   /* (nx2/rtgen.py) A64_WRITE_TRACK: a mark per 4 KB page of the 512 GB window */
+#endif
 #else
 #define A64_DIRTY_PAGES (1ull << 20)
 #define A64_PTR(a) (A64_MEM + (uint32_t)(a))
@@ -61,8 +63,19 @@ MARK_NATIVE_64 = r"""extern uint8_t a64_dirty[A64_DIRTY_PAGES];
 /* (Tried 2026-10-21: reading a mark first and writing it only when clear, against cache lines moving between cores:
    game threads +1.1 ms a frame, the code 18 MB bigger. Not kept.) */
 #define A64_DIRTY_AT(a) (((uint64_t)(a) >> 12) & (A64_DIRTY_PAGES - 1))
+#if defined(A64_MARK_BITMAP)
+/* (local, build.py RX_MARK_BITMAP: host/mark_bitmap.c) only a store that starts on a GPU page marks: a bit per page the host
+   sets when a GPU mapping is made, and for the page before it too, so that a store crossing into a mapping from the page
+   before is caught by its first byte; read-only on the store path */
+extern uint8_t a64_gpu_pages[A64_DIRTY_PAGES / 8];
+#define A64_GPU_PAGE(a) ((a64_gpu_pages[A64_DIRTY_AT(a) >> 3] >> (A64_DIRTY_AT(a) & 7)) & 1)
+#define A64_MARK(a, n) (A64_GPU_PAGE(a) ? \
+                        (void)(__atomic_store_n(&a64_dirty[A64_DIRTY_AT(a)], 1, __ATOMIC_RELEASE), \
+                               __atomic_store_n(&a64_dirty[A64_DIRTY_AT((a) + (n) - 1)], 1, __ATOMIC_RELEASE)) : (void)0)
+#else
 #define A64_MARK(a, n) (__atomic_store_n(&a64_dirty[A64_DIRTY_AT(a)], 1, __ATOMIC_RELEASE), \
-                        __atomic_store_n(&a64_dirty[A64_DIRTY_AT((a) + (n) - 1)], 1, __ATOMIC_RELEASE))"""
+                        __atomic_store_n(&a64_dirty[A64_DIRTY_AT((a) + (n) - 1)], 1, __ATOMIC_RELEASE))
+#endif"""
 
 SUBST = {
     "a64.h": [

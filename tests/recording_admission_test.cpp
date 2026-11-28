@@ -45,13 +45,14 @@ struct { VkDevice device{}; VkPhysicalDeviceProperties props{}; } dev;
 std::map<VkBuffer, Allocation> buffers;
 std::set<VkDescriptorPool> pools;
 std::map<VkDescriptorSet, VkDescriptorPool> sets;
-uintptr_t serial = 100;
+std::atomic<uintptr_t> serial{100};
 template<class T> T handle() { return reinterpret_cast<T>(++serial); }
 bool fail_buffer = false, fail_map = false, fail_pool = false;
 int fail_sets = 0, allocation_calls = 0, invalid_pool_calls = 0, destroys = 0, updates = 0, binds = 0;
 uint64_t largest_request = 0;
-std::mutex par_mutex;
-struct ParLock { std::lock_guard<std::mutex> lock{par_mutex}; };
+std::mutex fake_mutex, recording_mutex;
+// The fake driver owns these maps and counters, independently of recording admission.
+using FakeLock = std::lock_guard<std::mutex>;
 namespace rec {   // (vk_recorder.h's RX_VK_RECORDER_OWN marks, as they are with the recorder off)
 inline void slot_begin(uint64_t) {}
 inline void slot_done() {}
@@ -60,42 +61,54 @@ struct OwnSlot { OwnSlot() {} ~OwnSlot() {} };   // (a scope, as the real one)
 }   // namespace rec
 uint64_t rec_end_pos[64];   // (vk_replay.cpp: each slot's end in the recorder's ring)
 void logf(const char*, ...) {}
+// (vk_draw.cpp, adaptive simulated turf: a recording's demand samples read back at the slot's next begin; none taken here)
+void invalidate_mapped(VmaAllocation, uint64_t) {}
+void sim_turf_observe(uint64_t, bool, uint32_t, uint64_t) { require(false, "a simulated-turf sample read back with none taken"); }
 bool create_buffer(uint64_t bytes, VkBufferUsageFlags, bool, VkBuffer& buffer, VmaAllocation& allocation, void** map, bool = false) {
+    FakeLock lock(fake_mutex);
     ++allocation_calls; largest_request = std::max(largest_request, bytes);
     if (fail_buffer || bytes > (16ull << 20)) return false;
     buffer = handle<VkBuffer>(); auto& a = buffers[buffer]; a.bytes.assign((size_t)bytes, 0);
     allocation = &a; *map = fail_map ? nullptr : a.bytes.data(); return true;
 }
 void destroy_buffer(VkBuffer buffer, VmaAllocation allocation) {
+    FakeLock lock(fake_mutex);
     require(buffer && buffers.count(buffer) && &buffers.at(buffer) == allocation, "buffer ownership/double free");
     buffers.erase(buffer); ++destroys;
 }
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateDescriptorPool(VkDevice, const VkDescriptorPoolCreateInfo*, const VkAllocationCallbacks*, VkDescriptorPool* pool) {
+    FakeLock lock(fake_mutex);
     // Vulkan output handles must not be trusted after a failing creation result.
     if (fail_pool) { *pool = reinterpret_cast<VkDescriptorPool>(uintptr_t(0xdead)); return VK_ERROR_OUT_OF_HOST_MEMORY; }
     *pool = handle<VkDescriptorPool>(); pools.insert(*pool); return VK_SUCCESS;
 }
+// Caller holds fake_mutex.
 void drop_sets(VkDescriptorPool pool) {
     for (auto it = sets.begin(); it != sets.end();) {
         if (it->second == pool) it = sets.erase(it); else ++it;
     }
 }
 VKAPI_ATTR VkResult VKAPI_CALL vkResetDescriptorPool(VkDevice, VkDescriptorPool pool, VkDescriptorPoolResetFlags) {
+    FakeLock lock(fake_mutex);
     require(pools.count(pool), "reset invalid pool"); drop_sets(pool); return VK_SUCCESS;
 }
 VKAPI_ATTR void VKAPI_CALL vkDestroyDescriptorPool(VkDevice, VkDescriptorPool pool, const VkAllocationCallbacks*) {
+    FakeLock lock(fake_mutex);
     require(pools.erase(pool) == 1, "pool ownership/double free"); drop_sets(pool);
 }
 VKAPI_ATTR VkResult VKAPI_CALL vkAllocateDescriptorSets(VkDevice, const VkDescriptorSetAllocateInfo* info, VkDescriptorSet* set) {
+    FakeLock lock(fake_mutex);
     if (!pools.count(info->descriptorPool)) { ++invalid_pool_calls; return VK_ERROR_UNKNOWN; }
     if (fail_sets > 0) { --fail_sets; return VK_ERROR_OUT_OF_POOL_MEMORY; }
     *set = handle<VkDescriptorSet>(); sets[*set] = info->descriptorPool; return VK_SUCCESS;
 }
 VKAPI_ATTR void VKAPI_CALL vkUpdateDescriptorSets(VkDevice, uint32_t n, const VkWriteDescriptorSet* writes, uint32_t, const VkCopyDescriptorSet*) {
+    FakeLock lock(fake_mutex);
     for (uint32_t i = 0; i < n; ++i) require(sets.count(writes[i].dstSet), "update failed/destroyed set");
     ++updates;
 }
 VKAPI_ATTR void VKAPI_CALL vkCmdBindDescriptorSets(VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout, uint32_t, uint32_t n, const VkDescriptorSet* bound, uint32_t, const uint32_t*) {
+    FakeLock lock(fake_mutex);
     require(n == 1 && sets.count(bound[0]), "bind failed/destroyed set"); ++binds;
 }
 /* RES */
@@ -104,8 +117,6 @@ thread_local RecordingRes* cur = nullptr;
 const uint64_t kStream = 1024;
 constexpr VkBufferUsageFlags kStreamUse = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
 std::atomic<uint64_t> stream_extra{0}, stream_grown{0}, stream_peak{0}, pools_extra{0};
-bool grow_off = false;
-bool stream_grow_off() { return grow_off; }
 struct BufferRef { VkBuffer buffer{}; uint64_t offset = 0, size = 0, address = 0; };
 /* POOL */
 /* STREAM */
@@ -114,9 +125,9 @@ thread_local uint64_t rec_value = 0, targets_serial = 0;
 // Global defaults are outside this per-recording allocation contract.
 VkBuffer zero_buffer = reinterpret_cast<VkBuffer>(uintptr_t(99)); VmaAllocation zero_alloc{};
 struct Pass {}; Pass& pass() { static thread_local Pass p; return p; }
-bool work_since_barrier = false, last_dyn_valid = false, last_desc_valid = false, last_vb_valid = false;
-VkPipeline last_pipeline{};
-struct { bool on = false; } vertex_set, last_ib;
+thread_local bool work_since_barrier = false;
+struct CmdBound { void reset() {} };   // (vk_draw.cpp's: what the command buffer has bound, forgotten by a new recording)
+CmdBound& bound() { static CmdBound b; return b; }
 void descriptors_disturbed() {}
 std::unordered_map<int, int>& handle_hits() { static thread_local std::unordered_map<int, int> h; return h; }
 struct Program {};
@@ -125,6 +136,7 @@ int desc_reuse_level() { return 2; }   // (vk_draw.cpp: RX_VK_DESC_REUSE and the
 /* BANK_CACHE */
 std::array<std::array<BankCache, kNvnStages>, 2>& bank_cache() { static thread_local std::array<std::array<BankCache, kNvnStages>, 2> b; return b; }
 void make_dummies() {}
+void mesh_conv_begin_recording() {}   // (vk_draw.cpp: RX_VK_MESH_CONV read for the recording, its last batch let go)
 /* BEGIN */
 #define FINE_SCOPE(...) ((void)0)
 #define FINE_N(...) ((void)0)
@@ -151,12 +163,18 @@ bool bind_tail() {
     Writes& wr = dw();   // (bind_descriptors takes it at its top, above the part cut in here)
     /* DESCRIPTORS */
 }
-void begin(int slot = 0, uint64_t value = 1) { draw_begin_recording(slot, VkCommandBuffer{}, value); }
+void begin(int slot = 0, uint64_t value = 1) {
+    // vk_replay.cpp holds replay_mu across begin_recording and its draw_begin_recording call.
+    // The cut has no internal admission lock; keep its caller's contract here too.
+    std::lock_guard lock(recording_mutex);
+    draw_begin_recording(slot, VkCommandBuffer{}, value);
+}
 void cleanup() {
     for (auto& r : res) {
         for (auto& s : r.streams) destroy_buffer(s.buffer, s.alloc);
         for (auto p : r.extra) vkDestroyDescriptorPool(dev.device, p, nullptr);
         if (r.pool) vkDestroyDescriptorPool(dev.device, r.pool, nullptr);
+        if (r.sim_turf_readback) destroy_buffer(r.sim_turf_readback, r.sim_turf_readback_mem);   // (made at the slot's first begin)
     }
     require(buffers.empty() && pools.empty() && sets.empty(), "owned resources leaked");
 }
@@ -178,7 +196,9 @@ int main(int argc, char** argv) {
         fail_buffer = mode == "initial-buffer"; fail_map = mode == "initial-map"; fail_stream_commit = mode == "initial-commit";
         begin();
         require(res[0].streams.empty() && !cur->stream && !cur->mapped && cur->size == 0, "incomplete initial stream published");
-        require(stream_alloc(16, 256) == UINT64_MAX && buffers.empty(), "missing initial stream authorizes write/leaks");
+        // (the slot's simulated-turf readback is no stream: made before them, it is kept when only the stream fails)
+        require(stream_alloc(16, 256) == UINT64_MAX && buffers.size() == (res[0].sim_turf_readback ? 1u : 0u) &&
+                (!res[0].sim_turf_readback || buffers.count(res[0].sim_turf_readback)), "missing initial stream authorizes write/leaks");
         fail_buffer = fail_map = fail_stream_commit = false; begin(0, 2); copied(31, 17);
         require(res[0].streams.size() == 1, "initial retry must create exactly one owned stream");
     } else if (mode == "pool-retry") {
@@ -231,9 +251,6 @@ int main(int argc, char** argv) {
             uint64_t n = mode == "overflow" ? UINT64_MAX : mode == "rounding" ? UINT64_MAX - 1024 : 16;
             uint64_t align = mode == "alignment-zero" ? 0 : mode == "alignment-three" ? 3 : 256;
             require(stream_alloc(n, align) == UINT64_MAX && cur->stream == old && cur->used == used && allocation_calls == calls, "invalid/overflow range changed or admitted");
-        } else if (mode == "grow-off") {
-            grow_off = true; require(!stream_reserve(4096, 256), "disabled growth accepted");
-            require(cur->stream == old && cur->used == used && buffers.size() == count, "disabled growth changed current stream");
         } else if (mode == "retention" || mode == "reuse") {
             copied(4096, 91); const auto grown = cur->stream;
             begin(0, 2); require(cur->stream == old && cur->used == 0 && cur->streams.size() == 2, "recording reuse reset");

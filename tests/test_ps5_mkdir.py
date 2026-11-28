@@ -18,7 +18,7 @@ def main():
     body = glue[at:glue.find("\n}\n", at)] if at >= 0 else ""
     checks = [
         ('MKDIR = "-Dmkdir=hos_ps5_mkdir"' in build, "the build does not send mkdir to the console's own"),
-        (bool(re.search(r"host_fl = COMMON \+ \[MKDIR,", build)), "the host's sources do not take it"),
+        (bool(re.search(r"host_fl = COMMON \+ (?:DIRTY_PAGES \+ )?\[MKDIR,", build)), "the host's sources do not take it"),
         (bool(re.search(r"vfl = COMMON \+ \[MKDIR,", build)), "the renderer's sources do not take it"),
         (not re.search(r"^COMMON = .*MKDIR", build, re.M), "the game's own code would be built again for it"),
         ("mkdir(path, 0777)" in body, "the folder is not made for every user"),

@@ -22,6 +22,7 @@ void hos_input_clear_toggles(void);
 #include "../hos_paths.h"   /* (the game folder: its title and icon) */
 #include "../../gpu/vk/vk_api.h"
 #include "../display_pointer.h"
+#include "../fullscreen_monitor.h"
 #include <math.h>
 #include <limits.h>
 #ifndef LONGSHOT_ENV_H   /* (env_on: the switches' one rule) */
@@ -48,6 +49,9 @@ int hos_mouse_take(int32_t *dx, int32_t *dy) {
     *dy = InterlockedExchange(&mouse_dy, 0);
     return mouse_captured;
 }
+
+/* (nn_hid.c) the game's menus do not take the mouse here: its capture, and with it its buttons, stay the game's */
+int hos_mouse_in_game_menu(void) { return 0; }
 
 /* (mouse_native.c) motion taken and not used, put back for the next taker (the player camera's) */
 void hos_mouse_give_back(int32_t dx, int32_t dy) {
@@ -140,8 +144,18 @@ static void text_key(const HosSdlEvent *e) {
 
 /* ---- the window ---- */
 static volatile int renderer;   /* the renderer presents into the window */
+int rx_start_failure_claim(void);   /* rx_backend.c: coordinate with every close path */
 static HANDLE renderer_up;   /* (set once rx_start has returned, ready or not: hos_renderer_wait) */
 static int fullscreen;
+static MkwVkMonitor window_monitors[HOS_MONITOR_MAX];
+static uint32_t window_monitor_tokens[HOS_MONITOR_MAX];
+static int window_monitor_count;
+static void refresh_monitors(void) {
+    window_monitor_count=hos_sdl_monitor_list(window,window_monitors,window_monitor_tokens,HOS_MONITOR_MAX);
+    hos_monitor_publish(window_monitors,window_monitor_count,window!=NULL);
+}
+/* On Linux the SDL/main thread publishes the snapshot before starting the game's thread. */
+void hos_monitor_prepare(void) { hos_monitor_load(); }
 
 static int create_surface(void *w, void *instance, void *surface) { return hos_sdl_vulkan_surface(w, instance, surface); }
 static void drawable_size(void *w, int *width, int *height) {
@@ -173,17 +187,34 @@ static void mouse_capture(int on) {
     hos_sdl_relative_mouse(window, on);
 }
 static void set_fullscreen(int on) {
-    if (on == fullscreen) return;
-    fullscreen = on;
-    hos_posix_window[3] = on;
-    hos_sdl_fullscreen(window, on);
-    hos_log("display: %s", on ? "fullscreen (F11 for a window)" : "windowed");
+    static int failed_logged;
+    char wanted[512]; hos_monitor_wanted(wanted);
+    int pick=hos_monitor_find(window_monitors,window_monitor_count,wanted);
+    uint32_t token=pick>=0?window_monitor_tokens[pick]:UINT32_MAX;
+    if (on==fullscreen && (!on || token==UINT32_MAX || token==hos_sdl_window_display(window))) return;
+    if (!hos_sdl_fullscreen_target(window,on,token)) {
+        if (!failed_logged) hos_log("display: fullscreen monitor request failed: %s",hos_sdl_error());
+        failed_logged=1;
+        return;
+    }
+    failed_logged=0;
+    fullscreen=hos_sdl_is_fullscreen(window); hos_posix_window[3]=fullscreen;
+    refresh_monitors();
+    hos_log("display: %s", fullscreen ? "fullscreen (F11 for a window)" : "windowed");
 }
 
 static DWORD WINAPI renderer_main(void *p) {
     (void)p;
     const int ok = rx_start(&vk_window);
-    if (!ok) hos_log("display: the renderer did not start: the window stays black");
+    if (!ok) {   /* (longshot) the game ends at once: behind a black window it played on with its sound until the player closed
+                    it, and only then did the window after it (host/hos_crash_dialog.c) say why. That window reads this line */
+        if (!rx_start_failure_claim()) return 0;
+        hos_log("display: the renderer did not start: the game ends, and the window after it says why");
+        hos_log_flush();
+        void hos_crash_clean_end(void);
+        hos_crash_clean_end();
+        ExitProcess(1);
+    }
     renderer = ok;
     if (ok) {   /* (a size change while it started) */
         int w = 0, h = 0;
@@ -197,7 +228,7 @@ static DWORD WINAPI renderer_main(void *p) {
 /* (longshot) host/display.c's: the game's first work for the GPU waits for the renderer (nvn_native.c), so nothing it submits while
    the shaders are prepared is lost. Without a window the renderer starts on the game's own thread, before this is asked */
 void hos_renderer_wait(void) {
-    { const char *e = getenv("HOS_NO_RENDERER_WAIT"); if (e && atoi(e) != 0) return; }
+    if (env_on("HOS_NO_RENDERER_WAIT")) return;
     if (renderer_up) WaitForSingleObject(renderer_up, INFINITE);
 }
 
@@ -267,8 +298,8 @@ int hos_display_init(void) {
         hos_sdl_hint(hos_sdl_load() == 3 ? "SDL_VIDEO_DRIVER" : "SDL_VIDEODRIVER", "wayland,x11");
     /* (SDL2 on Wayland: libdecor from the start. SDL2 2.32 asks for the compositor's decorations before the window's first
        configure, and a compositor that answers "the client draws them" (COSMIC) has it unmap and map the window again
-       with libdecor inside that wait, which then waits forever on a field the switch cleared: no window, no renderer
-       (#992). libdecor takes the compositor's decorations itself where they are offered; with no libdecor SDL keeps
+       with libdecor inside that wait, which then waits forever on a field the switch cleared: no window, no renderer.
+       libdecor takes the compositor's decorations itself where they are offered; with no libdecor SDL keeps
        its own. SDL3 waits on the window's state and is left alone; SDL_VIDEO_WAYLAND_PREFER_LIBDECOR still wins) */
     if (hos_sdl_load() == 2) hos_sdl_hint("SDL_VIDEO_WAYLAND_PREFER_LIBDECOR", "1");
     if (!hos_sdl_init(HOS_SDL_VIDEO | HOS_SDL_EVENTS)) {
@@ -278,6 +309,9 @@ int hos_display_init(void) {
     }
     int w, h;
     if (hos_sdl_desktop_size(&w, &h)) hos_posix_window[1] = w, hos_posix_window[2] = h;
+    hos_monitor_load();
+    refresh_monitors();
+    if (hos_monitor_screen_size(&w,&h)) hos_posix_window[1]=w,hos_posix_window[2]=h;
     sdl_ready = 1;
     return 1;
 }
@@ -326,11 +360,12 @@ void hos_display_loop(void) {
         snprintf(png + n, sizeof png - n, "longshot.png");
         hos_sdl_icon(window, png);
     }
-    if (getenv("HOS_FULLSCREEN") && atoi(getenv("HOS_FULLSCREEN"))) set_fullscreen(1);
+    refresh_monitors();
+    if (hos_monitor_start_fullscreen()) set_fullscreen(1);
     __atomic_store_n(&refresh_now, hos_sdl_refresh_mhz(window), __ATOMIC_RELAXED);
     {   /* (the desktop's size, before the renderer starts: the Quality preset Auto (this PC) reads it once, desktop_size) */
         int dw, dh;
-        if (hos_sdl_desktop_size(&dw, &dh))
+        if (hos_monitor_screen_size(&dw, &dh))
             __atomic_store_n(&desktop_w, dw, __ATOMIC_RELAXED), __atomic_store_n(&desktop_h, dh, __ATOMIC_RELAXED);
     }
     pointer_update(0, 0);
@@ -342,14 +377,31 @@ void hos_display_loop(void) {
         hos_sdl_pads_pump();
         if (GetTickCount() - refresh_asked >= 1000) {   /* (the window may have moved to another display) */
             refresh_asked = GetTickCount();
+            fullscreen=hos_sdl_is_fullscreen(window); hos_posix_window[3]=fullscreen;
+            refresh_monitors();
+            if (fullscreen) set_fullscreen(1);
+            int dw,dh;
+            if (hos_monitor_screen_size(&dw,&dh)) {
+                __atomic_store_n(&desktop_w,dw,__ATOMIC_RELAXED);
+                __atomic_store_n(&desktop_h,dh,__ATOMIC_RELAXED);
+                hos_posix_window[1]=dw; hos_posix_window[2]=dh;
+            }
             __atomic_store_n(&refresh_now, hos_sdl_refresh_mhz(window), __ATOMIC_RELAXED);
+        }
+        { /* Renderer requests are resolved/applied here, never on the renderer's thread. */
+            static char last_wanted[512];
+            char wanted[512]; hos_monitor_wanted(wanted);
+            if (strcmp(wanted,last_wanted)) {
+                strcpy(last_wanted,wanted); refresh_monitors();
+                if (fullscreen) set_fullscreen(1);
+            }
         }
         if (hos_sdl_wait_event(&e, 4)) {
             do {
                 switch (e.type) {
                 case HOS_SDL_EV_QUIT:
                 case HOS_SDL_EV_CLOSE:
-                    rx_close_asked();   /* (a start still preparing the shaders keeps what it made) */
+                    rx_close_asked();
                     hos_window_closed_exit();
                 case HOS_SDL_EV_RESIZED:
                     pointer_update(0, 0);   /* publish pixels before waking the renderer's size consumer */

@@ -18,13 +18,15 @@ workers, tests/test_spawn_emit.py for the new processes, over a real lifter).
 """
 import bisect
 import collections
+import contextlib
 import glob
 import multiprocessing
 import os
 import re
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
-import whole_write   # (rewrites written beside and moved over: issue 1197)
+import whole_write   # (rewrites written beside and moved over)
+import build_jobs   # (the workers the build was asked for)
 
 import a64_lift
 import lifted_c
@@ -64,16 +66,21 @@ def load(img_dir):
     path = os.path.join(img_dir, FILE)
     if not os.path.exists(path):
         return []
-    return [int(l, 16) for l in open(path) if l.strip() and not l.startswith("#")]
+    try:
+        with open(path, encoding="utf-8") as f:
+            return [int(l, 16) for l in f if l.strip() and not l.startswith("#")]
+    except (OSError, UnicodeDecodeError, ValueError) as e:
+        print("chunks: %s could not be read (%s); ignoring" % (path, e), flush=True)
+        return []
 
 
 def save(img_dir, starts):
     # (lift.py --standalone writes this under <work>/image while its image.bin goes to <work>/sa/image, and nothing made
     # that folder: a fresh work folder stopped the lift at its last step with FileNotFoundError. make_game.py prepares it)
     os.makedirs(img_dir, exist_ok=True)
-    with open(os.path.join(img_dir, FILE), "w") as f:
-        f.write("# first guest address of each lifted C chunk after the first (nx2/chunks.py)\n")
-        f.write("".join("%08x\n" % s for s in sorted(starts)))
+    text = ("# first guest address of each lifted C chunk after the first (nx2/chunks.py)\n"
+            + "".join("%08x\n" % s for s in sorted(starts)))
+    whole_write.write_whole(os.path.join(img_dir, FILE), text, sync=True)   # (read by every later lift: issue #765)
 
 
 def seed_from_gen(gen_dir):
@@ -137,7 +144,7 @@ def _no_fork():
 
 def file_jobs():
     """Processes for the per-file passes (split_big, edit_c) and for the emit: LONGSHOT_LIFT_JOBS, else the cores this process
-    may use (at most 16; each holds its run's texts and the pages of the lift it touches), and at most one per 2 GB of available
+    may use (at most 16, and at most LONGSHOT_JOBS when the build was given a count; each holds its run's texts and the pages of the lift it touches), and at most one per 2 GB of available
     memory where they are forked (one per 0.75 GB where they are spawned: Windows, its available physical memory): a Steam
     Deck (16 GB) ran out with 8, and the system's out-of-memory
     handling stopped the lift ("lift.py stopped (signal 15): BrokenPipeError") or one worker (the update then sat at "jump tables"
@@ -149,7 +156,7 @@ def file_jobs():
         n = len(os.sched_getaffinity(0))
     except AttributeError:
         n = os.cpu_count() or 1
-    n = max(1, min(16, n))
+    n = build_jobs.cap(max(1, min(16, n)))   # (no more than the build was asked for: LONGSHOT_JOBS, nx2/build_jobs.py)
     gb = _available_gb()
     if gb is not None:
         # a new process (spawn: Windows) holds only the emit's tables and its run's bodies: 395 MB at most, measured
@@ -204,7 +211,7 @@ def parallel_emit(emit, order, texts, counters, jobs, run=2000):
 
 # What the emit reads of the lifter besides the bodies of the functions it emits (a64_lift.Lifter.emit_function and the
 # methods it calls): sent once to each new process
-EMIT_TABLES = ("entries", "plt", "jt", "devirt", "after", "no_local", "setjmp_owner", "comments", "names")
+EMIT_TABLES = ("entries", "plt", "jt", "devirt", "after", "no_local", "setjmp_owner", "comments", "names", "entry_hooks")
 _view = None   # (a new process's view: a lifter with the tables only, and its counters)
 
 
@@ -257,42 +264,135 @@ def _emit_bodies(funcs):
                 keys.setdefault((w, pc) if a64_lift.pc_relative(w) else w, (pc, w))
     order = list(keys)
     tx, fl = a64emit.translate([keys[x] for x in order])
-    fpx = set()   # (the shapes go to a64_fpx.h from the lift's own process, which translates all)
+    fpx = set()   # (the FPX shapes of the run, for a64_fpx.h: the lift's own process writes it from every run's)
     texts = dict(zip(order, zip((a64_lift.op_text(t, fpx) for t in tx), fl)))
     lifter.funcs = funcs
     before = _counts(counters)
     out = [(e,) + tuple(a64_lift.Lifter.emit_function(lifter, e, texts)) for e in funcs]
     return out, [collections.Counter({k: v - b.get(k, 0) for k, v in c.items() if v != b.get(k, 0)})
-                 for b, c in zip(before, counters)]
+                 for b, c in zip(before, counters)], fpx
+
+
+def lifter_texts(L, fpx, translate, op_text):
+    """The texts a64_lift.Lifter.write makes for the emit, with this translate and op_text (a64emit's and a64_lift's): every
+    distinct instruction translated once, per pc where it reads the pc. Their FPX shapes are added to fpx"""
+    keys = {}
+    for body, _ in L.funcs.values():
+        for pc, (k, w) in body.items():
+            if k[0] == "op":
+                keys.setdefault((w, pc) if a64_lift.pc_relative(w) else w, (pc, w))
+    order = list(keys)
+    tx, fl = translate([keys[x] for x in order])
+    return dict(zip(order, zip((op_text(t, fpx) for t in tx), fl)))
+
+
+@contextlib.contextmanager
+def no_texts():
+    """a64_lift.Lifter.write with no texts of its own (an empty one per instruction, no FPX shape): for an emit that makes its
+    own (spawn_emit's processes). Translating every instruction of OoT here took ~15 s and 1-2 GB, used by nothing"""
+    import a64emit
+    translate, op_text = a64emit.translate, a64_lift.op_text
+    a64emit.translate = lambda items, batch=65536: ([""] * len(items), [0] * len(items))
+    a64_lift.op_text = lambda text, fpx: text
+    try:
+        yield
+    finally:
+        a64emit.translate, a64_lift.op_text = translate, op_text
+
+
+def fill_fpx(gen_dir, used):
+    """a64_fpx.h as the lifter writes it after no_texts(): its helpers for no FPX shape, at its head, become those for used,
+    the shapes the emit's processes found (the same as the lifter's own texts would have)"""
+    path = os.path.join(gen_dir, "a64_fpx.h")
+    with open(path, encoding="utf-8", newline="") as f:
+        text = f.read()
+    empty = a64_lift.fpx_header(set())
+    if not text.startswith(empty):
+        raise SystemExit("chunks: %s does not begin with the lifter's FPX helpers for no shape" % path)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(a64_lift.fpx_header(used) + text[len(empty):])
+
+
+class _Spawned:
+    """spawn_emit's (e, text, refs): an iterator, whose close() also stops the processes when it was never read"""
+
+    def __init__(self, pool, made, fpx):
+        self.pool, self.made = pool, made
+        self.fpx = fpx   # (the FPX shapes of the runs the processes emitted, so far)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self.made)
+
+    def close(self):
+        self.made.close()
+        if self.pool is not None:
+            self.pool.shutdown(wait=True, cancel_futures=True)
 
 
 def spawn_emit(L, base_emit, order, texts, counters, jobs, polls, run=2000):
     """parallel_emit where there is no fork: the workers are new processes, each sent the tables of EMIT_TABLES once and, with
     each run, the bodies of its functions. polls: nx2/poll.py is installed (its counter is the last of `counters`). A worker
-    whose emit is not this process's (_identities) stops, and the runs are emitted here"""
+    whose emit is not this process's (_identities) stops, and the runs are emitted here.
+    The processes start at this call, not when the result is first read: they translate their runs' instructions themselves,
+    so write() starts them before the lifter makes its own texts (~15 s for OoT on a Ryzen 5 5600, which they waited for).
+    texts: this process's, for the runs it emits itself, or a function giving them (called only then). The result's fpx: the FPX
+    shapes of the processes' runs (a64_fpx.h's: write() adds them to the file)"""
+    import a64emit
+    # (the translator built and loaded here first, when it must be: started before anything here translated, the new
+    # processes would each build it at once, into the same file)
+    a64emit.lib()
     runs = [order[i:i + run] for i in range(0, len(order), run)]
     tables = {k: getattr(L, k) for k in EMIT_TABLES if hasattr(L, k)}
-    done = 0
+    pool = results = None
+    fpx = set()
     try:
-        with ProcessPoolExecutor(max_workers=jobs, mp_context=multiprocessing.get_context("spawn"),
-                                 initializer=_spawn_init, initargs=(tables, polls, _identities())) as pool:
-            for out, deltas in pool.map(_emit_bodies, ({e: L.funcs[e] for e in es} for es in runs)):
+        pool = ProcessPoolExecutor(max_workers=jobs, mp_context=multiprocessing.get_context("spawn"),
+                                   initializer=_spawn_init, initargs=(tables, polls, _identities()))
+        results = pool.map(_emit_bodies, ({e: L.funcs[e] for e in es} for es in runs))
+    except BrokenProcessPool:
+        pass   # (said below, as a worker that stops)
+
+    def made():
+        done = 0
+        try:
+            if results is None:
+                raise BrokenProcessPool("the processes did not start")
+            for out, deltas, shapes in results:
+                fpx.update(shapes)
                 for c, d in zip(counters, deltas):
                     for k, v in d.items():
                         c[k] = c.get(k, 0) + v
                 done += 1
                 yield from out
-    except BrokenProcessPool:
-        print("emit: a worker process stopped or could not start (out of memory, or its emit is not this process's): "
-              "the last %d of %d runs are emitted in this process" % (len(runs) - done, len(runs)), flush=True)
-    for es in runs[done:]:
-        for e in es:
-            yield (e,) + tuple(base_emit(e, texts))
+        except BrokenProcessPool:
+            print("emit: a worker process stopped or could not start (out of memory, or its emit is not this process's): "
+                  "the last %d of %d runs are emitted in this process" % (len(runs) - done, len(runs)), flush=True)
+        finally:
+            if pool is not None:
+                pool.shutdown(wait=True, cancel_futures=True)
+        mine = texts() if callable(texts) else texts
+        for es in runs[done:]:
+            for e in es:
+                yield (e,) + tuple(base_emit(e, mine))
+    return _Spawned(pool, made(), fpx)
 
 
-def write(L, gen_dir, img_dir, rechunk=False, counters=(), jobs=None, took=None):
+def _spawns(L, jobs, plain, counters):
+    """write()'s gate for spawn_emit, where there is no fork: new processes rebuild the lifter from the tables, so only for a
+    plain Lifter, with the polls in the workers exactly where they are here, and their counter the one passed in"""
+    import poll
+    return jobs > 1 and len(L.funcs) >= 4000 and plain and poll._installed == bool(counters) \
+        and (not counters or poll_only(counters))
+
+
+def write(L, gen_dir, img_dir, rechunk=False, counters=(), jobs=None, took=None, beside=None):
     """L.write(gen_dir) with stable boundaries; returns its files. counters: dicts the emit adds to besides the
-    lifter's own (poll.stats); jobs: emit processes (emit_jobs()); took(step): told as each step ends (nx2/lift.py's times)"""
+    lifter's own (poll.stats); jobs: emit processes (emit_jobs()); took(step): told as each step ends (nx2/lift.py's times);
+    beside: a function run here first, while new emit processes (spawn_emit) already work, else before the write (nx2/lift.py's
+    coverage report, which reads the functions and writes none)"""
     took = took or (lambda what: None)
     starts = [] if rechunk else load(img_dir)
     if not starts and not rechunk:
@@ -304,22 +404,31 @@ def write(L, gen_dir, img_dir, rechunk=False, counters=(), jobs=None, took=None)
     jobs = emit_jobs() if jobs is None else jobs
     made = None
     procs = 1   # (what ran: the gate below may decline the processes)
+    every = [L.stats, L.unhandled, L.ijump] + list(counters)
+    spawn = _no_fork() and _spawns(L, jobs, plain, counters)
+    shapes = set()   # (the FPX shapes of the texts this process makes itself, when the new processes stop)
+    if spawn:
+        # (the new processes need none of this process's texts, and translate their runs themselves: they start now, and the
+        # lifter writes with no texts (no_texts). Should they stop, the texts are made here, as the lifter makes them)
+        import a64emit
+        real = (a64emit.translate, a64_lift.op_text)
+        made = spawn_emit(L, base_emit, sorted(L.funcs), lambda: lifter_texts(L, shapes, *real), every, jobs,
+                          bool(counters))
+        procs = jobs
+    try:
+        if beside:
+            beside()
+    except BaseException:
+        if made is not None:
+            made.close()
+        raise
 
     def emit_function(e, texts):
         nonlocal made, procs
         b.current = e
         if made is None:   # (the first call: write() has its texts now, and asks for the functions in sorted order)
-            import poll
-            every = [L.stats, L.unhandled, L.ijump] + list(counters)
             if _no_fork():
-                # (new processes rebuild the lifter from the tables: only for a plain Lifter, with the polls in the workers
-                # exactly where they are here, and their counter the one passed in)
-                if jobs > 1 and len(L.funcs) >= 4000 and plain and poll._installed == bool(counters) \
-                        and (not counters or poll_only(counters)):
-                    made = spawn_emit(L, base_emit, sorted(L.funcs), texts, every, jobs, bool(counters))
-                    procs = jobs
-                else:
-                    made = parallel_emit(base_emit, sorted(L.funcs), texts, every, 1)
+                made = parallel_emit(base_emit, sorted(L.funcs), texts, every, 1)
             else:
                 made = parallel_emit(base_emit, sorted(L.funcs), texts, every, jobs)
                 procs = jobs if jobs > 1 and len(L.funcs) >= 4000 else 1
@@ -329,11 +438,14 @@ def write(L, gen_dir, img_dir, rechunk=False, counters=(), jobs=None, took=None)
         return got[1], got[2]
     L.emit_function = emit_function
     try:
-        files = L.write(gen_dir, chunk_bytes=b)
+        with no_texts() if spawn else contextlib.nullcontext():
+            files = L.write(gen_dir, chunk_bytes=b)
     finally:
         del L.emit_function
         if made is not None:
             made.close()   # (the processes go now, not when the generator is collected)
+    if spawn:
+        fill_fpx(gen_dir, made.fpx | shapes)
     took("emit and write (%d process%s)" % (procs, "" if procs == 1 else "es"))
     # (the numbered chunks only: files has code_hot.c too, and counting it skipped the first stale chunk, linked twice)
     n = sum(1 for f in files if re.fullmatch(r"code_\d{3}\.c", os.path.basename(f)))
@@ -355,7 +467,6 @@ def write(L, gen_dir, img_dir, rechunk=False, counters=(), jobs=None, took=None)
     return files
 
 
-HEAD = lifted_c.HEAD_NOTED
 PART = re.compile(r"code_(\d{3})_(\d+)\.c")
 HOT_PIECE = re.compile(r"code_hot_\d+\.c")   # (nx2/split_hot.py's pieces of code_hot.c)
 # (a function's compile time grows with the square of its size: LLVM's passes over one function of tens of thousands of blocks. Fitted to
@@ -372,7 +483,7 @@ def fn_cost(size):
 
 def text_cost(text):
     """The estimated compile cost of a C file of lifted functions"""
-    marks = [m.start() for m in HEAD.finditer(text)] + [len(text)]
+    marks = list(lifted_c.noted_starts(text)) + [len(text)]
     return marks[0] + sum(fn_cost(b - a) for a, b in zip(marks, marks[1:]))
 
 
@@ -393,7 +504,7 @@ def write_costs(gen_dir, costs):
 def _cut(text, budget):
     """A chunk's text cut at function starts into parts of about equal cost when its cost is past the budget:
     ([(part's text, its cost)], the total cost) with the chunk's own (first) part first, or (None, its cost) when it stays whole"""
-    marks = [h.start() for h in HEAD.finditer(text)]
+    marks = list(lifted_c.noted_starts(text))
     ends = marks[1:] + [len(text)]
     cost = [fn_cost(b - a) for a, b in zip(marks, ends)]
     total = sum(cost)
@@ -426,7 +537,7 @@ def _cut_already(gen_dir, path, nnn, text, budget):
     finished the cut and whose result was lost when another worker stopped (the pool breaks, _each runs the chunk again here).
     The chunk and its parts on disk joined and cut again must give those same files, so an earlier lift's parts beside a
     chunk that is small now are not taken: (the parts, {file: cost}, the line to print), or None"""
-    marks = [h.start() for h in HEAD.finditer(text)]
+    marks = list(lifted_c.noted_starts(text))
     if not marks:
         return None
     preamble = text[:marks[0]]

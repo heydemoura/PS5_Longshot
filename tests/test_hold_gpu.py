@@ -7,9 +7,10 @@ after that wait. When the GPU took longer than hold_ms (a load's uploads), the s
 was drawn with what the game had not written yet: the lit scene and Link dark for a frame (issue 366). Now they are held on
 while such a wait is under way and for hold_ms after it, up to a bound.
 
-The rule is compiled and run (tests/hold_gpu_test.cpp). And the source: wait() counts a thread in gpu_waiters only around its
-wait for its own queue's recorded work and only when its timeout is not a poll's; sync_watch reads the count, takes the
-later of the queues' stop and the last such wait as the hold's start, and asks the rule before it drains.
+The rule is compiled and run (tests/hold_gpu_test.cpp). And the source: wait() (its body in wait_inner) counts a thread in
+gpu_waiters only around its wait for its own queue's recorded work and only when its timeout is not a poll's; sync_watch
+reads the count, takes the later of the queues' stop and the last such wait as the hold's start, and asks the rule before
+it drains.
 
 python -I -B tests/test_hold_gpu.py [--cxx g++]
 """
@@ -41,14 +42,19 @@ def need(cond, why):
 
 def check_source():
     replay = (ROOT / "gpu/vk/vk_replay.cpp").read_text(encoding="utf-8")
-    docs = (ROOT / "docs/development.md").read_text(encoding="utf-8")
+    row = next((l for l in (ROOT / "gpu/vk/switches.def").read_text(encoding="utf-8").splitlines()
+                if l.startswith("SW(RX_VK_HOLD_GPU_MS,")), "")
     need('#include "hold_gpu.h"' in replay, "vk_replay.cpp no longer includes hold_gpu.h")
 
     waiter = block(replay, "struct GpuWaiter {")
     need("if (counted) gpu_waiters.fetch_add(1" in waiter and "if (counted) gpu_waiters.fetch_sub(1" in waiter,
          "GpuWaiter must count a thread in and out, and only when told to")
 
-    wait = block(replay, "int wait(uint64_t f, uint64_t timeout_ns) {")
+    # (wait() times the wait for RX_VK_GPU_TIMELINE and hands it to wait_inner, on every path: the wait is wait_inner's)
+    outer = block(replay, "int wait(uint64_t f, uint64_t timeout_ns) {")
+    need(outer.count("wait_inner(f, timeout_ns)") == 2 and outer.count("return") == 2 and "GpuWaiter" not in outer,
+         "wait() no longer hands every wait to wait_inner, or counts a waiter itself")
+    wait = block(replay, "int wait_inner(uint64_t f, uint64_t timeout_ns) {")
     mine = block(wait, "if (mine) {")
     need("GpuWaiter waiting(timeout_ns > 1000000);" in mine, "a poll must not count as a wait for the GPU")
     need(mine.index("GpuWaiter waiting(") < mine.index("wait_recorded(f, timeout_ns, &ok)"),
@@ -59,14 +65,14 @@ def check_source():
     watch = block(replay, "void sync_watch() {")
     need("gpu_waiters.load(" in watch and "if (gpu_wait) gpu_wait_seen = now;" in watch, "sync_watch no longer notes a wait for the GPU")
     need("std::max(blocked_since, gpu_wait_seen)" in watch, "the hold after a wait starts at the later of the stop and the wait")
-    need("hold_gpu::choose(hold_gpu_on, gpu_wait," in watch, "sync_watch no longer asks the rule")
+    need("hold_gpu::choose(gpu_wait," in watch, "sync_watch no longer asks the rule")
     force = watch[watch.index("case hold_gpu::Choice::Force:"):]
     need("drain(3);" in force and watch.count("drain(3);") == 1, "the stopped queues are made to go only where the rule says so")
     need(watch.index("schedule();") < watch.index("hold_gpu::choose("), "the look at the queues comes before the hold's question")
-    need('getenv("RX_VK_HOLD_GPU_WAIT")' in watch and 'getenv("RX_VK_HOLD_GPU_MS")' in watch, "the switches are read in sync_watch")
+    need('getenv("RX_VK_HOLD_GPU_MS")' in watch, "the bound's switch is read in sync_watch")
     need("(double)hold_ms()" in watch, "the bound is never under hold_ms")
 
-    need("`RX_VK_HOLD_GPU_WAIT=0`" in docs and "`RX_VK_HOLD_GPU_MS=<ms>`" in docs, "docs/development.md has no rows for the hold's switches")
+    need("<ms>" in row, "gpu/vk/switches.def has no row for the hold's switch, or it does not say its value is <ms>")
 
 
 def main():

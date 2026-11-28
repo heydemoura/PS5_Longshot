@@ -19,6 +19,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "compute_gate.h"   // the scoped Linux memory budget in the extracted pcache_load_off
 #ifdef _WIN32
 #define NOMINMAX   // (the extracted code calls std::max: no min/max macros from windows.h)
 #include <windows.h>
@@ -47,15 +48,33 @@ struct VkPipelineCacheCreateInfo {
     size_t initialDataSize = 0;
     const void* pInitialData = nullptr;
 };
+enum VkDriverId { VK_DRIVER_ID_AMD_PROPRIETARY = 1, VK_DRIVER_ID_NVIDIA_PROPRIETARY = 4 };
 struct {
     int device = 1;
     struct { bool pipelineCreationCacheControl = true; } vk13;
-    struct { unsigned vendorID = 0; } props;   // (not Intel: the fetch lock only with RX_VK_PCACHE_FETCH_LOCK=1)
+    struct { unsigned vendorID = 0; } props;
+    VkDriverId driver_id = VK_DRIVER_ID_AMD_PROPRIETARY;   // (not NVIDIA's: pcache_load_off reads no NVIDIA cache, the file is read)
+    // (dev.policy, which pcache_fetch_lock_on and serial_builds_on read: gpu/vk/device_policy.h makes the two of the GPU's
+    // driver and their switches. Here, not Intel's Windows driver: the fetch lock only with RX_VK_PCACHE_FETCH_LOCK=1, the
+    // case lock-users, and the builds not serial)
+    struct {
+        bool pcache_fetch_lock = [] {
+            const char* e = std::getenv("RX_VK_PCACHE_FETCH_LOCK");
+            return e && *e && std::strcmp(e, "0") != 0;
+        }();
+        bool compute_builds_serial = false;
+    } policy;
 } dev;
 VkPipelineCache pcache = nullptr;
 bool pcache_no_save = false;   // (pcache_init sets this in the renderer)
+bool pcache_file_rejected = false;   // (pcache_init: the cache's file was another driver's)
 std::atomic<size_t> pcache_saved_size{0};
 std::string pcache_dir, pcache_path;
+// (vk_draw.cpp's ordinary save, pipeline_cache_save, extracted unmodified after the play caches: the no-save-periodic case. What the
+// builds count towards a save, and the cache's data size last read or written)
+std::atomic<int64_t> pcache_built_since_save{0};
+thread_local bool pcache_save_between = false;   // (vk_draw.cpp: a save run between two serial builds, Intel; not here)
+std::atomic<bool> pcache_save_owed{false};
 std::atomic<int> creates{0}, destroys{0}, merges{0}, compiles{0}, failed_moves{0};
 std::atomic<int> fail_moves{0};   // (the next moves into place that fail)
 FakePipeline the_pipeline;
@@ -231,13 +250,23 @@ using mkwvk::PipelineCacheFile;
 struct { std::atomic<int64_t> play_from_driver{0}, play_from_start{0}, play_compiled{0}; } census;
 thread_local struct { uint8_t made_how = 0; } use_counters;
 #include "pipeline_play_cache.inc"
+#include "precompile_save.h"
+thread_local precompile_save::Outcome pcache_save_outcome;   // (vk_draw.cpp's: what the last save on this thread did)
+void helper_thread_start() {}   // (the background save's thread: no priority or name here)
+#include "pipeline_cache_save.inc"
 
 std::string cache_path(const char*) { return pcache_dir; }
 uint64_t program_cache_stamp() { return 17; }
+bool pipelines_stamp_ok(uint64_t stamp) { return stamp == 17; }
 namespace pcache_stamp {
-struct Dropped { size_t files; uint64_t bytes; };
-Dropped check(const std::string&, uint64_t) { return {0, 0}; }
+struct Dropped { size_t files = 0; uint64_t bytes = 0; bool carried = false; uint64_t main = 0, all = 0, base = 0; };
+Dropped check(const std::string&, uint64_t, bool (*)(uint64_t) = nullptr) { return {}; }
 }
+// (pcache_load_off's inputs: programs loaded before the title, not at their create calls, and no NVIDIA cache limit)
+#include "pcache_load.h"
+#include "nvidia_cache_limit.h"
+bool programs_load_at_create() { return false; }
+nvidia_cache_limit::Limit nvidia_limit() { return {}; }
 // (init's conditional read uses the read-result stub; play writes keep the real mapped-file writer)
 #define PipelineCacheFile ReadPart
 #include "pcache_init.inc"
@@ -299,12 +328,7 @@ CacheFiles cache_files() {
     }
     return files;
 }
-// (vk_draw.cpp's forced save as far as pcache_saved_now sees it: nothing under RX_VK_PCACHE_LOAD=0, else the whole cache in
-// the file. The real one is not extracted)
-void pipeline_cache_save(bool) {
-    if (!pcache || pcache_no_save) return;
-    write_file(pcache_path, "FAKE", keys_of(pcache));
-}
+// (pcache_saved_now's forced save is the real pipeline_cache_save, extracted above)
 #include "pcache_saved_now.inc"
 
 int run(const std::string& name) {
@@ -521,6 +545,57 @@ int run(const std::string& name) {
         CHECK(make(47) == VK_SUCCESS);
         play_cache_save();
         CHECK(file_keys(play_path(8)) == std::set<uint64_t>{47});   // (numbered after the highest read)
+    } else if (name == "no-save") {
+        // (longshot, issue 388: the file not read, pcache_load.h) the play files neither merged nor written into the file, however
+        // many there are; play's generations still taken away at a save, and freed, with nothing written
+        pcache_no_save = true;
+        pcache = cache_of({});
+        write_file(pcache_path, "FAKE", {1, 2, 3});
+        for (uint64_t i = 1; i <= kPlayFilesKept + 2; i++) write_file(play_path((uint32_t)i), "FAKE", {100 + i});
+        CHECK(play_files_merge() == 0);
+        CHECK(keys_of(pcache).empty() && file_keys(pcache_path) == (std::set<uint64_t>{1, 2, 3}));   // (the file as it was)
+        for (uint32_t i = 1; i <= kPlayFilesKept + 2; i++) CHECK(exists(play_path(i)));             // (kept for a start that reads it)
+        play_cache_begin();
+        PlayCache* g = play_cache.load();
+        CHECK(g && make(60) == VK_SUCCESS && g->built == 1);
+        play_cache_save();
+        CHECK(play_cache.load() != g && !exists(play_path(kPlayFilesKept + 3)));   // (taken away, nothing written)
+        CHECK(file_keys(pcache_path) == (std::set<uint64_t>{1, 2, 3}));
+        pcache_no_save = false;
+    } else if (name == "no-save-periodic") {
+        // (longshot, issue 388; PR 416's review) The file not read: the ordinary save, pipeline_cache_save(false) every 300 presents
+        // (vk_replay.cpp), still takes play's generation away and frees it once enough was built, on its thread, with nothing written:
+        // not the file, not a play file. Under its threshold it does nothing, and what is built next goes into the next generation
+        pcache_no_save = true;
+        pcache = cache_of({});
+        write_file(pcache_path, "FAKE", {1, 2, 3});
+        play_cache_begin();
+        PlayCache* g = play_cache.load();
+        CHECK(g && make(60) == VK_SUCCESS && make(61) == VK_SUCCESS && g->built == 2);
+        const int destroyed = destroys.load();
+        pcache_built_since_save = 31;
+        pipeline_cache_save(false);   // (under the threshold: nothing)
+        Sleep(50);
+        CHECK(play_cache.load() == g && destroys == destroyed);
+        pcache_built_since_save = 32;   // (as the builds count it, vk_draw.cpp: enough for a save)
+        pipeline_cache_save(false);
+        CHECK(wait_for([&] { return destroys.load() == destroyed + 1; }));   // (the generation freed on the save's thread)
+        PlayCache* g2 = play_cache.load();
+        CHECK(g2 != g && g2 && g2->cache);
+        CHECK(make(62) == VK_SUCCESS && has(g2->cache, 62) && g2->built == 1);   // (new work goes on, into the next one)
+        pcache_built_since_save = 32;
+        pipeline_cache_save(false);
+        CHECK(wait_for([&] { return destroys.load() == destroyed + 2; }));
+        pipeline_cache_save(true);   // (a forced save, Restart now: after the background one; nothing built since, nothing freed)
+        CHECK(!g->cache && !g2->cache && destroys == destroyed + 2 && play_cache.load()->cache);
+        CHECK(file_keys(pcache_path) == (std::set<uint64_t>{1, 2, 3}));   // (the file as it was)
+        int files = 0;
+        for (const auto& e : std::filesystem::directory_iterator(pcache_dir)) {
+            files++;
+            CHECK(e.path().string() == pcache_path);
+        }
+        CHECK(files == 1);   // (no play file, no temporary file)
+        pcache_no_save = false;
     } else if (name == "compact") {
         pcache = cache_of({1});
         write_file(pcache_path, "FAKE", {1});

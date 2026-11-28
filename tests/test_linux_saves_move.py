@@ -42,6 +42,7 @@ def build(cc, tmp):
     end = source.index("#endif", source.index("static const char *saves_dir(const char *beside) {"))
     program = r'''#include <windows.h>
 #include <stdarg.h>
+#include "hos_atomic_file.h"
 #define SEP '/'
 #define SEP_S "/"
 static void hos_log(const char *fmt, ...) { va_list ap; va_start(ap, fmt); vprintf(fmt, ap); va_end(ap); putchar(10); }
@@ -50,7 +51,7 @@ int main(int argc, char **argv) { if (argc != 2) return 2; printf("uses %s\n", s
 '''
     src, exe = tmp / "mover.c", tmp / "mover"
     src.write_text(program, encoding="utf-8")
-    subprocess.run([cc, "-std=gnu11", "-D_GNU_SOURCE", "-w", "-I", str(ROOT / "host" / "posix"), str(src),
+    subprocess.run([cc, "-std=gnu11", "-D_GNU_SOURCE", "-w", "-I", str(ROOT / "host" / "posix"), "-I", str(ROOT / "host"), str(src),
                     str(ROOT / "host" / "posix" / "win32_posix.c"), "-o", str(exe), "-lpthread", "-ldl"], check=True)
     return exe
 
@@ -264,6 +265,38 @@ def main():
             else:
                 print("an entry that cannot go, the game on another drive: not tried (no other drive here: /dev/shm is "
                       "missing, read-only or the temporary folder's own)")
+
+        c = case("save-work stays behind")
+        (c.user / "save" / USER_ID).mkdir(parents=True)
+        (c.user / "save" / USER_ID / "account.sav").write_text("committed", encoding="ascii")
+        work = c.user / "save-work" / USER_ID
+        work.mkdir(parents=True)
+        (work / "account.sav").write_text("uncommitted", encoding="ascii")
+        for n in (1, 2):
+            c.check(c.start() == c.new, "start %d did not move committed saves" % n)
+        c.check((c.new / "save" / USER_ID / "account.sav").read_text() == "committed", "committed bytes changed")
+        c.check(work.is_dir() and not (c.new / "save-work").exists(), "save-work was copied or removed")
+
+        c = case("ownership file is not pending work")
+        (c.user / "save" / USER_ID).mkdir(parents=True)
+        (c.user / "save" / USER_ID / "account.sav").write_text("committed", encoding="ascii")
+        work = c.user / "save-work"
+        work.mkdir()
+        lock = work / (USER_ID + ".lock")
+        lock.touch()
+        (work / (USER_ID + ".journal.failed")).write_text("retired", encoding="ascii")
+        for n in (1, 2):
+            c.check(c.start() == c.new, "start %d treated the ownership file as pending" % n)
+        c.check(lock.exists() and not (c.new / "save-work").exists(), "ownership file was moved or removed")
+        c.check((c.new / "save" / USER_ID / "account.sav").read_text() == "committed", "committed bytes changed")
+
+        c = case("pending journal keeps C beside its recovery data")
+        (c.user / "save" / USER_ID).mkdir(parents=True)
+        (c.user / "save-work").mkdir()
+        journal = c.user / "save-work" / (USER_ID + ".journal")
+        journal.write_text("R account.sav\nE\n")
+        c.check(c.start() == c.user, "a pending commit was separated from its journal")
+        c.check((c.user / "save" / USER_ID).exists() and journal.exists(), "recovery data moved")
 
         c = case("no link")
         (c.user / "save" / USER_ID).mkdir(parents=True)
