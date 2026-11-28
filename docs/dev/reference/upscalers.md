@@ -212,13 +212,13 @@ drawing from another share adds to the samplers the game biases below 0 (`upscal
 
 | Upscaler | Added bias |
 |---|---|
-| DLSS, DLAA | `log2(share / 0.75) + offset`, offset -1: NVIDIA's guide, the output's detail and one mip step finer, which DLSS resolves over its frames (Quality -1.17, Performance -1.58, DLAA -0.58, Auto -1) |
-| FSR 3.1, FSR 4, XeSS | `log2(share / 0.75)` below 75%; 0 at Auto and above |
-| The game's own, Off, FSR 4's and XeSS's native AA | 0 |
+| DLSS, DLAA, FSR 3.1, FSR 4, FSR 4 Native AA | `log2(share / 0.75) + offset`, offset -1: NVIDIA's DLSS guide and AMD's FSR 3.1 / FSR 4 specification, the output's detail and one mip step finer, resolved over frames (Quality -1.17, Performance -1.58, Native AA / 100% -0.58, Auto -1) |
+| XeSS | `log2(share / 0.75)` below 75%; 0 at Auto and above |
+| The game's own, Off, XeSS Native AA | 0 |
 
 The bias is part of every sampler's key: the Upscaler, Render resolution and Quality preset rows make the samplers
-again. `RX_VK_UPSCALE_LOD_BIAS=0` adds none; `RX_VK_DLSS_LOD_OFFSET=<steps>` sets DLSS's offset for a run (clamped to
--3..0; `0` gives DLSS the render size's own detail).
+again. `RX_VK_UPSCALE_LOD_BIAS=0` adds none; `RX_VK_DLSS_LOD_OFFSET=<steps>` sets the DLSS / FSR offset for a run (clamped to
+-3..0; `0` gives the render size's own detail).
 
 ## Resources and failures
 
@@ -311,7 +311,7 @@ All switches are in [`switches.def`](../../../gpu/vk/switches.def) and [switches
 | `RX_VK_DLSS_DIR`, `RX_VK_FSR_DIR`, `RX_VK_XESS_DIR` | A folder looked in first for the vendor's runtime ([vendor files](#vendor-files)) |
 | `RX_VK_DLSS_DEBUG` | `motion` shows the motion vectors; `alternate` shows the game's upscale every other frame |
 | `RX_VK_DLSS_JITTER=0`, `RX_VK_FSR_JITTER=0` | No camera jitter for the temporal engines, or for FSR 3.1 |
-| `RX_VK_UPSCALE_LOD_BIAS=0`, `RX_VK_DLSS_LOD_OFFSET=<steps>` | No upscaler texture bias, or DLSS's offset ([texture LOD bias](#texture-lod-bias)) |
+| `RX_VK_UPSCALE_LOD_BIAS=0`, `RX_VK_DLSS_LOD_OFFSET=<steps>` | No upscaler texture bias, or the DLSS / FSR offset ([texture LOD bias](#texture-lod-bias)) |
 | `RX_VK_FSR4_HDR=0`, `RX_VK_XESS_HDR=0` | FSR 4 and XeSS on their LDR contexts with native HDR |
 | `RX_VK_REFLEX_LOG=1` | NVIDIA Reflex's latency timings in the log every 300 frames while Reflex is on |
 | `RX_VK_PSYCHOV35_DLSS=0` | Turn off the PsychoV35 RGBA16F route |

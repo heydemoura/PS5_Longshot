@@ -384,7 +384,7 @@ SW(RX_VK_DLSS_FG_INVALID, attempt, bool, "FLT_MAX is the 'no motion here' value"
 SW(RX_VK_DLSS_FG_MOST, diag, int, "as many generated frames as the runtime offers", "Caps the number of frames DLSS-G may make per game frame, to imitate an older runtime in checks.")
 SW(RX_VK_DLSS_FG_MV_SCALE, diag, float, "1.0", "Multiplies the motion vector scale given to DLSS-G, for checks.")
 SW(RX_VK_DLSS_JITTER, kill, bool, "on: the camera is jittered while a temporal engine draws", "=0 turns off the sub-pixel camera jitter given to the temporal upscalers.")
-SW(RX_VK_DLSS_LOD_OFFSET, tune, float, "-1", "DLSS's LOD bias offset in mip steps, clamped to -3..0 (0: the render size's own detail).")
+SW(RX_VK_DLSS_LOD_OFFSET, tune, float, "-1", "DLSS and FSR's LOD bias offset in mip steps, clamped to -3..0 (0: the render size's own detail).")
 SW(RX_VK_DLSS_LOG, diag, bool, "off (NGX writes its own log files only)", "1 sends NGX's own log lines into the renderer's log instead of NGX's files.")
 SW(RX_VK_DLSS_NR, player, bool, "the DLSS 5 row (Off by default)", "=1 or =0 turns DLSS 5 (NVIDIA's neural rendering after the upscaler) on or off for this run over the saved row; NVIDIA's nvngx_dlssnr.dll and a temporal upscaler are still needed.")
 SW(RX_VK_DLSS_NR_DEBUG, diag, int, "0: the DLSS 5 picture", "A view of DLSS 5 for this run, never saved: 1 its input, 2 the model's raw output, 3 the difference x20, 4 depth, 5 motion vectors.")
