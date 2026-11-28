@@ -192,6 +192,12 @@ VkImageView texture_view(Texture* tex, const nvn_tex* t, const nvn_view* v, VkIm
 /// (longshot) The format rules texture_get and texture_view follow (vk_texture.cpp), shared with the pipeline state list
 VkFormat image_format_of(VkFormat vf, bool astc_decoded);
 VkFormat view_format_of(VkFormat image, bool astc_decoded, bool bc, int view_nvn, ViewUse use, VkFormat force_format);
+/// (longshot) A view's NVN format over a texture of NVN format tex_nvn: R11G11B10F over one of the game's R11G11B10F targets that
+/// the host made RGBX16F (host/scene_format.h: the scene's light with PsychoV35) is the texture's own, the format it holds; any
+/// other as it is
+inline int scene_view_format(int tex_nvn, int view_nvn) {
+    return view_nvn == NVN_FORMAT_R11G11B10F && tex_nvn == NVN_FORMAT_RGBX16F ? tex_nvn : view_nvn;
+}
 /// The format a draw renders in on this device, into a texture of NVN format tex_nvn through a view of NVN format view_nvn
 VkFormat attachment_format(int tex_nvn, int view_nvn);
 /// The view format an NVN texture and view sample / render in

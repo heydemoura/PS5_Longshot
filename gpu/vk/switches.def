@@ -212,6 +212,7 @@ SW(HOS_SAMPLE_ALL, diag, string, "off (HOS_PROFILE=1 sets it to the profile fold
 SW(HOS_SAMPLE_FILE, diag, string, "unset: HOS_SAMPLE logs its most frequent places only", "Writes every HOS_SAMPLE sample's whole stack to the given file.")
 SW(HOS_SAMPLE_PACKED, diag, bool, "off: plain sample lines", "The sampler writes each distinct stack once (packed format, read by scripts/profiling/samples.py).")
 SW(HOS_SCAN_DT, diag, string, "off", "Writes every guest float between ~0.015 and ~0.04 with its address to <prefix> files, four times.")
+SW(HOS_SCENE_RGBA16F, kill, bool, "on: with HDR Native and the PsychoV35 tone mapper, the game's R11G11B10F render targets (the scene's light, its copies and its bloom) are made as RGBX16F, so the sky is not drawn in bands", "=0 makes them R11G11B10F, as before.")
 SW(HOS_SDL_VERSION, kill, enum, "SDL3 when present, else SDL2", "=2 loads SDL2 even when SDL3 is there.")
 SW(HOS_SHADER_DUMP, diag, string, "no dump", "Writes each shader stage's code and control section into the named folder, as <code address>.code and .ctl.")
 SW(HOS_SHADOW_BUCKET, tune, int, "384 (HOS_SHADOW_SLOT_STEP)", "The step of sides a character's shadow map reserves storage in; 0: every texture its own size.")

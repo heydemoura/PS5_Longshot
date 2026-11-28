@@ -193,6 +193,7 @@ VkFormat view_format_of(VkFormat image, bool astc_decoded, bool bc, int view_nvn
 /// (a depth target: its own). What texture_get and texture_view make of them, without the texture: the pipeline state list's
 /// targets are the game's NVN formats, and each GPU builds the pipelines its draws will ask for (vk_draw.cpp state_targets)
 VkFormat attachment_format(int tex_nvn, int view_nvn) {
+    view_nvn = scene_view_format(tex_nvn, view_nvn);
     const VkFormatInfo fi = vk_format(tex_nvn);
     if (fi.format == VK_FORMAT_UNDEFINED) return VK_FORMAT_UNDEFINED;
     int from = 0;
@@ -3455,7 +3456,7 @@ void texture_transition_layout(VkCommandBuffer cmd, Texture* tex, VkImageLayout 
 }
 
 int view_nvn_format(const nvn_tex* t, const nvn_view* v) {
-    return v && v->set_format ? v->format : t->d.format;
+    return scene_view_format(t->d.format, v && v->set_format ? v->format : t->d.format);
 }
 unsigned view_level(const nvn_view* v) {
     return v && v->set_levels ? v->base_level : 0;

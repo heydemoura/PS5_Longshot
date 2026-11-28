@@ -81,10 +81,12 @@ def wiring():
     need("nvn_texdesc slot = *d;" in slot and "slot.width = slot.height = side;" in slot and "nvn_tex_layout(&slot, out);" in slot,
          "the slot's layout is a copy's: the texture's own description is not changed")
     size = block(src, "NV(nvnTextureBuilderGetStorageSize)")
-    need("shadow_slot_layout(&CTB(P(0))->d, &slot) && slot.size > L.size) L.size = slot.size;" in size,
+    need("shadow_slot_layout(&made, &slot) && slot.size > L.size) L.size = slot.size;" in size and
+         "const nvn_texdesc made = made_desc(TB(P(0)));" in size,
          "the storage size answers the slot's where it is larger")
     align = block(src, "NV(nvnTextureBuilderGetStorageAlignment)")
-    need("shadow_slot_layout(&CTB(P(0))->d, &slot) && slot.align > L.align) L.align = slot.align;" in align,
+    need("shadow_slot_layout(&made, &slot) && slot.align > L.align) L.align = slot.align;" in align and
+         "const nvn_texdesc made = made_desc(TB(P(0)));" in align,
          "the alignment answers the slot's where it is larger")
     own = block(src, "NV(nvnTextureGetStorageSize)")
     need("shadow_slot" not in own, "a made texture's own storage size is its own")

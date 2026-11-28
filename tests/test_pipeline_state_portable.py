@@ -47,7 +47,8 @@ def main():
     formats = '\n'.join([astc_tables, 'namespace {\n' + block(fmts, 'bool r5g5b5a1_sampled()') + '\n}',
                          block(fmts, 'VkFormatInfo vk_format(int nvn_format)'),
                          block(fmts, 'bool is_depth_format(VkFormat f)'), block(fmts, 'bool has_stencil(VkFormat f)')])
-    texture = '\n'.join(block(tex, m) for m in (
+    tex_h = (ROOT / 'gpu/vk/vk_texture.h').read_text(encoding='utf-8')
+    texture = block(tex_h, 'inline int scene_view_format(') + '\n' + '\n'.join(block(tex, m) for m in (
         'bool is_bc(VkFormat f)', 'bool is_astc(VkFormat f)', 'VkFormat linear_twin(VkFormat f)', 'VkFormat widened(VkFormat f, int* from_bpb)',
         'VkFormat storage_view_format(VkFormat f)', 'VkFormat image_format_of(', 'VkFormat view_format_of(', 'VkFormat attachment_format('))
     shaders = '\n'.join(block(shader, m) for m in (

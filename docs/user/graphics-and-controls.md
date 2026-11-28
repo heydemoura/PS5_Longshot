@@ -256,6 +256,8 @@ helper asks you to.
 - **V-Sync:** Auto is mailbox where the driver has it (no tearing, no wait), else On, or Off on Windows. On waits for
   each refresh; Off shows each frame at once and can tear.
 - **HDR:** Expanded expands the game's SDR picture; Native is the game's own HDR, with the **HDR tone mapper** row.
+  With PsychoV35 the game's scene is also drawn at higher precision, so skies and the sun's glow have no bands (with frame
+  generation on, its frames keep them until its own 10-bit fix).
   On Windows, if the game stays SDR, the HDR row's help says why ([HDR stays SDR](common-issues.md#windows-hdr-is-on-but-the-game-stays-sdr)).
 - **CRT filter** adds scanlines and a phosphor mask to the finished SDR picture, HUD included; **CRT lines** is its
   virtual line count. Native HDR leaves it out.
