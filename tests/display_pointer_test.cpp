@@ -118,6 +118,7 @@ namespace sdl {
 [[maybe_unused]] static uint32_t ptr_held;
 static int menu_open=1, renderer;
 static void mouse_capture(int on){mouse_captured=on;}
+[[maybe_unused]] static void gm_mouse_used() {}   // (a click shows the cursor: tests/test_cursor_hidden_linux.py)
 [[maybe_unused]] static LONG ptr_x, ptr_y, ptr_pressed, ptr_wheel;
 [[maybe_unused]] static void* window = (void*)(uintptr_t)1;
 [[maybe_unused]] static int ww = 1280, wh = 720, pw = 1280, ph = 720;
