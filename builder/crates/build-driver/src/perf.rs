@@ -483,6 +483,12 @@ fn create_lock(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new().write(true).create_new(true).open(path)
 }
 
+/// Whether [`create_lock`] failed because something is at `path`: a file, or a directory (Unix says it exists; Windows
+/// refuses a file over a directory with access denied).
+fn lock_there(e: &std::io::Error, path: &Path) -> bool {
+    e.kind() == std::io::ErrorKind::AlreadyExists || std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+}
+
 /// True when this process may send; false while another sender's lock holds. A takeover claims an expired lock by
 /// rename and installs the new one with a create-new (atomic on every file system, the vfat and exfat of a Deck's SD
 /// card too), so two racing takers never both reclaim one stale lock; what a claim moved is looked at first, and a live
@@ -501,7 +507,7 @@ fn take_send_lock(folder: &Path) -> bool {
                 }
                 return true;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) if lock_there(&e, &path) => {}
             Err(_) => return true, // (no lock can be made at all: send unlocked)
         }
         let _ = std::fs::remove_file(&mine); // (our own half-made claim from a send that broke halfway)
@@ -532,7 +538,7 @@ fn take_send_lock(folder: &Path) -> bool {
                 }
                 return true;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return !lock_holds(&path),
+            Err(e) if lock_there(&e, &path) => return !lock_holds(&path),
             Err(_) => return true,
         }
     }

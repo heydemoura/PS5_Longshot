@@ -39,9 +39,18 @@ pub fn same_file(a: &Path, b: &Path) -> bool {
             _ => false,
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        // (std tells no file id on Windows: the same path, however spelled)
+        // (std tells no file id on Windows: the volume's serial and the file's 128-bit id, which ReFS needs whole. A
+        // file system that gives none: the same path, however spelled)
+        match (crate::sys::file_id(a), crate::sys::file_id(b)) {
+            (Some(x), Some(y)) => x == y,
+            _ => matches!((fs::canonicalize(a), fs::canonicalize(b)), (Ok(x), Ok(y)) if x == y),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // (no file id: the same path, however spelled)
         matches!((fs::canonicalize(a), fs::canonicalize(b)), (Ok(x), Ok(y)) if x == y)
     }
 }
@@ -390,6 +399,21 @@ mod tests {
             assert_eq!(files_under(&d.join(t)).unwrap(), files_under(&d.join("src")).unwrap());
             assert_eq!(fs::read(d.join(t).join("x/1")).unwrap(), b"1");
         }
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn a_hard_link_is_the_same_file_and_a_copy_is_not() {
+        let d = scratch("same");
+        let (a, b, c) = (d.join("a"), d.join("b"), d.join("c"));
+        fs::write(&a, b"x").unwrap();
+        fs::hard_link(&a, &b).unwrap();
+        fs::copy(&a, &c).unwrap();
+        fs::create_dir_all(d.join("x")).unwrap();
+        assert!(same_file(&a, &b) && same_file(&b, &a), "a hard link of it");
+        assert!(same_file(&a, &a) && same_file(&a, &d.join("x/../a")), "the same path, however spelled");
+        assert!(!same_file(&a, &c), "a copy");
+        assert!(!same_file(&a, &d.join("missing")) && !same_file(&d.join("missing"), &d.join("missing")));
         fs::remove_dir_all(&d).unwrap();
     }
 

@@ -421,8 +421,9 @@ with a dev mod linked in". Its status is the game's, or play's own (120 to 123);
 `game_args` go after a `--`: the builder reads none of them.
 
 `extra_mod_dirs` reach the game in **`LONGSHOT_DEV_MODS`** (`build_driver::play::DEV_MODS_VAR`, host/longshot_profile.h),
-the folders joined by the OS's path separator (`:`, `;` on Windows). This release only passes it on: the Mod API's game
-side reads it and links each folder's mod in beside the profile's, for that run alone.
+the folders joined by the OS's path separator (`:`, `;` on Windows; a folder with it in its name is refused, on Windows
+too, so the list has no quotes). This release only passes it on: the Mod API's game side reads it and links each
+folder's mod in beside the profile's, for that run alone.
 
 ### The game's channel to its builder
 

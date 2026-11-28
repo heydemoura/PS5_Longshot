@@ -1,14 +1,8 @@
 use super::*;
 use std::io::{BufRead, BufReader, PipeReader, PipeWriter};
-use std::path::Path;
 
 fn scratch(name: &str) -> PathBuf {
-    let d = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../target/test-scratch")
-        .join(format!("channel-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    crate::scratch(&format!("channel-{name}"))
 }
 
 /// A profile folder with the mods the tests change.

@@ -29,6 +29,12 @@ pub(crate) fn delete_at_restart(path: &std::path::Path) -> bool {
     imp::delete_at_restart(path)
 }
 
+/// The file's volume serial and file id, following links; none if unreadable or either identifier is zero.
+#[cfg(windows)]
+pub(crate) fn file_id(path: &std::path::Path) -> Option<(u64, [u8; 16])> {
+    imp::file_id(path)
+}
+
 /// This process, and every process it starts from now on, at a low priority, so the PC stays usable while it compiles
 /// (`from-source`'s compile of a builder): Linux, a nice of 10 (the calling thread's, which the threads and
 /// processes it starts inherit: call it first); Windows, the below-normal priority class, which the processes it
@@ -299,6 +305,30 @@ mod imp {
         GetCurrentProcess, PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
         PROCESS_POWER_THROTTLING_STATE, ProcessPowerThrottling, SetProcessInformation,
     };
+
+    pub(super) fn file_id(p: &std::path::Path) -> Option<(u64, [u8; 16])> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+        };
+        // (no access asked: reading the id needs none, and a file another program has open still opens; a folder opens
+        // with backup semantics)
+        let f = std::fs::OpenOptions::new().access_mode(0).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(p).ok()?;
+        // SAFETY: FILE_ID_INFO is plain data, valid all zero.
+        let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+        // SAFETY: the handle is the open file's, and info is a FILE_ID_INFO of the size given.
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                f.as_raw_handle() as _,
+                FileIdInfo,
+                std::ptr::from_mut(&mut info).cast(),
+                std::mem::size_of::<FILE_ID_INFO>() as u32,
+            )
+        };
+        (ok != 0 && info.VolumeSerialNumber != 0 && info.FileId.Identifier != [0; 16])
+            .then_some((info.VolumeSerialNumber, info.FileId.Identifier))
+    }
 
     pub(super) fn available_memory() -> Option<u64> {
         let mut m =

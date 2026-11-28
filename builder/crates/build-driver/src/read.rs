@@ -340,12 +340,13 @@ mod tests {
         assert!(manifest_mods(None).is_empty(), "no profile: none");
         let d = crate::scratch("manifest-mods");
         assert!(names(&d).is_empty(), "no mods folder: none");
-        for m in ["b", "A", "c", "x/y", "1/2/3/4", "1/2/3/4b/5", "-off/z", "_off", ".hid", "s/-o", "a/inner"] {
+        // (no two names that differ only in case: Windows and macOS take them for one folder)
+        for m in ["b", "A", "c", "x/y", "1/2/3/4", "1/2/3/4b/5", "-off/z", "_off", ".hid", "s/-o", "ab/inner"] {
             manifest_mod(&d, m);
         }
         let on = |n: &str| (n.to_string(), true);
         // (no mods.json: all on, by path ignoring case; four levels down found, five not; -, _ and . folders skipped)
-        assert_eq!(names(&d), [on("1/2/3/4"), on("A"), on("a/inner"), on("b"), on("c"), on("x/y")]);
+        assert_eq!(names(&d), [on("1/2/3/4"), on("A"), on("ab/inner"), on("b"), on("c"), on("x/y")]);
         // (nothing below a mod)
         manifest_mod(&d, "b/below");
         assert!(!names(&d).iter().any(|(n, _)| n == "b/below"));
@@ -355,11 +356,11 @@ mod tests {
             r#"{"mods":[{"id":"local/x/y","enabled":true},{"id":"local/b","enabled":false},{"id":"local/gone"},{"id":"c"},{"id":"local/A"}]}"#,
         )
         .unwrap();
-        assert_eq!(names(&d), [on("x/y"), ("b".into(), false), on("A"), on("1/2/3/4"), on("a/inner"), on("c")]);
+        assert_eq!(names(&d), [on("x/y"), ("b".into(), false), on("A"), on("1/2/3/4"), on("ab/inner"), on("c")]);
         // (a mods.json that isn't such a list: every mod on, in path order)
         for bad in [&b"{not json"[..], br#"{"mods": 3}"#] {
             std::fs::write(d.join("mods.json"), bad).unwrap();
-            assert_eq!(names(&d), [on("1/2/3/4"), on("A"), on("a/inner"), on("b"), on("c"), on("x/y")]);
+            assert_eq!(names(&d), [on("1/2/3/4"), on("A"), on("ab/inner"), on("b"), on("c"), on("x/y")]);
         }
         std::fs::remove_dir_all(&d).unwrap();
     }

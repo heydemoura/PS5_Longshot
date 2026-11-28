@@ -318,7 +318,8 @@ fn one_sender_at_a_time() {
         assert_eq!(s.sent, 2);
         assert!(!lock.exists(), "the holder's own release clears it");
     }
-    // (a lock left as a directory: cleared)
+    // (a lock left as a directory: cleared. The running holder's file goes first: only Linux's takeover above removed it)
+    let _ = std::fs::remove_file(&lock);
     std::fs::create_dir_all(&lock).unwrap();
     assert!(take_send_lock(&f));
     assert_eq!(lock_read(&lock).map(|l| l.0), Some(std::process::id()));

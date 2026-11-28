@@ -547,7 +547,7 @@ pub fn unpack(pack: &[u8], cache: &Path) -> Result<Unpacked> {
         current.push(cache.join("tools").join(format!("{}-{}", &m.name["tools/".len()..], &m.sha[..16])));
     }
     for d in &current {
-        let _ = std::fs::write(d.join(USED), b"");
+        crate::storage::mark_used(d);
     }
     Ok(Unpacked { dir, hash, files, tools, fresh })
 }

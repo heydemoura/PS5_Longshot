@@ -70,7 +70,7 @@ pub fn install(rust: &Path, version: &str, parts: &[Part], progress: &dyn Fn(f64
         // (the downloads are in the installed folder now)
         let _ = build_core::fsx::remove_tree(&downloads);
     }
-    let _ = std::fs::write(dir.join(build_driver::sources::USED), b"");
+    build_driver::storage::mark_used(&dir);
     progress(1.0);
     Ok((dir, downloaded))
 }
