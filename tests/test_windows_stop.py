@@ -55,6 +55,7 @@ void hos_crash_clean_end(void) { assert(order == 3); order = 4; clean_ends++; }
 void hos_fs_wait_writes(void) { assert(order == 1); }
 void hos_input_movie_close(void) { assert(order == 1); }   /* (an input recording's end, before the log's flush) */
 void hos_ab_end(void) { assert(order == 2); }   /* (host/hos_ab.c: the A/B's sums after the close work, before the flush) */
+void game_close_log(void) { assert(order == 2); }   /* (game/game.h: the game's last log lines, before the flush) */
 static void relaunch(void) { assert(order == 4); restarted++; }
 static void ExitProcess(unsigned code) { assert(order == 4 && code == 0); exited++; }
 /* ACTUAL_FINISH */

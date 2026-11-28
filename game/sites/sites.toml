@@ -167,6 +167,199 @@ can_return = true
 shape = "data"
 thread = "worker"
 
+# Havok cloth on host code with HOS_NATIVE_CLOTH (game/oot_cloth.c, game/cloth_*.cpp): a kernel does a pass or a loop of
+# the cloth's step with the game's exact results, or declines and the lifted code runs it. Three whole functions are
+# entry sites; each loop's site jumps to the loop's way out when the host did the loop. The *End sites at those ways out
+# are events set only in check mode (hos_oot_cloth_init, with hos_site_set): there the lifted loop's result is compared.
+[[site]]
+name = "cloth.bend"
+doc = "The cloth's bending pass is about to run (w0 the records); a callback that answers non-zero has done it"
+can_return = true
+shape = "data"
+thread = "worker"
+args = ["w0:u32:count", "x1:ptr:slots", "x3:ptr:records"]
+
+[[site]]
+name = "cloth.anchor"
+doc = "The cloth's skinned-anchor pass is about to run (x0 the constraint); a callback that answers non-zero has done it"
+can_return = true
+shape = "data"
+thread = "worker"
+args = ["x0:ptr:constraint", "x1:ptr:slots", "x3:ptr:skin"]
+
+[[site]]
+name = "cloth.matrices"
+doc = "Prepare Matrices is about to run (w4 the count, x5 the output); a callback that answers non-zero has done it"
+can_return = true
+shape = "data"
+thread = "worker"
+args = ["x0:ptr:matrix", "w4:u32:count", "x5:ptr:out"]
+
+[[site]]
+name = "cloth.links"
+doc = "A link constraint set's loop is set up, its first record next (w9 the count): non-zero, the host did every record"
+at = "jump"
+shape = "data"
+thread = "worker"
+args = ["x20:ptr:set", "w9:u32:count"]
+
+[[site]]
+name = "cloth.linksEnd"
+doc = "A link constraint set's loop has ended (its way out)"
+at = "before"
+shape = "event"
+thread = "worker"
+
+[[site]]
+name = "cloth.bendLinks"
+doc = "A bend link set's loop is set up, its first record next (w9 the count): non-zero, the host did every record"
+at = "jump"
+shape = "data"
+thread = "worker"
+args = ["x20:ptr:set", "w9:u32:count"]
+
+[[site]]
+name = "cloth.bendLinksEnd"
+doc = "A bend link set's loop has ended (its way out)"
+at = "before"
+shape = "event"
+thread = "worker"
+
+[[site]]
+name = "cloth.tethers"
+doc = "A tether set's loop is set up, its first record next (w9 the count): non-zero, the host did every record"
+at = "jump"
+shape = "data"
+thread = "worker"
+args = ["x20:ptr:set", "w9:u32:count"]
+
+[[site]]
+name = "cloth.tethersEnd"
+doc = "A tether set's loop has ended (its way out)"
+at = "before"
+shape = "event"
+thread = "worker"
+
+[[site]]
+name = "cloth.boxes"
+doc = "updateAabbs' particle loop is about to be set up (x20 the instance): non-zero, the host did the loop"
+at = "jump"
+shape = "data"
+thread = "worker"
+args = ["x20:ptr:instance"]
+
+[[site]]
+name = "cloth.boxesEnd"
+doc = "updateAabbs' particle loop has ended (its way out)"
+at = "before"
+shape = "event"
+thread = "worker"
+
+[[site]]
+name = "cloth.cull"
+doc = "The capsule collidable's cull loop is about to be set up (w22 the particles): non-zero, the host did the loop"
+at = "jump"
+shape = "data"
+thread = "worker"
+args = ["x19:ptr:instance", "x20:ptr:particles", "w22:u32:count"]
+
+[[site]]
+name = "cloth.cullEnd"
+doc = "The capsule collidable's cull loop has ended (its way out)"
+at = "before"
+shape = "event"
+thread = "worker"
+
+[[site]]
+name = "cloth.verlet"
+doc = "_integrateTask's Verlet loop is about to be set up (w25 the particles): non-zero, the host did the loop"
+at = "jump"
+shape = "data"
+thread = "worker"
+args = ["x22:ptr:instance", "w25:u32:count"]
+
+[[site]]
+name = "cloth.verletEnd"
+doc = "_integrateTask's Verlet loop has ended (its way out)"
+at = "before"
+shape = "event"
+thread = "worker"
+
+[[site]]
+name = "cloth.capsule"
+doc = "The capsule collision is about to enter its record loop (x12 the records' end): non-zero, on to the loop's way out"
+at = "jump"
+shape = "data"
+thread = "worker"
+args = ["x20:ptr:collidable", "x12:u64:end"]
+
+[[site]]
+name = "cloth.capsuleRecordsEnd"
+doc = "The capsule collision's record loop has ended (its way out), before the particles left over (count & 15)"
+at = "before"
+shape = "event"
+thread = "worker"
+
+[[site]]
+name = "cloth.capsuleTail"
+doc = "The capsule collision is about to enter its loop of the particles left over (w9 = count & 15): non-zero, all done"
+at = "jump"
+shape = "data"
+thread = "worker"
+args = ["w9:u32:rest", "x15:ptr:instance"]
+
+[[site]]
+name = "cloth.capsuleEnd"
+doc = "The capsule collision is about to return (its way out)"
+at = "before"
+shape = "event"
+thread = "worker"
+
+[[site]]
+name = "cloth.sphere"
+doc = "The sphere collision is about to enter its record loop (x12 the records' end): non-zero, on to the loop's way out"
+at = "jump"
+shape = "data"
+thread = "worker"
+args = ["x20:ptr:collidable", "x12:u64:end"]
+
+[[site]]
+name = "cloth.sphereRecordsEnd"
+doc = "The sphere collision's record loop has ended (its way out), before the particles left over (count & 15)"
+at = "before"
+shape = "event"
+thread = "worker"
+
+[[site]]
+name = "cloth.skin"
+doc = "Object Space Deform's block loop is at a block (w10 the block, w9 the blocks): non-zero, the host did every block"
+at = "jump"
+shape = "data"
+thread = "worker"
+args = ["x1:ptr:block", "w10:u32:index", "w9:u32:blocks"]
+
+[[site]]
+name = "cloth.skinEnd"
+doc = "Object Space Deform's block loop has ended (its way out)"
+at = "before"
+shape = "event"
+thread = "worker"
+
+[[site]]
+name = "cloth.bones"
+doc = "Mesh Bone Deform's bone loop is about to be set up (x19, x21 the operator's objects): non-zero, the host did the loop"
+at = "jump"
+shape = "data"
+thread = "worker"
+args = ["x19:ptr:operator", "x21:ptr:mesh"]
+
+[[site]]
+name = "cloth.bonesEnd"
+doc = "Mesh Bone Deform's bone loop has ended (its way out)"
+at = "before"
+shape = "event"
+thread = "worker"
+
 # A movie's frame count above a 60 cap (issue 1742; host/nn_vi.c hos_movie_frames, through game/oot_sites.c).
 [[site]]
 name = "movie.frameCount"

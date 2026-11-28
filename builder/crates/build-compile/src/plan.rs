@@ -462,10 +462,16 @@ fn zstd_units(l: &Layout, cc: &Path, flags: &[String]) -> Vec<Unit> {
 /// containers' maps, the prompts).
 const ZSTD_HOST: [&str; 2] = ["hos_zstd.c", "zs.c"];
 
+/// The game's C++ (`game/*.cpp`) is compiled with the host's flags and these: C++ that needs nothing of the C++
+/// runtime, no exceptions, no RTTI. The game is linked by the C driver (lib.rs, the C++ one only for Tracy's client),
+/// so a game C++ file may use templates, constexpr and the compiler's intrinsics, not new, throw, typeid or the
+/// standard library's compiled parts.
+const GAME_CXX: [&str; 3] = ["-std=c++17", "-fno-exceptions", "-fno-rtti"];
+
 /// The host's C files the game compiles: host/'s own (not pgo_rt.c, the renderer's profile counters' writer, compiled
 /// into the renderer alone; on Linux not the Windows window, movies and wgpu stand-in; dav1d's movies only with dav1d),
 /// the game's, `game/` beside `host/` (compiled as the host's, with its flags, into the same game binary:
-/// game/README.md), and on Linux the POSIX stand-ins.
+/// game/README.md; its C++ too, `game/*.cpp`, with [`GAME_CXX`]), and on Linux the POSIX stand-ins.
 pub(crate) fn host_sources(host: &Path, posix: &Path, linux: bool, dav1d: bool) -> Vec<PathBuf> {
     let mut srcs = sorted_files(host, |f| {
         f.ends_with(".c")
@@ -474,7 +480,8 @@ pub(crate) fn host_sources(host: &Path, posix: &Path, linux: bool, dav1d: bool) 
             && (f != "dav1d_av1.c" || dav1d)
     });
     if let Some(tree) = host.parent() {
-        srcs.extend(sorted_files(&tree.join("game"), |f| f.ends_with(".c")));
+        // (game/ alone has C++: the cloth kernels)
+        srcs.extend(sorted_files(&tree.join("game"), |f| f.ends_with(".c") || f.ends_with(".cpp")));
         // (and its Insert menu rows, game/menu/: data the renderer's menu adds, through MkwVkHost's game_menu_rows)
         srcs.extend(sorted_files(&tree.join("game").join("menu"), |f| f.ends_with(".c")));
     }
@@ -525,8 +532,14 @@ fn plan_host(
             Some(d) if d == game_menu_dir.as_path() => "game_menu_",
             _ => "host_",
         };
-        let obj = format!("{}{}.o", prefix, &name[..name.len() - 2]);
+        // (the object is named after the file without its extension, .c or .cpp)
+        let stem = src.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        let cxx = src.extension().is_some_and(|e| e == "cpp");
+        let obj = format!("{prefix}{stem}.o");
         let mut f = hf.clone();
+        if cxx {
+            f.extend(s(&GAME_CXX));
+        }
         f.push(opus_inc.clone());
         if let Some(ff) = &p.ffmpeg_windows {
             f.push(inc(&ff.join("include")));
@@ -545,7 +558,8 @@ fn plan_host(
             name,
             module: Module::Game,
             kind: Kind::Tree,
-            compiler: tc.cc.clone(),
+            // (clang++, or clang itself where it is the C++ driver too: a .cpp is compiled as C++ by its extension)
+            compiler: if cxx { tc.cxx.clone() } else { tc.cc.clone() },
             source: src,
             object: l.obj.join(obj),
             flags: f,

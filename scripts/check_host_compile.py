@@ -58,15 +58,15 @@ def rejoin(words):
 
 
 def host_commands(plan_text):
-    """[(source, command)] of the plan's units whose source is the host's C"""
+    """[(source, command)] of the plan's units whose source is the host's C or the game's (game/: its C and C++)"""
     out, lines = [], plan_text.splitlines()
-    host = os.path.join(ROOT, "host") + os.sep
+    dirs = tuple(os.path.join(ROOT, d) + os.sep for d in ("host", "game"))
     for i, line in enumerate(lines):
         if not line.startswith(FATES) or i + 1 >= len(lines) or not lines[i + 1].startswith("    "):
             continue
         cmd = rejoin(lines[i + 1].split())
         src = next((a for a in cmd if a.endswith((".c", ".cpp")) and not a.startswith("-")), None)
-        if src and os.path.normpath(src).startswith(host):
+        if src and os.path.normpath(src).startswith(dirs):
             out.append((src, cmd))
     return out
 

@@ -58,8 +58,10 @@ about Ocarina of Time is in `game/` ([its README](../../../game/README.md)). The
 
 `tests/test_game_boundary.py` checks both sides. Each hook is a plain C function; a table of function pointers is used
 only where the host keeps one already (the control bridge's `HosControlGame`). The game's C is compiled with the
-host's flags into the same game binary, and the game's Rust is linked into it through `longshot-rs`, the one
-staticlib: two would each carry Rust's standard library. A player's build compiles no Rust: the release carries a
+host's flags into the same game binary; its C++ (`game/*.cpp`) too, with `-std=c++17 -fno-exceptions -fno-rtti`
+added, and since the C driver links the game it may use nothing of the C++ runtime (no `new`, `throw`, `typeid` or
+the standard library's compiled parts). The game's Rust is linked into it through `longshot-rs`, the one staticlib:
+two would each carry Rust's standard library. A player's build compiles no Rust: the release carries a
 `liblongshot_rs.a` of the tree's Rust sources for each platform (`builder/crates/build-compile/src/rust.rs`).
 
 ### From dump to game folder
