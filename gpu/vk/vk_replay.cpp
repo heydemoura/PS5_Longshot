@@ -6123,7 +6123,7 @@ namespace {
 static bool acquire_ahead_wanted();   // (acquire ahead: every driver, RX_VK_ACQUIRE_AHEAD; after present_image)
 static void acquire_ahead(VkSwapchainKHR sc, uint64_t generation);
 bool present_thread_on();
-void present_hand_off(uint32_t index, VkFence done, uint64_t reflex_id, OutputTrialFrame trial);
+void present_hand_off(uint32_t index, VkFence done, uint64_t reflex_id, uint64_t antilag_id, OutputTrialFrame trial);
 void present_finish(VkResult res, bool on_presenter);
 std::atomic<bool> presenter_surface_lost{false};   // (the presenter thread's present: VK_ERROR_SURFACE_LOST_KHR, for present_image)
 }  // namespace
@@ -6796,9 +6796,11 @@ static bool present_out(uint32_t index, std::unique_lock<decltype(dev.present_mu
     if (hand_off) {
         const uint64_t reflex_id = pi.pNext ? static_cast<const VkPresentIdKHR*>(pi.pNext)->pPresentIds[0] : 0;
         if (reflex_id) reflex_present_handed_off();
-        antilag_present();   // (AMD Anti-Lag 2: the frame's present stage)
+        // (AMD Anti-Lag 2: snapshot the frame index now before the next input stage advances it; presenter_loop fires PRESENT right before vkQueuePresentKHR; skip the lock when unavailable)
+        const uint64_t antilag_id = !antilag_available() ? 0
+            : antilag_present_frame == kAntiLagThisFrame ? antilag_frame() : antilag_present_frame;
         qk.unlock();
-        present_hand_off(index, present_copy_done, reflex_id, frame);
+        present_hand_off(index, present_copy_done, reflex_id, antilag_id, frame);
         return true;   // (taken as shown: only present_commit's presents, never handed over, read it)
     }
     if (present_thread_on()) {   // (one handed over before, made first: the presents in order; the queue's lock let go meanwhile)
@@ -6897,6 +6899,7 @@ struct Presenter {
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkFence done = VK_NULL_HANDLE;   // (the copy's fence)
     uint64_t reflex_id = 0;          // (NVIDIA Reflex's present id for it, 0 none: present_out)
+    uint64_t antilag_id = 0;         // (AMD Anti-Lag 2's frame index for it, 0 none: present_out)
     uint64_t generation = 0;         // (dev.swapchain_generation of swapchain)
     bool ahead = false;              // (acquire ahead after it: present_image's present_acquire_ahead; a drain that gave up clears it)
     OutputTrialFrame trial;
@@ -6941,6 +6944,7 @@ void presenter_loop() {
         const VkSwapchainKHR sc = presenter.swapchain;
         const VkFence done = presenter.done;
         const uint64_t reflex_id = presenter.reflex_id;
+        const uint64_t antilag_id = presenter.antilag_id;
         const uint64_t generation = presenter.generation;
         const OutputTrialFrame trial = presenter.trial;
         lk.unlock();
@@ -6973,6 +6977,11 @@ void presenter_loop() {
             pi.swapchainCount = 1;
             pi.pSwapchains = &sc;
             pi.pImageIndices = &index;
+            if (antilag_id) {
+                antilag_present_frame = antilag_id;
+                antilag_present();
+                antilag_present_frame = kAntiLagThisFrame;
+            }
             {   // (on the queue the presents use (the replay's, or the Present queue row's), its lock held for the call only:
                 // the copy is done by now, so the call does not wait for the GPU (NVIDIA's driver on Linux would, ~4.5 ms, with
                 // the replay's submits held behind it). Lock order: the queue's, then presenter_queue_mu (the swapchain's)
@@ -7060,7 +7069,7 @@ bool presenter_wait_idle(std::unique_lock<std::mutex>& lk, int limit_ms = 0) {
     return true;
 }
 /// The present of image index, whose copy signals done, to the presenter thread (started at the first), once the one before is made
-void present_hand_off(uint32_t index, VkFence done, uint64_t reflex_id, OutputTrialFrame trial) {
+void present_hand_off(uint32_t index, VkFence done, uint64_t reflex_id, uint64_t antilag_id, OutputTrialFrame trial) {
 #ifdef TRACY_ENABLE
     HT_SCOPE("present_hand_off");
 #endif
@@ -7072,6 +7081,7 @@ void present_hand_off(uint32_t index, VkFence done, uint64_t reflex_id, OutputTr
     presenter_wait_idle(lk);   // (the frame before's present made: one out at most; the presenter's own waits are bounded)
     presenter.index = index, presenter.swapchain = dev.swapchain, presenter.done = done, presenter.busy = true;
     presenter.reflex_id = reflex_id;
+    presenter.antilag_id = antilag_id;
     presenter.generation = dev.swapchain_generation, presenter.ahead = present_acquire_ahead;
     presenter.trial = trial;
     presenter.copy_done_at = 0;

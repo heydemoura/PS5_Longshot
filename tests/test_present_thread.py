@@ -43,7 +43,7 @@ def main():
     need("static_cast<const VkPresentIdKHR*>(pi.pNext)->pPresentIds[0]" in hand and
          "if (reflex_id) reflex_present_handed_off();" in hand,
          "with NVIDIA Reflex the present's id is not handed over with it, or the game's thread keeps its present marker")
-    need("present_hand_off(index, present_copy_done, reflex_id, frame);" in out, "the present is handed over without its Reflex id")
+    need("present_hand_off(index, present_copy_done, reflex_id, antilag_id, frame);" in out, "the present is handed over without its Reflex or Anti-Lag id")
     need("qk.unlock();" in hand, "the queue's lock is held while the game's thread hands a present over")
     rest = out[out.index("present_hand_off("):]
     need("qk.unlock();\n        present_thread_drain();\n        qk.lock();" in rest and
@@ -61,7 +61,7 @@ def main():
     need("present_out(p.index, qk);" in commit and "present_copy_done" not in commit,
          "frame generation's paced presents are handed over")
 
-    give = block(replay, "void present_hand_off(uint32_t index, VkFence done, uint64_t reflex_id, OutputTrialFrame trial) {")
+    give = block(replay, "void present_hand_off(uint32_t index, VkFence done, uint64_t reflex_id, uint64_t antilag_id, OutputTrialFrame trial) {")
     idle = block(replay, "bool presenter_wait_idle(std::unique_lock<std::mutex>& lk, int limit_ms = 0) {")
     need("presenter.cv.wait(lk, idle);" in idle, "presenter_wait_idle does not wait for the presenter")
     need(give.index("presenter_wait_idle(lk);") < give.index("presenter.busy = true"),

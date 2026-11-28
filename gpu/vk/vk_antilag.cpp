@@ -15,6 +15,7 @@
 // renders on its presentation thread, and the wait holds the presentation thread, which the main thread waits for.
 #include "vk_antilag.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -26,11 +27,15 @@ namespace mkwvk {
 namespace {
 
 struct AntiLag {
-    bool have_ext = false, ready = false;
+    bool have_ext = false;
+    std::atomic<bool> ready{false};
     VkPhysicalDeviceAntiLagFeaturesAMD feature{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ANTI_LAG_FEATURES_AMD};
     PFN_vkAntiLagUpdateAMD update = nullptr;
-    bool active = false;         // (the driver was last told On)
+    bool active = false;         // (the row wanted at the last check)
+    bool need_off = false;       // (active turned false: tell the driver Off once in_flight reaches 0)
+    bool off_in_flight = false;  // (a caller is inside update(false, nullptr) outside a.mu: hold off later Mode-On calls)
     bool frame_marked = false;   // (this frame's input stage given: its present stage counts)
+    uint32_t in_flight = 0;      // (Mode-On stage calls currently inside vkAntiLagUpdateAMD outside a.mu)
     uint64_t frame = 0;          // (the frame's index, the same for both its stages)
     uint64_t since = 0;          // (the last index before the row last changed: frames up to it get no present stage)
     std::mutex mu;
@@ -42,7 +47,7 @@ AntiLag& al() {
 
 bool wanted() {
     static const char* e = getenv("RX_VK_ANTILAG");
-    return (e && *e ? atoi(e) : opts.antilag) > 0;
+    return (e && *e ? atoi(e) : menu_antilag()) > 0;
 }
 
 /// The mode to the driver, with one of the frame's stages or none (the mode alone)
@@ -54,17 +59,36 @@ void update(bool on, const VkAntiLagPresentationInfoAMD* stage) {
     al().update(dev.device, &d);
 }
 
-/// With a.mu held: the row on, and the extension and its feature. Turning off tells the driver once
+/// With a.mu held: the row on, and the extension and its feature. Turning off marks need_off so the last caller out tells the
+/// driver once outside a.mu. While an Off call is in flight, later On calls wait for the next frame so Mode-On cannot overtake Off
 bool on() {
     AntiLag& a = al();
-    if (!a.ready) return false;
+    if (!a.ready.load(std::memory_order_relaxed) || a.off_in_flight) return false;
     const bool want = wanted();
     if (want != a.active) {
-        if (!want) update(false, nullptr);
-        a.active = want, a.frame_marked = false, a.since = a.frame;
+        a.active = want, a.need_off = !want, a.frame_marked = false, a.since = a.frame;
         logf("vk: AMD Anti-Lag 2: %s", want ? "on" : "off");
     }
     return want;
+}
+
+/// With a.mu held: claims the single Off driver call once no Mode-On stage call or earlier Off call is in flight
+bool take_off() {
+    AntiLag& a = al();
+    if (!a.active && a.need_off && !a.in_flight && !a.off_in_flight) {
+        a.need_off = false;
+        a.off_in_flight = true;
+        return true;
+    }
+    return false;
+}
+
+/// Tells the driver Off outside a.mu, then releases off_in_flight so a later On transition can start strictly after Off returns
+void send_off() {
+    update(false, nullptr);
+    AntiLag& a = al();
+    std::lock_guard lk(a.mu);
+    a.off_in_flight = false;
 }
 
 void stage(VkAntiLagStageAMD s, uint64_t frame) {
@@ -101,38 +125,84 @@ void antilag_device_created() {
         return;
     }
     a.update = (PFN_vkAntiLagUpdateAMD)vkGetDeviceProcAddr(dev.device, "vkAntiLagUpdateAMD");
-    a.ready = a.update != nullptr;
-    logf("vk: AMD Anti-Lag 2: %s", a.ready ? "available (VK_AMD_anti_lag)" : "its function is missing: off");
+    const bool ok = a.update != nullptr;
+    a.ready.store(ok, std::memory_order_release);
+    logf("vk: AMD Anti-Lag 2: %s", ok ? "available (VK_AMD_anti_lag)" : "its function is missing: off");
 }
 
-bool antilag_available() { return al().ready; }
+bool antilag_available() { return al().ready.load(std::memory_order_acquire); }
 
 thread_local uint64_t antilag_present_frame = kAntiLagThisFrame;
 
 uint64_t antilag_frame() {
     AntiLag& a = al();
-    std::lock_guard lk(a.mu);
-    return on() && a.frame_marked ? a.frame : 0;
+    if (!a.ready.load(std::memory_order_acquire)) return 0;
+    bool turn_off = false;
+    uint64_t f = 0;
+    {
+        std::lock_guard lk(a.mu);
+        if (on() && a.frame_marked) f = a.frame;
+        else turn_off = take_off();
+    }
+    if (turn_off) send_off();
+    return f;
 }
 
 void antilag_present() {
     AntiLag& a = al();
-    std::lock_guard lk(a.mu);
-    if (!on()) return;
-    const uint64_t f = antilag_present_frame == kAntiLagThisFrame ? (a.frame_marked ? a.frame : 0) : antilag_present_frame;
-    // (none: a made frame, or no input stage yet; a frame from before the row was last turned on had its input stage in
-    // the driver's earlier run)
-    if (!f || f <= a.since) return;
+    if (!a.ready.load(std::memory_order_acquire)) return;
+    bool turn_off = false;
+    uint64_t f = 0;
+    {
+        std::lock_guard lk(a.mu);
+        if (on()) {
+            f = antilag_present_frame == kAntiLagThisFrame ? (a.frame_marked ? a.frame : 0) : antilag_present_frame;
+            // (none: a made frame, or no input stage yet; a frame from before the row was last turned on had its input stage in
+            // the driver's earlier run)
+            if (f <= a.since) f = 0;
+            if (f) a.in_flight++;
+        } else {
+            turn_off = take_off();
+        }
+    }
+    if (turn_off) {
+        send_off();
+        return;
+    }
+    if (!f) return;
     stage(VK_ANTI_LAG_STAGE_PRESENT_AMD, f);
+    {
+        std::lock_guard lk(a.mu);
+        --a.in_flight;
+        on();
+        turn_off = take_off();
+    }
+    if (turn_off) send_off();
 }
 
 void antilag_input() {
     AntiLag& a = al();
-    std::lock_guard lk(a.mu);
-    if (!on()) return;
-    a.frame++;
-    stage(VK_ANTI_LAG_STAGE_INPUT_AMD, a.frame);   // (the driver's wait, when it wants one)
-    a.frame_marked = true;
+    if (!a.ready.load(std::memory_order_acquire)) return;
+    bool turn_off = false;
+    uint64_t f = 0;
+    {
+        std::lock_guard lk(a.mu);
+        if (on()) a.frame_marked = false, f = ++a.frame, a.in_flight++;
+        else turn_off = take_off();
+    }
+    if (turn_off) {
+        send_off();
+        return;
+    }
+    if (!f) return;
+    stage(VK_ANTI_LAG_STAGE_INPUT_AMD, f);   // (the driver's wait, when it wants one; a.mu dropped so presents never wait on it)
+    {
+        std::lock_guard lk(a.mu);
+        --a.in_flight;
+        if (on() && a.frame == f && f > a.since) a.frame_marked = true;
+        else turn_off = take_off();
+    }
+    if (turn_off) send_off();
 }
 
 } // namespace mkwvk

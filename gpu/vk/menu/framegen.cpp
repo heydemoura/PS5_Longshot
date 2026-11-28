@@ -8,6 +8,7 @@
 #include "framegen_rows.h"
 
 #ifndef MENU_LAYOUT_ONLY
+#include <atomic>
 #include "menu/framegen.h"
 #include "vk_antilag.h"
 #include "vk_dlss.h"
@@ -25,6 +26,13 @@ namespace mkwvk {
 namespace fgr = framegen_rows;
 
 #ifndef MENU_LAYOUT_ONLY
+namespace {
+std::atomic<int> live_antilag{0};
+}
+
+void menu_antilag_changed(int on) { live_antilag.store(on, std::memory_order_relaxed); }
+int menu_antilag() { return live_antilag.load(std::memory_order_relaxed); }
+
 const char* tx_framegen(int v) {
     // (Auto, chosen: who makes its frames now (vk_framegen.cpp framegen_maker, as the FPS counter names it). NVIDIA DLSS FG
     // makes fixed multipliers only, so they are AMD FSR 3.1's or the built-in one's; none made lately (the game keeps up with
@@ -291,7 +299,8 @@ MENU_MODULE(framegen) {
               .preset_exempt = true,
               .shown = MENU_HOOK([] { return antilag_available(); }),
               .text = MENU_HOOK([](int v) { return std::string(tx_antilag(v)); }),
-              .hint = MENU_HOOK(hn_antilag)});
+              .hint = MENU_HOOK(hn_antilag),
+              .on_change = MENU_HOOK(menu_antilag_changed)});
     menu::tab("debug")
         .row({.key = "frame_pacing",
               .label = "Frame pacing",

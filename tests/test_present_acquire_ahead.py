@@ -298,7 +298,7 @@ void presenter_run() {   // (the presenter thread's turn: the present handed ove
     std::unique_lock<std::mutex> lk(presenter.mu);
     if (!presenter.busy) return;
 @@LOOP_HEAD@@
-    (void)done, (void)reflex_id;
+    (void)done, (void)reflex_id, (void)antilag_id;
     (void)trial;
     presenter_presented = false;
     const bool copied = true;
@@ -312,7 +312,7 @@ bool present_out(uint32_t index, std::unique_lock<QueueLock>& qk, OutputTrialSou
     if (!qk.owns_lock()) problem("the present made without the queue's lock");
     if (!present_copy_done) problem("present_image's present without its copy's fence: not handed to the presenter");
     qk.unlock();
-    present_hand_off(index, present_copy_done, 0, {trial.generation});
+    present_hand_off(index, present_copy_done, 0, 0, {trial.generation});
     if (presenter.trial.generation != trial.generation) problem("trial receipt lost at hand-over");
     return true;
 }
@@ -715,7 +715,7 @@ def fixture(replay, windows, mode):
     idle = block(replay, "bool presenter_wait_idle(std::unique_lock<std::mutex>& lk, int limit_ms = 0) {")
     idle = (idle.replace("presenter.cv.wait_for(lk, std::chrono::milliseconds(limit_ms), idle)", "model_wait(lk, idle)")
                 .replace("presenter.cv.wait(lk, idle);", "if (!model_wait(lk, idle)) problem(\"a hand-over waits without end\");"))
-    hand = block(replay, "void present_hand_off(uint32_t index, VkFence done, uint64_t reflex_id, OutputTrialFrame trial) {")
+    hand = block(replay, "void present_hand_off(uint32_t index, VkFence done, uint64_t reflex_id, uint64_t antilag_id, OutputTrialFrame trial) {")
     hand = hand.replace('::mkwvk::cxx_escape::spawn_needed("presenter", presenter_loop);', "")
     drain = block(replay, "bool present_thread_drain() {")
     loop = block(replay, "void presenter_loop() {")

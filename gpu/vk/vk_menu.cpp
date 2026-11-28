@@ -4351,6 +4351,7 @@ void menu_init() {
     first_start = !has_options;
     sim_turf_settings_init();
     menu_colour_vision_changed(opts.colour_vision);
+    menu_antilag_changed(opts.antilag);
     menu_sync_hud_placement();
     sync_transition_autosave();
     grass_distance_now.store(opts.grass_distance, std::memory_order_relaxed);
@@ -5804,6 +5805,7 @@ void menu_tick() {
         }
     }
     fps_level_now.store(fps_stats::level_of(opts.show_fps), std::memory_order_relaxed);   // (what vk_fps.cpp measures)
+    menu_antilag_changed(opts.antilag);   // (what vk_antilag.cpp reads across presentation threads)
     if (opts.show_fps) {
         static int64_t next = 0, last_game = 0, last_shown = 0;
         const int64_t now = prof_now();

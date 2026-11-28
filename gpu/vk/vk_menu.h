@@ -191,6 +191,9 @@ int menu_vsync();
 /// The persisted colour correction mode, shared between menu edits and presentation.
 void menu_colour_vision_changed(int mode);
 int menu_colour_vision_mode();
+/// The live AMD Anti-Lag 2 row, shared atomically between menu edits and presentation threads.
+void menu_antilag_changed(int on);
+int menu_antilag();
 /// (longshot) The Threaded rendering row as this run resolved it, once, at the start (threaded_rendering.h's rule: On, or what
 /// Auto picks for this PC), in its two halves: menu_render_thread, the render thread (On; Auto from 4 cores when buffer pools
 /// are mirrored), and menu_recorder_thread, the recorder thread (On; Auto from 4 cores with mirrors, or alone with serial
