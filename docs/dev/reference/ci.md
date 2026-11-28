@@ -1,7 +1,7 @@
 # CI
 
-CI is Forgejo Actions (`.forgejo/workflows/`): it runs the checks, publishes the releases and deploys the website. No
-check needs the game: every one is game-free.
+CI is Forgejo Actions (`.forgejo/workflows/`): it runs the checks; [MagicBeanAdmin/Release](https://git.magicbean.dev/MagicBeanAdmin/Release) publishes the releases and
+deploys the website. No check needs the game: every one is game-free.
 
 **Run CI's checks yourself:** `mise run ci` runs what CI checks on every change: the pinned test tools (`test-deps`),
 every game-free check (`tests/run_all.py --strict`, the same line CI runs in parts) and the website's build and checks
@@ -13,8 +13,9 @@ image itself ([below](#the-ci-images)).
 
 Nothing that publishes a file or a package is made here: [MagicBeanAdmin/Release](https://git.magicbean.dev/MagicBeanAdmin/Release), on runners registered to
 that repository alone, builds, signs and publishes the releases ([`longshot.yml`](https://git.magicbean.dev/MagicBeanAdmin/Release/src/branch/main/.forgejo/workflows/longshot.yml),
-[releases](releases.md#the-release-workflow)), pushes [the CI images](#the-ci-images) ([`longshot-ci-image.yml`](https://git.magicbean.dev/MagicBeanAdmin/Release/src/branch/main/.forgejo/workflows/longshot-ci-image.yml)) and uploads the build
-tools ([`longshot-tools.yml`](https://git.magicbean.dev/MagicBeanAdmin/Release/src/branch/main/.forgejo/workflows/longshot-tools.yml), [bumping a tool](releases.md#bumping-a-tool)).
+[releases](releases.md#the-release-workflow)), pushes [the CI images](#the-ci-images) ([`longshot-ci-image.yml`](https://git.magicbean.dev/MagicBeanAdmin/Release/src/branch/main/.forgejo/workflows/longshot-ci-image.yml)) uploads the build
+tools ([`longshot-tools.yml`](https://git.magicbean.dev/MagicBeanAdmin/Release/src/branch/main/.forgejo/workflows/longshot-tools.yml), [bumping a tool](releases.md#bumping-a-tool)) and deploys the website
+([`longshot-website.yml`](https://git.magicbean.dev/MagicBeanAdmin/Release/src/branch/main/.forgejo/workflows/longshot-website.yml), [its previews](#the-websites-preview)).
 
 | Workflow | When | What it does |
 |---|---|---|
@@ -22,7 +23,6 @@ tools ([`longshot-tools.yml`](https://git.magicbean.dev/MagicBeanAdmin/Release/s
 | `pr-description.yml` | Pull request (opened, edited, pushed) | The title (a Conventional Commit) and the description against the template (`scripts/check_pr_description.py`), with main's script: no code of the pull request's runs. The title is here, not in `ci.yml`, because a title edit runs this file, and an edit's run of `ci.yml` would cancel the code's checks |
 | `third-party.yml` | Nightly, by hand | The third-party parts compared with their upstream archives (`check_third_party.py --upstream`); the per-change check is `ci.yml`'s `third-party` |
 | `tools-check.yml` | By hand (any branch) | Check tools: the build tools named made twice from their pins (`builder/tools/make.sh --check`) on a check runner, nothing uploaded ([bumping a tool](releases.md#bumping-a-tool)) |
-| `website.yml` | Push to `main` that changes the site's sources, hourly, pull request | Deploys longshot.magicbean.dev (hourly too, for the progress data the build collects); a pull request that changes the site's sources gets a preview: `ci.yml`'s `website` job builds it once and keeps `dist/` as `website-dist-<head commit>`, and main's code uploads those files ([scripts/ci_website_dist.py](../../../scripts/ci_website_dist.py)) |
 | `vulkan-dlss.yml` | By hand | The Windows Vulkan back end built with NVIDIA's DLSS SDK and AMD FSR 4 |
 | `vulkan-fixtures.yml` | By hand | The authored Vulkan fixtures on Mesa's software driver |
 
@@ -34,8 +34,7 @@ started under Wine. The labels the workflows ask for, all on the image `docker:/
 | Label | For |
 |---|---|
 | `ubuntu-latest`, `ubuntu-24.04` | the checks. No secrets: a runner anyone in the team lends can carry these |
-| `quick` | jobs of a few minutes (`changes`, `lint`, `third-party`, the title and description, the website preview's wait), on a runner kept for them so they never wait behind a build |
-| `deploy` | the website's deploy and preview upload. Only the server's quick runner, on the seal broker's network ([below](#secrets-only-our-runners-can-open)). A pull request's own code never runs on it |
+| `quick` | jobs of a few minutes (`changes`, `lint`, `third-party`, the title and description), on a runner kept for them so they never wait behind a build |
 
 The server's runners share 2 cores (MagicBeanDev/Infra, `runner-dind`).
 
@@ -47,8 +46,8 @@ MagicBeanDev's *Settings > Actions > Runners*, and run `forgejo-runner daemon`. 
 
 Each runner keeps its own cache (forgejo-runner's, on its disk): `ci.yml`'s jobs read it on every run and write it only
 on a push to `main`. forgejo-runner 13 keeps a pull request's writes to that pull request (its write isolation key), so a
-pull request can't put anything there that another run reads. The jobs that sign or publish a release, and the
-website's deploy, read no cache at all; the jobs that build a release read only [their own](#the-releases-cache).
+pull request can't put anything there that another run reads. The jobs that sign or publish a release read no cache at
+all; the jobs that build a release read only [their own](#the-releases-cache).
 
 | Cache (key) | What it holds | Who reads it |
 |---|---|---|
@@ -129,65 +128,34 @@ A skipped job is not a failed one: `main` requires no status checks, and Tooling
 
 ### The website's preview
 
-A pull request that changes the site's sources (`website/`, `docs/`, `CONTRIBUTING.md`, `website.yml`) gets a preview
-of the built site, a version of the Worker with the alias `pr-<number>`. The site is built once, by `ci.yml`'s
-`website` job (`pull_request`, no secrets), which keeps `dist/` as the artifact `website-dist-<head commit>`.
-`website.yml` runs from `main` (`pull_request_target`), for a pull request from a branch of Longshot on every push, or
-for a fork's when a maintainer adds the label `preview` after reading it, in two jobs:
+A pull request that changes the site's sources (`website/`, `docs/`, `CONTRIBUTING.md`) gets a preview of the built site,
+a version of the Worker with the alias `pr-<number>`, and the link is posted on it. The site is built once, by `ci.yml`'s
+`website` job (`pull_request`, no secrets), which keeps `dist/` as the artifact `website-dist-<head commit>`. The upload
+is MagicBeanAdmin/Release's [`longshot-website-preview.yml`](https://git.magicbean.dev/MagicBeanAdmin/Release/src/branch/main/.forgejo/workflows/longshot-website-preview.yml):
+Release's workflows never run on a pull request, so MagicBeanDev/Infra's `release-trigger` starts it from the pull
+request's webhook, with its number and head commit, once that artifact is kept. It is for a pull request from a branch
+of Longshot on every push, or for a fork's when a maintainer adds the label `preview` after reading it (the label approves
+the commit the pull request is at, and comes off after the run, so a later push needs it again). Release asks the forge
+for the pull request as it is then (open, to main, that commit, changing what the site reads, the label), takes only the
+artifact of `ci.yml`'s `pull_request` run at that commit, as files (a link, an absolute name or `..` is refused, the
+number and size are capped), and uploads it beside main's `wrangler.jsonc` and Worker script with its own pinned
+Wrangler. Nothing of the pull request is checked out or run where the Cloudflare token is; a change to the Worker itself
+shows in its preview only once merged. If the `website` job failed or was cancelled, there is no preview.
 
-- `preview-wait` (`quick`, no secrets): main's [scripts/ci_website_dist.py](../../../scripts/ci_website_dist.py)
-  waits, up to 30 minutes and saying so each minute, for that artifact. Only one of `ci.yml`'s `pull_request` run at
-  the pull request's head commit counts. If the website job failed or was cancelled, there is no preview.
-- `preview-upload` (`deploy`, `enable-openid-connect`): checks out main, takes the artifact as files only (a link, an
-  absolute path or `..` is refused), and uploads it with main's wrangler and `wrangler.jsonc` and the sealed Cloudflare
-  token; then it posts the link on the pull request and takes the label off. It never runs the pull request's code:
-  nothing of the pull request is checked out or executed there, so the token is opened only beside main's code.
+### The website's deploy
 
-### Secrets only our runners can open
+[`longshot-website.yml`](https://git.magicbean.dev/MagicBeanAdmin/Release/src/branch/main/.forgejo/workflows/longshot-website.yml) builds the site from main (`scripts/website_check.sh`: `npm ci`, the Astro build
+and its checks) in a job with no secrets, and deploys that `dist/` in another, the only one with the Cloudflare token,
+which runs nothing of this repository. It runs after a push to `main` (release-trigger) and every hour, for the
+progress data the build collects.
 
-A label only routes a job: a runner says its own labels each time it starts, so anyone's runner can ask for `deploy`,
-and Forgejo hands it the job and the job's secrets. So the secrets that sign or deploy are kept in
-Forgejo **sealed** ([scripts/ci_secret.sh](../../../scripts/ci_secret.sh), AES-256 with PBKDF2), and the key that
-opens them, `seal.key`, is on the server only, in the **seal broker** (MagicBeanDev/Infra's README, *The seal
-broker*). The broker hands it to a job of **main or a `v*` tag** and to no other, and it knows which run a job is from
-by the ID token Forgejo signs for the job, not by anything the workflow says: a workflow on another branch, or a pull
-request's copy of one, sets its own env, steps and container, and a label only routes it. A job that unseals:
+### Secrets
 
-- has `enable-openid-connect: true` (that job only: any step of it can ask for the token) and
-  `SEAL_BROKER_PIN: ${{ vars.SEAL_BROKER_PIN }}` (the broker's pinned key, an organization variable);
-- runs `scripts/ci_secret.sh unseal`, which fetches the key from the broker the first time (to `$RUNNER_TEMP`);
-- runs only code of main or the tag: a job that checks out a pull request must not turn on `enable-openid-connect`.
-  The website's preview is for that reason built by `ci.yml` (`pull_request`, no secrets), and main's code takes its
-  `dist/` as files and uploads it from `deploy` (`website.yml`).
-
-The broker gives the key to `push` on main or a `v*` tag, `schedule` and `workflow_dispatch` on main, and
-`pull_request_target` (main's own workflow file) for Longshot only; anything else gets a refusal that says why. This
-rests on main and the `v*` tags being protected: whoever may push to main or push a `v*` tag may have the key.
-
-- A runner that takes such a job and can't reach the broker (anyone else's) gets text it can't open: the job fails, and
-  signs or deploys nothing.
-- A job of a branch, or of a pull request, gets no key, on any runner.
-
-| Secret (organization) | Sealed | Used by |
-|---|---|---|
-| `CLOUDFLARE_API_TOKEN_SEALED` | the Cloudflare token | `website.yml`, deploy and preview |
-| `PREVIEW_COMMENT_TOKEN_SEALED` | optional, a Forgejo token with `write:issue` | `website.yml`, the preview's comment on a fork's PR |
-
-`CLOUDFLARE_ACCOUNT_ID` is not sealed: it opens nothing. To seal a secret, on a PC you trust with a copy of `seal.key`:
-`scripts/ci_secret.sh seal --key seal.key < release.pem`, and paste the line into the Forgejo secret. A new
-`seal.key` (`scripts/ci_secret.sh newkey`) means sealing every secret again.
-
-What sealing doesn't cover:
-
-- A pull request's or a branch's run may still ask for `deploy` and run there: it gets no key, but it shares the runner
-  (and its Docker) with the real deploy jobs. A fork's run waits for a maintainer's approval: read its `.forgejo/`
-  changes before you approve one, and don't mark a fork's author as always trusted.
-- A job's own token (`forgejo.token`) comes with every job, whichever runner takes it, and on a push it may write to
-  the repository (releases, tags).
-
-What the `deploy` jobs run is kept to what they need, since every step of such a job can read what it mounts:
-
-- A secret, sealed or the job's token, is given in the `env:` of the steps that use it, never the job's.
+None is kept here. The signing key, the packages token and the Cloudflare token are ordinary secrets of
+[MagicBeanAdmin/Release](https://git.magicbean.dev/MagicBeanAdmin/Release), whose runners are registered to that repository alone and whose workflows run only on a
+schedule or by hand, so no job of a branch or a pull request here reaches them. The jobs here run with the job's own
+token (`forgejo.token`), which on a push may write to the repository (releases, tags): none of the jobs that run a pull
+request's code is given more.
 
 Lend runners only to people you'd trust that far.
 

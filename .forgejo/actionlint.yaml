@@ -1,7 +1,7 @@
 # actionlint's settings for the workflows here (ci.yml, "Workflow lint"): it knows GitHub, not Forgejo.
 self-hosted-runner:
-  # (docs/dev/reference/ci.md: quick is the label of the short jobs' runner, deploy of the jobs that deploy)
-  labels: [quick, deploy]
+  # (docs/dev/reference/ci.md: quick is the label of the short jobs' runner)
+  labels: [quick]
 paths:
   .forgejo/workflows/*.yml:
     ignore:
@@ -9,5 +9,3 @@ paths:
       - 'specifying action ".+" in invalid format because owner and repo and ref should not be empty'
       # (Forgejo's own context, as github)
       - 'undefined variable "forgejo"'
-      # (Forgejo's: a job's ID token for the seal broker)
-      - 'unexpected key "enable-openid-connect" for "job" section'
