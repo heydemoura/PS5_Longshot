@@ -807,11 +807,13 @@ __attribute__((constructor)) void hos_ps5_clock_init(void) {
     fprintf(stderr, "[ps5] clock: the time stamp counter at %llu Hz\n", (unsigned long long)hz);
 }
 
-/* The game's package on the console: HOS_PS5_NUP, else the copy an emulator there already keeps, so one 25 GB file serves
-   both: EglantinePS5's folder (under the name its dump has), PS5_Lichii's, then the one that had before 2026-11-10 (when
-   none is there, the first, for the message). */
+/* The game's package on the console: HOS_PS5_NUP, else Longshot's own folder (/data/longshot/oot.nup: a player with no
+   emulator installed has nowhere else to put it, and the player's longshot_env.txt takes no paths), else the copy an
+   emulator there already keeps, so one 25 GB file serves both: EglantinePS5's folder (under the name its dump has),
+   PS5_Lichii's, then the one that had before 2026-11-10 (when none is there, the first, for the message). */
 const char *hos_ps5_nup(void) {
     static const char *const places[] = {
+        "/data/longshot/oot.nup",
         "/data/eglantineps5/roms/The Legend of Zelda Ocarina of Time [0400486024dec000][v131072].nup",
         "/data/eglantineps5/roms/oot.nup", "/data/lichii/roms/oot/oot.nup", "/data/prosperoeden/roms/oot/oot.nup"};
     const char *set = getenv("HOS_PS5_NUP");

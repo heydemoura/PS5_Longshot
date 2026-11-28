@@ -1,7 +1,7 @@
 // (longshot) A temporal upscaler in place of OoT's gameplay upscale network: the frame chain (vk_temporal.h), shared by the
 // engines that draw with it, NVIDIA DLSS (vk_dlss.cpp), AMD FSR 4 (vk_fsr4.cpp) and Intel XeSS (vk_xess.cpp).
-// The chain is hckrman101's, from their NVIDIA DLSS (#841): the camera, the inputs pass, the actor motion and the jitter's
-// state, moved here from vk_dlss.cpp unchanged in what they do, so that DLSS and FSR share them.
+// The chain was NVIDIA DLSS's: the camera, the inputs pass, the actor motion and the jitter's state, here so that DLSS and
+// FSR share them.
 //
 // OoT has no temporal upscaler of its own: its scene is drawn at a lower size and a network of its own (the program
 // fd029a317a9a4b94 at 3/4, another for each other share; one dispatch, cooperative matrices) scales it up, from the
@@ -20,9 +20,18 @@
 //    vertex skinned with this frame's bones and the frame before's, so their pixels get their own motion. Their poses are
 //    copied on the GPU from where the game has them into two buffers that take turns; a pixel is the draw's where its depth is
 //    the scene's (within RX_VK_DLSS_ACTOR_TOL steps, default 64). What moves without bones (particles, water, foliage moved in
-//    its vertex shader, mesh-shader draws) keeps the camera's motion. RX_VK_DLSS_ACTORS=0: camera motion alone.
+//    its vertex shader, mesh-shader draws) keeps the camera's motion.
+//  - hidden meshes (vk_draw.cpp hidden_depth_draw, hidden_mesh.h): the game goes on drawing a skinned mesh into the
+//    scene's depth after it stops showing it (Link, with the camera pushed into him), so those depth draws are left out:
+//    the depth and the actor motion then have no invisible body in front of the room. RX_VK_DLSS_FADED=0: drawn.
 //  - the engine scales them to the output's size; shaders/dlss_out.comp squares that back to linear colour into the
 //    network's output.
+//  - (longshot) NVIDIA DLAA, the scene at the output's size, runs before the game's bloom and tone map instead
+//    (temporal_pre_bloom; pre_bloom.h has the frame's passes and how the place is learned): on the scene's linear colour, a
+//    feature made for HDR colour with its own exposure, its picture written back into the scene. The bloom, the tone map and
+//    the passes after them then take the anti-aliased scene, and the network's dispatch becomes a copy, as with the Upscaler's
+//    Off at 100%. A frame with no learned place runs it at the network as before. Only with the Upscaler's DLAA before the
+//    bloom row on (off by default; RX_VK_DLSS_PRE_BLOOM over it for a run).
 // Anything unexpected (no camera this frame, other sizes, the engine not there or failing) leaves the network to run, the
 // reason in the log when it changes.
 // Unless RX_VK_PSYCHOV35_DLSS=0, also takes Native PsychoV35's RGBA16F input/output with the supported HDR engines
@@ -41,6 +50,7 @@
 // in it); =alternate: every other frame the game's own upscale (a test's reference beside the engine's). (The names are
 // DLSS's from before FSR came: they apply to every engine of the chain, FSR 3.1 on it too.)
 #include "vk_temporal.h"
+#include "upscale_route.h"   // (the FPS counter footer's record of the gameplay upscale as drawn)
 
 #include <algorithm>
 #include <atomic>
@@ -56,14 +66,19 @@
 #include <vector>
 
 #include "dlss_actor.h"
+#include "longshot_env.h"
 #include "dlss_checks.h"
 #include "dlss_math.h"
+#include "hidden_mesh.h"
+#include "pre_bloom.h"
 #include "temporal_jitter.h"
 #include "upscaler_rows.h"
 #include "vk_dlss.h"
 #include "vk_draw.h"
 #include "fsr3_math.h"   // (longshot: FSR 3.1's depth constants from the projection)
 #include "vk_fsr3.h"   // (fsr3_wanted: AMD FSR 3.1 upscales with inputs of its own; fsr3_engine: on this chain)
+#include "vk_fsr3_inputs.h"   // (longshot: take_motion, this chain's motion for FSR 3.1's frame interpolation)
+#include "vk_fsr3fi.h"        // (frames_wanted: that interpolation is asked for)
 #include "vk_fsr4.h"
 #include "vk_xess.h"
 #include "xess_rules.h"
@@ -76,6 +91,7 @@
 #include "shaders/dlss_out_comp_spv.h"
 #include "shaders/dlss_out_rgba_comp_spv.h"
 #include "shaders/dlss_prep_comp_spv.h"
+#include "reshade/fx_runtime.h"
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk {
@@ -127,6 +143,23 @@ bool temporal_off() { return opts.dlss == ur::OFF && temporal_mode() == ur::GAME
 bool temporal_full_scale() { return ur::full_scale(temporal_mode()); }
 
 namespace {
+/// (longshot) DLAA before the game's bloom and tone map (temporal_pre_bloom) now, the mode being DLAA: the Upscaler's DLAA
+/// before the bloom row (opts.dlss_pre_bloom, off by default; RX_VK_DLSS_PRE_BLOOM over it for a run, vk_menu.cpp). Read at
+/// each call, the row changing at once; a change is logged
+bool pre_bloom_wanted(int mode) {
+    const bool asked = opts.dlss_pre_bloom != 0;
+    static std::atomic<int> told{-1};
+    const int now = asked ? 1 : 0;
+    if (told.exchange(now, std::memory_order_relaxed) != now)
+        logf("vk: upscaler: NVIDIA DLAA %s", now == 0 ? "after the game's bloom and tone map (DLAA before the bloom: off)"
+                                                      : "before the game's bloom and tone map (DLAA before the bloom: on)");
+    return asked && mode == ur::DLAA;
+}
+}  // namespace
+
+bool temporal_hdr_input() { return pre_bloom_wanted(temporal_mode()); }
+
+namespace {
 
 struct Image {
     VkImage image = VK_NULL_HANDLE;
@@ -134,8 +167,19 @@ struct Image {
     VkImageView view = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0, height = 0;
-    TemporalImage shown() const { return {image, view, format, width, height}; }
+    VkImageUsageFlags usage = 0;
+    TemporalImage shown() const { return {image, view, format, width, height, usage}; }
 };
+
+void stage_barrier(VkCommandBuffer cmd, VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
+                   VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = src_stage, b.srcAccessMask = src_access;
+    b.dstStageMask = dst_stage, b.dstAccessMask = dst_access;
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.memoryBarrierCount = 1, di.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &di);
+}
 
 struct Camera {
     float current[16]{};      // (its view-projection)
@@ -147,7 +191,14 @@ struct Camera {
     uint64_t depth_gen = 0;   // (texture_destroy_generation when taken: a depth texture destroyed since is not used)
     uint64_t frame = 0;       // (texture_frame_no when taken)
     VkFormat scene_format = VK_FORMAT_UNDEFINED;
+    const Texture* color = nullptr;   // (longshot: the scene's colour target, for DLAA before the bloom: temporal_pre_bloom)
     bool valid = false;
+};
+
+struct SceneDepth {
+    Texture* texture = nullptr;
+    uint32_t width = 0, height = 0;
+    uint64_t generation = 0, frame = 0;
 };
 
 /// An engine as the chain keeps it: started once, failed for good once
@@ -173,6 +224,10 @@ struct State {
     VkDescriptorSetLayout prep_hdr_set = VK_NULL_HANDLE, out_hdr_set = VK_NULL_HANDLE;
     VkPipelineLayout prep_hdr_layout = VK_NULL_HANDLE, out_hdr_layout = VK_NULL_HANDLE;
     VkPipeline prep_hdr = VK_NULL_HANDLE, out_hdr = VK_NULL_HANDLE;
+    // (longshot) dlss_prep.comp for the scene before its tone map (temporal_pre_bloom): linear light already, taken as it is
+    VkDescriptorSetLayout prep_lin_set = VK_NULL_HANDLE;
+    VkPipelineLayout prep_lin_layout = VK_NULL_HANDLE;
+    VkPipeline prep_lin = VK_NULL_HANDLE;
     VkDescriptorSetLayout out_rgba_set = VK_NULL_HANDLE;
     VkPipelineLayout out_rgba_layout = VK_NULL_HANDLE;
     VkPipeline out_rgba = VK_NULL_HANDLE;
@@ -183,19 +238,42 @@ struct State {
     bool psycho_last = false; // A tone mapper or input encoding change discards temporal history.
     VkFormat history_input = VK_FORMAT_UNDEFINED;
     Camera cam;               // (this frame's, since the last upscale)
+    SceneDepth reshade_depth; // The upscale consumes the camera before the post-processing pass can use its depth.
     // (the gameplay upscale's output, as last seen: the scene sizes the upscaler can take follow from it,
     // temporal_scene_size. Read on the game's draws without the lock)
     std::atomic<uint32_t> out_w{0}, out_h{0};
     std::atomic<uint64_t> last_frame{0};   // (the frame an engine last drew: read on the game's thread too)
+    std::atomic<uint64_t> asked_frame{0};  // (longshot: the frame the game last asked for its gameplay upscale, temporal_scene_now)
     float last_jitter[2]{};   // (its camera's jitter: the frame before's, for the next one)
     float last_vp[16]{};      // (its camera's view-projection: the frame before's)
     TemporalJitter jitter;    // (one completed scene size, sequence and frame)
     std::unordered_map<VkImage, VkImageView> depth_views;
     uint64_t depth_views_gen = 0;
+    // (longshot) DLAA before the bloom (temporal_pre_bloom, pre_bloom.h): this frame's passes, the place learned from the frame
+    // before, the frame it last ran in (the network then copies), and the scene's colour views (sampled and stored in one)
+    pre_bloom::Frame pre;
+    uint64_t pre_frame = 0;            // (the frame `pre` lists)
+    pre_bloom::Trigger pre_trigger;
+    uint64_t pre_drawn = 0;
+    bool pre_last = false;             // (the last evaluation was before the bloom: a change of place starts a new history)
+    bool pre_last_told = false;        // (the place of the picture last logged: route_told)
+    const char* pre_reason = nullptr;  // (why it ran at the network instead, as last logged)
+    uint64_t status_pre = 0;           // (since the last status line: frames it drew before the bloom)
+    std::unordered_map<VkImage, VkImageView> color_views;
+    uint64_t color_views_gen = 0;
+    // (read on every draw without the lock: the scene's colour target while DLAA before the bloom is wanted this frame)
+    std::atomic<const Texture*> pre_scene{nullptr};
+    std::atomic<uint64_t> pre_scene_frame{0};
     const char* reason = nullptr;
     int reason_repeats = 0;
     const TemporalEngine* told_first = nullptr;
     bool told_camera = false;
+    // (longshot) frame generation's inputs with no engine drawing (fg_inputs, temporal_fg_inputs): their own camera history,
+    // apart from the engine's, so neither takes the other's frame before for its own
+    float fg_last_vp[16]{};
+    float fg_last_jitter[2]{};
+    uint64_t fg_last_frame = 0;
+    bool fg_told = false;
     // (actor motion: the skinned draws into the scene since the last upscale; the poses the engine last drew, by draw: the
     // frame before's, where they were copied to in one of the two pose buffers (each frame's poses go to the other one))
     struct Skin {
@@ -343,7 +421,7 @@ bool make_image(VkCommandBuffer cmd, Image& im, VkFormat format, uint32_t w, uin
         destroy_image(im.image, im.memory);
         return im = {}, false;
     }
-    im.format = format, im.width = w, im.height = h;
+    im.format = format, im.width = w, im.height = h, im.usage = ic.usage;
     VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};   // (UNDEFINED -> GENERAL, once)
     b.srcStageMask = VK_PIPELINE_STAGE_2_NONE, b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
     b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
@@ -393,7 +471,7 @@ bool make_pipeline(const uint32_t* code, size_t size, const VkDescriptorType* ty
 /// The two passes' pipelines and the samplers, once (temporal_upscale stops trying when this fails)
 bool make_pipelines() {
     State& s = st();
-    if (s.prep && s.prep_hdr && s.out && s.out_hdr && s.point && s.linear) return true;
+    if (s.prep && s.prep_hdr && s.prep_lin && s.out && s.out_hdr && s.point && s.linear) return true;
     if (!dev.push_descriptor || !vkCmdPushDescriptorSetKHR) return false;
     const VkDescriptorType S = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, I = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     const VkDescriptorType prep_types[5] = {S, S, I, I, I}, out_types[2] = {S, I};
@@ -419,6 +497,13 @@ bool make_pipelines() {
         return false;
     if (!s.out_hdr && !make_pipeline(BUILTIN_SPV_ARGS(DLSS_OUT_COMP_SPV), out_types, 2, 8, s.out_hdr_set,
                                      s.out_hdr_layout, s.out_hdr, &out_hdr_spec))
+        return false;
+    // (longshot) the scene before its tone map (temporal_pre_bloom): linear light, not squared (kSquare off), with the HDR
+    // ceiling, for a feature made for HDR colour; its picture goes back by out_hdr, as it is
+    static const PrepSpec prep_lin_data{16384.0f, VK_FALSE};
+    static const VkSpecializationInfo prep_lin_spec{2, prep_hdr_entries, sizeof prep_lin_data, &prep_lin_data};
+    if (!s.prep_lin && !make_pipeline(BUILTIN_SPV_ARGS(DLSS_PREP_COMP_SPV), prep_types, 5, 84, s.prep_lin_set,
+                                      s.prep_lin_layout, s.prep_lin, &prep_lin_spec))
         return false;
     VkSamplerCreateInfo si{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     si.magFilter = si.minFilter = VK_FILTER_NEAREST;
@@ -470,6 +555,29 @@ VkImageView depth_view(Texture* t) {
     VkImageView v = VK_NULL_HANDLE;
     if (vkCreateImageView(dev.device, &vc, nullptr, &v) != VK_SUCCESS) v = VK_NULL_HANDLE;
     s.depth_views[t->image] = v;
+    return v;
+}
+
+/// (longshot) A view of the scene's colour target in its own format, level 0, to sample and to store into (temporal_pre_bloom:
+/// the engine's picture written back into it). Made once per image, as depth_view's
+VkImageView color_view(const Texture* t) {
+    State& s = st();
+    const uint64_t gen = texture_destroy_generation();
+    if (gen != s.color_views_gen) {   // (a texture was destroyed: its image's view may be stale)
+        auto old = std::move(s.color_views);
+        s.color_views.clear();
+        later([old] {
+            for (const auto& [image, view] : old) vkDestroyImageView(dev.device, view, nullptr);
+        });
+        s.color_views_gen = gen;
+    }
+    if (auto it = s.color_views.find(t->image); it != s.color_views.end()) return it->second;
+    VkImageViewCreateInfo vc{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vc.image = t->image, vc.viewType = VK_IMAGE_VIEW_TYPE_2D, vc.format = t->format;
+    vc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkImageView v = VK_NULL_HANDLE;
+    if (vkCreateImageView(dev.device, &vc, nullptr, &v) != VK_SUCCESS) v = VK_NULL_HANDLE;
+    s.color_views[t->image] = v;
     return v;
 }
 
@@ -562,9 +670,10 @@ constexpr uint64_t kPoseBytes = 4 << 20;   // (a pose buffer: 280 bones of 48 by
 /// image over the camera's motion. Each one's pose (bones and origin), as its draw read it (temporal_note_skinned_draw),
 /// else copied on the GPU from where the game has it, goes into this frame's pose buffer, for this frame and the next.
 /// before: the frame before's camera without its jitter. history:
-/// the engine has the frame before. Returns the draws drawn
+/// the engine has the frame before. last: the frame the poses to pair with were kept at (the engine's last frame, or frame
+/// generation's inputs' last: fg_inputs), a pose of any other frame not paired. Returns the draws drawn
 int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, uint32_t rw, uint32_t rh, VkImageView dview,
-                 bool history) {
+                 bool history, uint64_t last) {
     State& s = st();
     struct Timed {
         State& s;
@@ -575,8 +684,7 @@ int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, ui
     s.skins.clear();
     std::unordered_map<uint64_t, State::Pose> old = std::move(s.poses);
     s.poses.clear();
-    static const bool off = env_switch("RX_VK_DLSS_ACTORS") == 0;
-    if (off || skins.empty() || !make_actor_pipeline()) return 0;
+    if (skins.empty() || !make_actor_pipeline()) return 0;
     for (auto& b : s.pose_buffers)
         if (!b.buffer) {
             if (!create_device_buffer(kPoseBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
@@ -703,7 +811,7 @@ int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, ui
         } else if (paired[i]) {
             it = old.find(pair_key[i]);
         }
-        if (!history || it == old.end() || it->second.frame != s.last_frame || it->second.nbones != k.nbones) {
+        if (!history || it == old.end() || it->second.frame != last || it->second.nbones != k.nbones) {
             s.actor_skipped++;
             continue;
         }
@@ -744,7 +852,9 @@ int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, ui
     std::memcpy(head + 16, before, 64);
     head[32] = cam.jitter[0], head[33] = cam.jitter[1], head[34] = (float)rw, head[35] = (float)rh;
     flush_mapped(u.memory, dlss_actor::kHeadWords * 4);
-    full_barrier(cmd);   // (the poses copied)
+    stage_barrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                  VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                  VK_ACCESS_2_SHADER_READ_BIT);   // (the poses copied)
     VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     ca.imageView = s.motion.view, ca.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -823,13 +933,14 @@ void drop_all() {
             }
     s.poses.clear(), s.skins.clear(), s.model_bones.clear();
     s.pose_bytes = {}, s.poses_time = {};
-    if (!s.depth_views.empty()) {
-        auto old = std::move(s.depth_views);
-        s.depth_views.clear();
-        later([old] {
-            for (const auto& [image, view] : old) vkDestroyImageView(dev.device, view, nullptr);
-        });
-    }
+    for (auto* views : {&s.depth_views, &s.color_views})   // (longshot: the scene's colour views too)
+        if (!views->empty()) {
+            auto old = std::move(*views);
+            views->clear();
+            later([old] {
+                for (const auto& [image, view] : old) vkDestroyImageView(dev.device, view, nullptr);
+            });
+        }
 }
 
 }  // namespace
@@ -856,7 +967,9 @@ void temporal_note_scene_draw(const Texture* color0, uint32_t width, uint32_t he
     // below: the format, the camera's own size and perspective, the largest in the frame, and the upscale's input)
     if (!color0 || !depth || !camera || camera_size < 0x230 || !temporal_scene_size(width, height)) return;
     // (with the Upscaler Off too: its stretch takes the fixed shares' networks only with the frame's scene as their input)
-    if (!temporal_scene_format(color0->format) || (!temporal_wanted() && !temporal_off())) return;
+    // (and with no engine, for frame generation's inputs: temporal_fg_inputs)
+    if (!temporal_scene_format(color0->format) || (!temporal_wanted() && !temporal_off() && !temporal_fg_inputs() &&
+                                                !reshade::depth_requested.load(std::memory_order_relaxed))) return;
     State& s = st();
     std::lock_guard lk(s.mu);
     const uint64_t now = texture_frame_no();
@@ -882,7 +995,17 @@ void temporal_note_scene_draw(const Texture* color0, uint32_t width, uint32_t he
     k.fov_y = plain ? 2.0f * std::atan(1.0f / p11) : 0.0f;
     k.width = width, k.height = height, k.depth = depth, k.depth_gen = texture_destroy_generation(), k.frame = now;
     k.scene_format = color0->format;
+    k.color = color0;
     k.valid = true;
+    if (reshade::depth_requested.load(std::memory_order_relaxed))
+        s.reshade_depth = {depth, width, height, k.depth_gen, now};
+    // (longshot) DLAA before the bloom: the scene at the output's size (as last seen: a frame that changed it runs DLAA at the
+    // network), and this frame's pass list started (temporal_pre_bloom)
+    const bool pre = pre_bloom_wanted(temporal_mode()) && width == s.out_w.load(std::memory_order_relaxed) &&
+                     height == s.out_h.load(std::memory_order_relaxed);
+    if (s.pre_frame != now) s.pre = {}, s.pre_frame = now;
+    s.pre_scene_frame.store(pre ? now : 0, std::memory_order_relaxed);
+    s.pre_scene.store(pre ? color0 : nullptr, std::memory_order_relaxed);
 }
 
 bool temporal_scene_size(uint32_t width, uint32_t height) {
@@ -929,15 +1052,22 @@ int temporal_status(char* b, size_t n) {
     if (engine) snprintf(feature, sizeof feature, ", its own %llu MB", (unsigned long long)(engine >> 20));
     char passed[64] = "";
     if (s.status_passed) snprintf(passed, sizeof passed, ", %llu left to the game's network", (unsigned long long)s.status_passed);
-    snprintf(b, n, "; %s: %llu frames drawn%s, %llu made, jitter %+.3f %+.3f px%s, actor motion %llu draws in %llu "
+    char pre[64] = "";   // (longshot: DLAA before the game's bloom and tone map, temporal_pre_bloom)
+    if (s.status_pre) snprintf(pre, sizeof pre, " (%llu before the bloom)", (unsigned long long)s.status_pre);
+    snprintf(b, n, "; %s: %llu frames drawn%s%s, %llu made, jitter %+.3f %+.3f px%s, actor motion %llu draws in %llu "
              "frames (%.3f ms CPU a frame; poses %llu read at the draw, %llu copied later), its images %llu MB%s",
-             name_of(mode), (unsigned long long)s.status_drawn, passed, (unsigned long long)s.engines_made,
+             name_of(mode), (unsigned long long)s.status_drawn, pre, passed, (unsigned long long)s.engines_made,
              s.status_jitter[0], s.status_jitter[1], s.status_motion ? "" : " (no motion)",
              (unsigned long long)draws, (unsigned long long)frames, frames ? s.actor_ns / 1e6 / (double)frames : 0.0,
              (unsigned long long)s.poses_read, (unsigned long long)s.poses_copied, (unsigned long long)(own >> 20), feature);
-    s.status_draws = s.actor_draws, s.status_frames = s.actor_frames, s.actor_ns = 0, s.status_drawn = s.status_passed = 0;
+    s.status_draws = s.actor_draws, s.status_frames = s.actor_frames, s.actor_ns = 0, s.status_drawn = s.status_passed = s.status_pre = 0;
     s.poses_read = s.poses_copied = 0;
     return mode;
+}
+
+bool temporal_scene_now() {
+    const uint64_t asked = st().asked_frame.load(std::memory_order_relaxed);
+    return asked && texture_frame_no() - asked <= 2;
 }
 
 void temporal_reset_failure() {
@@ -959,11 +1089,9 @@ void temporal_idle() {
     const uint64_t now = texture_frame_no();
     if (now - s.asked <= 120) return;   // (in use, or off for under 120 frames (2 s): kept, a row stepped through comes back at once)
     // (longshot, a stutter: kept too while DLSS or FSR 4 is still the Upscaler's choice. Each area change's loading screen has no
-    // gameplay upscale for 2 s and more, and DLSS's feature let go then was made again at the next area's first frame: 44-78 ms
-    // of the replay thread at every area entry (12 times in a 15-minute walk, 2026-11-10, #1520). Let go once the row leaves them.
-    // RX_VK_DLSS_IDLE_RELEASE=1: let go after 120 frames unused, as before)
-    static const bool release_idle = getenv("RX_VK_DLSS_IDLE_RELEASE") && atoi(getenv("RX_VK_DLSS_IDLE_RELEASE")) != 0;
-    if (!release_idle && temporal_wanted()) return;
+    // gameplay upscale for 2 s and more, and DLSS's feature let go then would be made again at the next area's first frame:
+    // 44-78 ms of the replay thread at every area entry. Let go once the row leaves them)
+    if (temporal_wanted()) return;
     if (s.drawing) {
         logf("vk: %s: not used for 120 frames (the last at frame %llu, now %llu): what it made and its images let go; "
              "the next upscale with it makes them again", s.drawing->name, (unsigned long long)s.asked, (unsigned long long)now);
@@ -976,9 +1104,174 @@ void temporal_idle() {
     s.holding = !s.dead.empty();
 }
 
+// ---- (longshot, smoothness) DLSS's feature made before the game's first 3D frame (vk_temporal.h temporal_prewarm_on) ----
+namespace {
+std::atomic<int64_t> prewarm_draws{1 << 30};   // (the last frame's draws: none known yet, not light)
+std::atomic<uint64_t> prewarm_present{0};      // (the game's last picture, width << 32 | height)
+}  // namespace
+
+bool temporal_prewarm_on() {   // (on unless RX_VK_DLSS_PREWARM is 0, off, false or no: the switches' one rule)
+    static const bool on = env_on_or("RX_VK_DLSS_PREWARM", 1);
+    return on;
+}
+void temporal_note_frame(int64_t draws) { prewarm_draws.store(draws, std::memory_order_relaxed); }
+void temporal_note_present(uint32_t width, uint32_t height) {
+    prewarm_present.store((uint64_t)width << 32 | height, std::memory_order_relaxed);
+}
+
+void temporal_prewarm(VkCommandBuffer cmd) {
+    static bool probed = false;   // (the replay thread's alone)
+    if (!probed) {
+        probed = true;
+        if (dev.offscreen && env_switch("RX_VK_PROBE_HEADLESS") != 0) {
+            logf("vk: upscaler: no window: the upscalers asked in the background as the start-up screen does "
+                 "(RX_VK_PROBE_HEADLESS=0: at the first upscale)");
+            upscalers_probe_start();
+        }
+    }
+    // (made again when the Upscaler row or the presented size changes before the game's first 3D frame: a player who picks
+    // DLSS over DLAA at the title gets DLSS's feature, not a DLAA one made for nothing. The row held for 30 frames first, so
+    // stepping through it makes none; four at the most)
+    static bool done = false;
+    static int warmed_mode = -1, seen_mode = -1, warmed_n = 0;
+    static uint64_t warmed_pic = 0, seen_since = 0;
+    if (done || !cmd || !temporal_prewarm_on()) return;
+    State& s = st();
+    // (a gameplay upscale asked for already: too late, it makes its own)
+    if (s.asked_frame.load(std::memory_order_relaxed)) {
+        done = true;
+        return;
+    }
+    const int mode = temporal_mode();
+    const uint64_t frame = texture_frame_no();
+    if (mode != seen_mode) seen_mode = mode, seen_since = frame;
+    // (a light frame: the title, the file select, a loading screen, as texture_ahead.h's kLightDraws)
+    if (prewarm_draws.load(std::memory_order_relaxed) >= 200) return;
+    if (!ur::is_dlss(mode) || frame - seen_since < 30) return;   // (another Upscaler now, or the row just changed)
+    const uint64_t pic = prewarm_present.load(std::memory_order_relaxed);
+    if (mode == warmed_mode && pic == warmed_pic) return;   // (made for this already)
+    const int ngx = dlss_ngx_ready();
+    if (ngx < 0) return;   // (NGX not started yet: the probe's thread starts it)
+    const uint32_t ow = (uint32_t)(pic >> 32), oh = (uint32_t)pic;
+    if (ngx == 0 || !ow || !oh) {
+        if (ngx == 0) done = true;
+        return;
+    }
+    std::lock_guard lk(s.mu);
+    if (s.asked || (s.drawing && warmed_mode < 0)) return void(done = true);
+    warmed_mode = mode, warmed_pic = pic;
+    if (++warmed_n >= 4) done = true;
+    const auto t0 = std::chrono::steady_clock::now();
+    Engine& engine = engine_of(mode);
+    if (!engine.e || engine.failed) return;
+    if (!engine.started) engine.started = true, engine.ok = engine.e->start();
+    if (!engine.ok) return;
+    if (!make_pipelines()) return;
+    (void)make_actor_pipeline();
+    // (the size the scene will have: the output's for DLAA, and for DLSS the full size too, which its scaled mode's range
+    // holds (vk_dlss.cpp prepare): the Render resolution's Auto starts each area at full size)
+    const bool native = ur::full_scale(mode);
+    const uint32_t rw = ow, rh = oh;
+    struct Disturbed {
+        ~Disturbed() { descriptors_disturbed(); }
+    } disturbed;
+    full_barrier(cmd);
+    uint32_t iw = rw, ih = rh;
+    const char* why = nullptr;
+    const int ready = engine.e->prepare(cmd, rw, rh, ow, oh, native, &iw, &ih, &why);
+    if (ready <= 0) {
+        logf("vk: %s: not made ahead (%s)", name_of(mode), why ? why : "not now");
+        return;
+    }
+    s.drawing = engine.e;   // (temporal_idle lets it go if the row leaves DLSS before the game draws)
+    s.holding = true;
+    s.last_frame = 0;       // (the first gameplay frame starts a new history)
+    const VkImageUsageFlags copied = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    if (!make_image(cmd, s.color, VK_FORMAT_R16G16B16A16_SFLOAT, iw, ih, VK_IMAGE_USAGE_TRANSFER_DST_BIT) ||
+        !make_image(cmd, s.depth, VK_FORMAT_R32_SFLOAT, iw, ih, copied) ||
+        !make_image(cmd, s.motion, VK_FORMAT_R16G16_SFLOAT, iw, ih, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | copied) ||
+        !make_image(cmd, s.output, VK_FORMAT_R16G16B16A16_SFLOAT, native ? rw : ow, native ? rh : oh,
+                    VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+        logf("vk: %s: made ahead, its images were not", name_of(mode));
+        return;
+    }
+    // (one evaluation, a new history, on cleared images: NGX's first-evaluation work and the driver's for its kernels done
+    // here too. Its picture goes nowhere; the first gameplay frame's is a new history again)
+    full_barrier(cmd);
+    const VkClearColorValue zero{};
+    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    for (const Image* im : {&s.color, &s.depth, &s.motion, &s.output})
+        vkCmdClearColorImage(cmd, im->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &range);
+    full_barrier(cmd);
+    // (not named f: tests/test_temporal_history.py takes the first `f.reset =` in this file as draw_engine's)
+    TemporalFrame warm;
+    warm.color = s.color.shown(), warm.depth = s.depth.shown(), warm.motion = s.motion.shown(), warm.output = s.output.shown();
+    warm.render_w = rw, warm.render_h = rh;
+    warm.reset = true;
+    warm.jitter_phases = (uint32_t)dlss_jitter_phases(rw, rh, native ? rw : ow, native ? rh : oh);
+    const bool evaluated = engine.e->evaluate(cmd, warm);
+    full_barrier(cmd);
+    logf("vk: %s: its feature made ahead of the game's first 3D frame for %ux%u (%.1f ms of the replay's, a light frame%s; "
+         "RX_VK_DLSS_PREWARM)",
+         name_of(mode), ow, oh, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+         evaluated ? ", one evaluation" : ", its evaluation failed");
+}
+
+// ---- (longshot) the depth draws of hidden meshes (vk_draw.cpp hidden_depth_draw has the why) ----
+int temporal_hidden_mesh_mode() {
+    static const int mode = [] {
+        const bool rule = env_switch("RX_VK_DLSS_FADED") != 0;          // (unset: on)
+        const bool detail = env_switch("RX_VK_DLSS_FADED_LOG") == 1;   // (unset: off)
+        if (rule)
+            logf("vk: upscaler: faded: while a temporal upscaler or frame generation draws, the depth draws of a skinned mesh "
+                 "that had colour and has had none for %u frames are left out until its colour is back (RX_VK_DLSS_FADED=0 "
+                 "draws them)", hidden_mesh::kHiddenAfter);
+        else
+            logf("vk: upscaler: faded: RX_VK_DLSS_FADED=0: hidden meshes' depth draws are drawn");
+        return (rule ? 1 : 0) | (detail ? 2 : 0);
+    }();
+    return mode;
+}
+
+bool temporal_scene_depth_is(const Texture* depth) {
+    State& s = st();
+    std::lock_guard lk(s.mu);
+    return depth && s.cam.valid && s.cam.depth == depth && s.cam.frame == texture_frame_no();
+}
+
+VkImageView temporal_reshade_depth(uint32_t width, uint32_t height) {
+    State& s = st();
+    std::lock_guard lk(s.mu);
+    const auto& scene = s.reshade_depth;
+    static const char* previous = nullptr;
+    const auto missing = [](const char* reason) -> VkImageView {
+        if (reason != previous) {
+            previous = reason;
+            logf("vk: ReShade: waiting for gameplay depth (%s)", reason);
+        }
+        return {};
+    };
+    // As in temporal_upscale, a present between replay batches can advance the frame counter here.
+    if (!scene.texture || texture_frame_no() - scene.frame > 1) return missing("no current camera");
+    if (scene.generation != texture_destroy_generation()) return missing("texture generation changed");
+    auto* depth = scene.texture;
+    if (!depth->image || !(depth->usage & VK_IMAGE_USAGE_SAMPLED_BIT) ||
+        !(depth->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) || depth->samples != VK_SAMPLE_COUNT_1_BIT ||
+        depth->width != scene.width || depth->height != scene.height) return missing("depth attachment not sampleable");
+    if (!dlss_checks::scene_size_fits(scene.width, scene.height, width, height) ||
+        std::abs(double(scene.width) / width - double(scene.height) / height) > 0.02)
+        return missing("depth does not cover the output");
+    const auto view = depth_view(depth);
+    if (!view) return missing("cannot make a depth-only view");
+    depth->last_frame = texture_frame_no();
+    depth->last_value = std::max(depth->last_value, vk_retirement_value());
+    return view;
+}
+
 void temporal_note_skinned_draw(const SkinnedDraw& k) {
-    static const bool off = env_switch("RX_VK_DLSS_ACTORS") == 0;
-    if (off || !temporal_wanted() || !k.depth || !k.bones || k.bones_size < 48 || !k.object || k.object_size < 0x4c) return;
+    if ((!temporal_wanted() && !temporal_fg_inputs()) || !k.depth || !k.bones || k.bones_size < 48 || !k.object ||
+        k.object_size < 0x4c)
+        return;
     State& s = st();
     const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
     // (the time this draw's actor motion costs, less the time it waited for the lock: another thread's work there is counted
@@ -1040,6 +1333,43 @@ void temporal_note_skinned_draw(const SkinnedDraw& k) {
 }
 
 namespace {
+/// The network's input (in_view: square-root encoded) into its output (out, ow x oh), squared back to linear colour and
+/// stretched with a linear filter, at the same size a copy (shaders/dlss_out.comp). The Upscaler's Off (stretch), and the network
+/// after DLAA ran before the bloom (temporal_upscale). With the chain's lock held; false: its shader was not made
+bool stretch_record(VkCommandBuffer cmd, VkImageView in_view, const Texture* out, VkImageView out_view, uint32_t ow, uint32_t oh) {
+    State& s = st();
+    const bool rgba = out->format == VK_FORMAT_R16G16B16A16_SFLOAT;
+    if (!make_pipelines() || (rgba && !make_rgba_stretch())) return false;
+    struct Disturbed {   // (the program's descriptor pushes are gone from the bind point and are pushed again)
+        ~Disturbed() { descriptors_disturbed(); }
+    } disturbed;
+    full_barrier(cmd);   // (the scene's colour, written before)
+    const int32_t pc[2] = {(int32_t)ow, (int32_t)oh};
+    const VkDescriptorImageInfo info[2] = {{s.linear, in_view, VK_IMAGE_LAYOUT_GENERAL},
+                                           {VK_NULL_HANDLE, out_view, VK_IMAGE_LAYOUT_GENERAL}};
+    VkWriteDescriptorSet w[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+    w[0].dstBinding = 0, w[0].descriptorCount = 1, w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w[0].pImageInfo = &info[0];
+    w[1].dstBinding = 1, w[1].descriptorCount = 1, w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    w[1].pImageInfo = &info[1];
+    const VkPipeline pipe = rgba ? s.stretch_rgba : s.out;
+    const VkPipelineLayout layout = rgba ? s.stretch_rgba_layout : s.out_layout;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 2, w);
+    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    vkCmdDispatch(cmd, (ow + 7) / 8, (oh + 7) / 8, 1);
+    full_barrier(cmd);
+    return true;
+}
+
+/// (the FPS counter's footer, upscale_route.h) An engine or Off's stretch recorded the picture: rw x rh of the 3D into ow x oh
+static void route_drawn(upscale_route::Route route, int engine, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh) {
+    if (!upscale_route::wanted()) return;
+    upscale_route::Sample r;
+    r.route = route, r.engine = engine, r.in_w = rw, r.in_h = rh, r.out_w = ow, r.out_h = oh;
+    upscale_route::publish(r);
+}
+
 /// The Upscaler's Off: the gameplay upscale's input stretched into its output, in place of the network (temporal_upscale's
 /// dispatches, found the same way). known: one of the gameplay networks by its key; else a network of that shape, taken only
 /// when its input is this frame's scene (the camera temporal_note_scene_draw took) and its output the picture. true: written
@@ -1061,30 +1391,11 @@ bool stretch(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, VkImage
         note_output(out, out_level);
     }
     s.cam.valid = false;   // (each frame's own camera)
-    if (!make_pipelines() || (rgba && !make_rgba_stretch())) {
+    if (!stretch_record(cmd, in_view, out, out_view, ow, oh)) {
         static bool told = false;
         if (!told) told = true, logf("vk: upscaler: Off: its shader was not made: the game's upscale runs");
         return false;
     }
-    struct Disturbed {   // (the program's descriptor pushes are gone from the bind point and are pushed again)
-        ~Disturbed() { descriptors_disturbed(); }
-    } disturbed;
-    full_barrier(cmd);   // (the scene's colour, written before)
-    const int32_t pc[2] = {(int32_t)ow, (int32_t)oh};
-    const VkDescriptorImageInfo info[2] = {{s.linear, in_view, VK_IMAGE_LAYOUT_GENERAL},
-                                           {VK_NULL_HANDLE, out_view, VK_IMAGE_LAYOUT_GENERAL}};
-    VkWriteDescriptorSet w[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
-    w[0].dstBinding = 0, w[0].descriptorCount = 1, w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    w[0].pImageInfo = &info[0];
-    w[1].dstBinding = 1, w[1].descriptorCount = 1, w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-    w[1].pImageInfo = &info[1];
-    const VkPipeline pipe = rgba ? s.stretch_rgba : s.out;
-    const VkPipelineLayout layout = rgba ? s.stretch_rgba_layout : s.out_layout;
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
-    vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 2, w);
-    vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
-    vkCmdDispatch(cmd, (ow + 7) / 8, (oh + 7) / 8, 1);
-    full_barrier(cmd);
     // (the log: once, and again at another size, as the dynamic resolution or the Render resolution row moves it)
     static uint64_t told = 0;
     static VkFormat told_format = VK_FORMAT_UNDEFINED;
@@ -1094,83 +1405,193 @@ bool stretch(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, VkImage
         logf("vk: upscaler: Off: network %016llx left out, its input stretched linearly (%ux%u -> %ux%u), %s output",
              (unsigned long long)key, in->width, in->height, ow, oh, rgba ? "RGBA16F" : "packed");
     }
+    route_drawn(upscale_route::Route::Stretch, ur::OFF, in->width, in->height, ow, oh);
     return true;
 }
-}  // namespace
 
-bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, VkImageView in_view, Texture* out,
-                      VkImageView out_view, uint32_t out_level) {
-    const int mode = temporal_mode();
-    if (mode == ur::GAME) return temporal_off() && stretch(cmd, key, known, in, in_view, out, out_view, out_level);
+/// (longshot) Frame generation's inputs with no engine drawing (temporal_fg_inputs: the game's own upscaler, or the Upscaler's
+/// Off, with AMD FSR 3.1's frame interpolation asked for): the chain's motion, the camera's and the skinned draws' own
+/// (actor_motion), made as an engine's would be and handed to FSR's (vk_fsr3_inputs.h take_motion), whose own is the
+/// camera's alone. Nothing is upscaled: the network runs (or Off's stretch, after this), and no jitter is asked of the host
+/// (s.jitter is not published), so the scene is drawn as the game draws it. The same dispatches as temporal_upscale, found
+/// the same way: known, one of the gameplay networks; else one of that shape whose input is this frame's scene
+void fg_inputs(VkCommandBuffer cmd, bool known, Texture* in, VkImageView in_view, Texture* out, uint32_t out_level) {
     State& s = st();
     std::lock_guard lk(s.mu);
-    if (!known) {   // (another network of the upscale's shape: only the scene into the picture, the rest untouched and unsaid)
-        const Camera& c = s.cam;
-        // (the gameplay networks' own formats: they sample the scene's B10G11R11 colour and write the B10G11R11 picture.
-        // Other cooperative-matrix networks of the same shape (one RGBA8 into A2B10G10R10, RGB9E5 into B10G11R11) are not it)
-        if (!in || !out || !temporal_colour_pair(in->format, out->format) ||
-            (out->width >> out_level) <= in->width)
-            return false;
-        note_output(out, out_level);
-        // (one in the gameplay networks' formats whose input is not this frame's scene: counted for the status line)
-        if (!c.valid || texture_frame_no() - c.frame > 1 || in->width != c.width || in->height != c.height)
-            return s.status_passed++, false;
-        static std::atomic<uint64_t> told{0};
-        if (told.exchange(key) != key) logf("vk: upscaler: network %016llx is the gameplay upscale (%ux%u -> %ux%u)",
-                                            (unsigned long long)key, in->width, in->height, out->width >> out_level,
-                                            out->height >> out_level);
-    }
-    free_dead(false);
-    if (known && in && out && temporal_colour_pair(in->format, out->format)) note_output(out, out_level);
+    if (!in || !in_view || !out || !temporal_colour_pair(in->format, out->format)) return;
+    if (!known && (out->width >> out_level) <= in->width) return;
+    note_output(out, out_level);   // (the scene sizes the camera and the skinned draws are taken at follow from it)
     const Camera cam = s.cam;
-    s.cam.valid = false;   // (each frame's own camera)
-    struct SkinsDone {     // (the skinned draws, each frame's own too: actor_motion takes them, or they go here)
+    if (!temporal_off()) s.cam.valid = false;   // (each frame's own camera; with Off, the stretch after this takes it)
+    struct SkinsDone {   // (the skinned draws, each frame's own: actor_motion takes them, or they go here)
         State& s;
         ~SkinsDone() { s.skins.clear(); }
     } skins_done{s};
-
-    Engine& engine = engine_of(mode);
-    if (!engine.e || engine.failed) return fail("it failed earlier");
-    s.asked = texture_frame_no(), s.holding = true;   // (not after a failure: what it holds is let go, temporal_idle)
-    if (!in || !in_view || !out || !out_view) return fail("no input or output view");
-    if (!cam.valid || texture_frame_no() - cam.frame > 1) return fail("no scene camera this frame");
-    if (!temporal_scene_format(cam.scene_format) || !temporal_scene_format(in->format))
-        return fail("unexpected scene colour format");
-    const bool psycho = scene_tonemap_on() && ur::takes_psychov35(mode) &&
-                        temporal_scene_format(VK_FORMAT_R16G16B16A16_SFLOAT);
-    if (cam.depth_gen != texture_destroy_generation()) return fail("the scene depth may be gone");
+    const uint64_t now = texture_frame_no();
+    if (!cam.valid || now - cam.frame > 1 || in->width != cam.width || in->height != cam.height) return;
+    if (cam.depth_gen != texture_destroy_generation() || !temporal_scene_format(cam.scene_format)) return;
     const uint32_t rw = in->width, rh = in->height;
-    const uint32_t ow = std::max(1u, out->width >> out_level), oh = std::max(1u, out->height >> out_level);
-    if (rw != cam.width || rh != cam.height) return fail("the input is not the scene's size");
     if (cam.depth->width != rw || cam.depth->height != rh || !(cam.depth->usage & VK_IMAGE_USAGE_SAMPLED_BIT) ||
         cam.depth->samples != VK_SAMPLE_COUNT_1_BIT || !(cam.depth->aspect & VK_IMAGE_ASPECT_DEPTH_BIT))
-        return fail("unexpected scene depth");
+        return;
+    if (!make_pipelines()) return;
+    const VkImageView dview = depth_view(cam.depth);
+    if (!dview) return;
+    free_dead(false);
+    s.asked = now, s.holding = true;   // (temporal_idle lets them go 120 frames after the last)
+    struct Disturbed {   // (from here commands are recorded: the program's descriptor pushes are pushed again after)
+        ~Disturbed() { descriptors_disturbed(); }
+    } disturbed;
+    const VkImageUsageFlags copied = VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    if (!make_image(cmd, s.color, VK_FORMAT_R16G16B16A16_SFLOAT, rw, rh) ||
+        !make_image(cmd, s.depth, VK_FORMAT_R32_SFLOAT, rw, rh, copied) ||
+        !make_image(cmd, s.motion, VK_FORMAT_R16G16_SFLOAT, rw, rh, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | copied))
+        return;
+    // (the motion as temporal_upscale makes it: from this frame's jittered clip space to the frame before's without its
+    // jitter, the depth plain. The camera has no jitter here, none being asked of the host, but one is taken off if it has)
+    float previous[16];
+    std::memcpy(previous, s.fg_last_vp, sizeof previous);
+    dlss_math::unjitter(previous, s.fg_last_jitter);
+    struct {
+        float reproject[16];
+        float jitter[2];
+        int32_t size[2];
+        int32_t flags;
+    } pc{};
+    const bool history = s.fg_last_frame && now - s.fg_last_frame <= 2;
+    const bool motion = history && dlss_math::reprojection(cam.current, previous, pc.reproject);
+    pc.jitter[0] = cam.jitter[0], pc.jitter[1] = cam.jitter[1];
+    pc.size[0] = (int32_t)rw, pc.size[1] = (int32_t)rh;
+    pc.flags = motion ? 1 : 0;
+    const uint64_t fg_last = s.fg_last_frame;   // (the poses actor_motion pairs with were kept at that frame)
+    s.fg_last_frame = now;
+    std::memcpy(s.fg_last_vp, cam.current, sizeof s.fg_last_vp);
+    s.fg_last_jitter[0] = cam.jitter[0], s.fg_last_jitter[1] = cam.jitter[1];
+    // (without a frame before to move from the motion is zero and not handed over, FSR's own inputs this frame; the skinned
+    // draws are drawn all the same, as their poses are the next frame's frame before)
+    full_barrier(cmd);   // (the scene's colour and depth, written before)
+    {
+        const VkDescriptorImageInfo info[5] = {{s.point, in_view, VK_IMAGE_LAYOUT_GENERAL},
+                                               {s.point, dview, VK_IMAGE_LAYOUT_GENERAL},
+                                               {VK_NULL_HANDLE, s.color.view, VK_IMAGE_LAYOUT_GENERAL},
+                                               {VK_NULL_HANDLE, s.depth.view, VK_IMAGE_LAYOUT_GENERAL},
+                                               {VK_NULL_HANDLE, s.motion.view, VK_IMAGE_LAYOUT_GENERAL}};
+        VkWriteDescriptorSet w[5]{};
+        for (uint32_t i = 0; i < 5; i++) {
+            w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w[i].dstBinding = i, w[i].descriptorCount = 1, w[i].pImageInfo = &info[i];
+            w[i].descriptorType = i < 2 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        }
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.prep);
+        vkCmdPushDescriptorSetKHR(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s.prep_layout, 0, 5, w);
+        vkCmdPushConstants(cmd, s.prep_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
+        vkCmdDispatch(cmd, (rw + 7) / 8, (rh + 7) / 8, 1);
+    }
+    full_barrier(cmd);
+    const int actors = actor_motion(cmd, cam, previous, rw, rh, dview, motion, fg_last);
+    if (actors) full_barrier(cmd);
+    const bool taken = motion && fsr3_inputs::take_motion(cmd, s.motion.image, rw, rh);
+    if (!s.fg_told && taken) {
+        s.fg_told = true;
+        logf("vk: frame generation: the chain's motion (the skinned draws' own in it: %d this frame) for AMD FSR 3.1, "
+             "%ux%u, with no engine drawing", actors, rw, rh);
+    }
+}
+/// (longshot) DLAA before the bloom did not run this frame, so it runs at the network, after the bloom and the tone map: why,
+/// when it changes and every 600th time
+bool pre_fail(const char* why) {
+    State& s = st();
+    static uint64_t repeats = 0;
+    if (why != s.pre_reason || ++repeats % 600 == 0)
+        logf("vk: NVIDIA DLAA: not before the bloom this frame (%s): it runs at the game's upscale", why);
+    if (why != s.pre_reason) s.pre_reason = why, repeats = 0;
+    return false;
+}
+
+/// (longshot) At the frame's end (its gameplay upscale): the place of the next frame's DLAA before the bloom (pre_bloom.h learn),
+/// logged when it changes (the first 20 times, then every 600th)
+void pre_learn(State& s) {
+    const pre_bloom::Trigger t = pre_bloom::learn(s.pre);
+    static uint64_t changes = 0;
+    if (!(t == s.pre_trigger) && (changes++ < 20 || changes % 600 == 0)) {
+        if (s.pre.late)
+            logf("vk: NVIDIA DLAA: the scene was drawn into after it ran before the bloom (frame %llu): the next frame runs it "
+                 "at the game's upscale", (unsigned long long)texture_frame_no());
+        else if (t.valid)
+            logf("vk: NVIDIA DLAA: the first pass to read the scene after its last draw is program %016llx, the scene's "
+                 "reader %u of %u (in play, the bloom's first): DLAA runs before it",
+                 (unsigned long long)t.key, t.place + 1, s.pre.samplers);
+        else
+            logf("vk: NVIDIA DLAA: no pass read the scene after its last draw this frame (%u readers): DLAA runs at the game's "
+                 "upscale", s.pre.samplers);
+    }
+    s.pre_trigger = t;
+}
+
+/// Whether to log the engine's first picture: another engine, or (longshot) the other place, before the bloom or at the network
+/// (the first 20 changes, then every 600th: a scene that moves it back and forth says so without filling the log)
+bool route_told(State& s, const TemporalEngine* e, bool pre) {
+    static uint64_t changes = 0;
+    const bool changed = s.told_first != e || s.pre_last_told != pre;
+    s.told_first = e, s.pre_last_told = pre;
+    return changed && (changes++ < 20 || changes % 600 == 0);
+}
+
+/// The engine's evaluation of this frame, with the chain's lock held: at the gameplay upscale (pre false: in, the network's input
+/// as it samples it, square-root encoded; out, its output), or before the game's bloom (pre true, temporal_pre_bloom: in and
+/// out the scene's colour, linear light, the picture written back into it). key: the program it runs at, for the log. false:
+/// not this frame, the reason logged (fail: the network runs; pre_fail: it runs at the network instead)
+bool draw_engine(VkCommandBuffer cmd, State& s, int mode, const Camera& cam, uint64_t key, bool pre, const Texture* in,
+                 VkImageView in_view, const Texture* out, VkImageView out_view, uint32_t out_level) {
+    const auto no = [pre](const char* why) { return pre ? pre_fail(why) : fail(why); };
+    Engine& engine = engine_of(mode);
+    if (!engine.e || engine.failed) return no("it failed earlier");
+    s.asked = texture_frame_no(), s.holding = true;   // (not after a failure: what it holds is let go, temporal_idle)
+    if (!in || !in_view || !out || !out_view) return no("no input or output view");
+    if (!cam.valid || texture_frame_no() - cam.frame > 1) return no("no scene camera this frame");
+    if (!temporal_scene_format(cam.scene_format) || !temporal_scene_format(in->format))
+        return no("unexpected scene colour format");
+    // (before the bloom the scene is linear light whatever the tone mapper: PsychoV35's route is the network's)
+    const bool psycho = !pre && scene_tonemap_on() && ur::takes_psychov35(mode) &&
+                        temporal_scene_format(VK_FORMAT_R16G16B16A16_SFLOAT);
+    if (cam.depth_gen != texture_destroy_generation()) return no("the scene depth may be gone");
+    const uint32_t rw = in->width, rh = in->height;
+    const uint32_t ow = std::max(1u, out->width >> out_level), oh = std::max(1u, out->height >> out_level);
+    if (rw != cam.width || rh != cam.height) return no("the input is not the scene's size");
+    if (cam.depth->width != rw || cam.depth->height != rh || !(cam.depth->usage & VK_IMAGE_USAGE_SAMPLED_BIT) ||
+        cam.depth->samples != VK_SAMPLE_COUNT_1_BIT || !(cam.depth->aspect & VK_IMAGE_ASPECT_DEPTH_BIT))
+        return no("unexpected scene depth");
     if (!temporal_colour_pair(in->format, out->format) || !dlss_checks::scene_size_fits(rw, rh, ow, oh))
-        return fail("unexpected output");
+        return no("unexpected output");
     if (!engine.started) engine.started = true, engine.ok = engine.e->start();
     if (!engine.ok) {
         engine.failed = true;
-        return fail("not available");
+        return no("not available");
     }
     if (!make_pipelines()) {
         engine.failed = true;
-        return fail("its shaders were not made");
+        return no("its shaders were not made");
     }
     const VkImageView dview = depth_view(cam.depth);
-    if (!dview) return fail("no view of the scene depth");
+    if (!dview) return no("no view of the scene depth");
     // Give queued small scenes three frames to reach the requested native size.
     // Some games keep a smaller scene even at full scale: then use native AA at that size.
     // Creating DLAA for that queued scene would replace the feature twice in successive frames.
-    const bool entering_dlaa = mode == ur::DLAA && s.drawing == engine.e && s.drawn_mode == ur::DLSS;
-    const bool queued_native = entering_dlaa && (rw != ow || rh != oh);
+    // (longshot) The same for FSR 4's and XeSS's native AA entered from their scaled mode: the queued frames are drawn by the
+    // scaled engine. Made at a queued size, FSR 4's native context can fail at the VRAM limit, and the engine then stays off
+    // until the player changes the upscaler
+    const bool entering_native =
+        ur::full_scale(mode) && s.drawing == engine.e && s.drawn_mode == ur::engine(mode) && ur::engine(mode) != mode;
+    const bool queued_native = entering_native && (rw != ow || rh != oh);
     const uint64_t frame = texture_frame_no();
     if (queued_native && !s.dlaa_waiting) s.dlaa_waiting = true, s.dlaa_wait_frame = frame;
     const bool wait_expired = queued_native && (frame < s.dlaa_wait_frame || frame - s.dlaa_wait_frame >= 3);
     if (wait_expired)
-        logf("vk: DLAA native scene still %ux%u after three frames; using it for output %ux%u", rw, rh, ow, oh);
+        logf("vk: %s native scene still %ux%u after three frames; using it for output %ux%u",
+             mode == ur::DLAA ? "DLAA" : mode == ur::FSR4_AA ? "AMD FSR 4 Native AA" : "Intel XeSS Native AA", rw, rh, ow, oh);
     const bool waiting_for_native = queued_native && !wait_expired;
     if (!waiting_for_native) s.dlaa_waiting = false;
-    const int draw_mode = waiting_for_native ? ur::DLSS : mode;
+    const int draw_mode = waiting_for_native ? ur::engine(mode) : mode;
     if (s.drawing != engine.e) {   // (another engine than the one before: that one's state let go, and a new history)
         if (s.drawing) {
             logf("vk: upscaler: %s in place of %s (frame %llu)", engine.e->name, s.drawing->name,
@@ -1194,15 +1615,22 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
     const int ready = engine.e->prepare(cmd, rw, rh, dw, dh, native, &iw, &ih, &why);
     if (ready < 0) {
         engine.failed = true;
-        return fail(why ? why : "it could not be made");
+        return no(why ? why : "it could not be made");
     }
-    if (ready == 0) return fail(why ? why : "not this frame");
+    if (ready == 0) return no(why ? why : "not this frame");
     if (psycho && (!engine.e->hdr || !engine.e->hdr()))
         return fail(ur::is_fsr4(mode)   ? "PsychoV35 waits for the native HDR FSR 4 context"
                     : ur::is_xess(mode) ? "PsychoV35 waits for the native HDR XeSS context"
                     : mode == ur::FSR3  ? "PsychoV35 waits for the native HDR FSR 3.1 path"
                                         : "PsychoV35 waits for the native HDR DLSS feature");
-    const bool rgba = psycho && in->format == VK_FORMAT_R16G16B16A16_SFLOAT && out->format == VK_FORMAT_R16G16B16A16_SFLOAT;
+    // (longshot) the scene before its tone map goes past 1 at every highlight: only a feature made for HDR colour takes it
+    // (vk_dlss.cpp prepare, temporal_hdr_input)
+    if (pre && (!engine.e->hdr || !engine.e->hdr())) return no("its feature is not made for HDR colour");
+    // (the pair of formats: the PsychoV35 network's RGBA16F, or the scene's own RGBA16F before the bloom (PsychoV35's too),
+    // written back by the typed output pass)
+    const bool rgba = pre ? in->format == VK_FORMAT_R16G16B16A16_SFLOAT
+                          : psycho && in->format == VK_FORMAT_R16G16B16A16_SFLOAT &&
+                                out->format == VK_FORMAT_R16G16B16A16_SFLOAT;
     if (s.psycho_last != psycho || s.history_input != in->format) {
         if (psycho || s.psycho_last || s.history_input == VK_FORMAT_R16G16B16A16_SFLOAT)
             logf("vk: PsychoV35 %s: %s route; scene format %u, network input %u, output %u",
@@ -1212,6 +1640,9 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
         s.history_input = in->format;
         s.last_frame = 0;
     }
+    // (longshot) before the bloom or at the network: the scene's linear light or the tone-mapped picture, a history of each
+    // of its own. A frame that moves it from one to the other starts a new one
+    if (s.pre_last != pre) s.pre_last = pre, s.last_frame = 0;
     if (ready == 2) s.engines_made++, s.last_frame = 0;   // (made just now: a new history)
     // (NVIDIA DLSS Frame Generation through NGX copies the depth and the motion each frame, vk_dlss.cpp dlss_fg_inputs: a
     // transfer's source too, always, so the Frame generation by row can turn it on at any time)
@@ -1220,7 +1651,7 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
         !make_image(cmd, s.depth, VK_FORMAT_R32_SFLOAT, iw, ih, copied) ||
         !make_image(cmd, s.motion, VK_FORMAT_R16G16_SFLOAT, iw, ih, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | copied) ||
         !make_image(cmd, s.output, VK_FORMAT_R16G16B16A16_SFLOAT, dw, dh, VK_IMAGE_USAGE_TRANSFER_DST_BIT))   // (FSR 3.1 copies in)
-        return fail("its images were not made");
+        return no("its images were not made");
 
     // (longshot) the projection without this frame's jitter, for an engine that makes its depth constants from it (FSR 3.1), and
     // its depth reversed for FSR's passes where the near plane is at 0 (fsr3_math.h): bit 3 of the prep's flags
@@ -1230,7 +1661,7 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
     bool fsr_flip = false;
     if (engine.e->fsr_depth) {
         fsr3_math::Camera fc;
-        if (!fsr3_math::camera_from_projection(projection, fc)) return fail("the scene's projection is not one FSR takes");
+        if (!fsr3_math::camera_from_projection(projection, fc)) return no("the scene's projection is not one FSR takes");
         fsr_flip = fc.flip_depth;
     }
     const uint64_t now = texture_frame_no();
@@ -1258,10 +1689,11 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
     // clamp cut every highlight at the paper white, a flat picture. It is given linear light and gives it back: the HDR pair)
     const bool hdr = engine.e->hdr && engine.e->hdr();
     // The network receives perceptual colour after the scene pass: decode it even when its storage is RGBA16F.
-    if (rgba && !make_rgba_output()) return fail("the RGBA16F output shader was not made");
-    const VkPipeline prep_pipe = hdr ? s.prep_hdr : s.prep;
+    if (rgba && !make_rgba_output()) return no("the RGBA16F output shader was not made");
+    // (longshot) the scene before its tone map is linear light already: taken as it is (prep_lin), and given back as it is
+    const VkPipeline prep_pipe = pre ? s.prep_lin : hdr ? s.prep_hdr : s.prep;
     const VkPipeline out_pipe = rgba ? s.out_rgba : hdr ? s.out_hdr : s.out;
-    const VkPipelineLayout prep_layout = hdr ? s.prep_hdr_layout : s.prep_layout;
+    const VkPipelineLayout prep_layout = pre ? s.prep_lin_layout : hdr ? s.prep_hdr_layout : s.prep_layout;
     const VkPipelineLayout out_layout = rgba ? s.out_rgba_layout : hdr ? s.out_hdr_layout : s.out_layout;
 
     const auto prep = [&] {
@@ -1281,16 +1713,30 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
         vkCmdPushConstants(cmd, prep_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, &pc);
         vkCmdDispatch(cmd, (rw + 7) / 8, (rh + 7) / 8, 1);
     };
-    full_barrier(cmd);   // (the scene's colour and depth, written before)
+    stage_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT,
+                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT |
+                      VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                  VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT |
+                      VK_ACCESS_2_TRANSFER_READ_BIT);   // (the scene's colour, depth, and actor buffers, written before)
     prep();
-    full_barrier(cmd);
+    stage_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                      VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                  VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT |
+                      VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                      VK_ACCESS_2_TRANSFER_READ_BIT);
     // (what moves by itself: the skinned draws drawn again over the camera's motion, with their own)
-    const int actors = actor_motion(cmd, cam, previous, rw, rh, dview, motion);
-    if (actors) full_barrier(cmd);
+    const int actors = actor_motion(cmd, cam, previous, rw, rh, dview, motion, s.last_frame);
+    if (actors)
+        stage_barrier(cmd, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                      VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT);
     if (show_motion && actors) {   // (RX_VK_DLSS_DEBUG=motion: the motion as it is now, the actors' in it)
         pc.flags = 4;
         prep();
-        full_barrier(cmd);
+        stage_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
+                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                      VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT);
     }
     TemporalFrame f;
     f.color = s.color.shown(), f.depth = s.depth.shown(), f.motion = s.motion.shown(), f.output = s.output.shown();
@@ -1308,15 +1754,14 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
              cam.far_z, cam.fov_y * 57.29578f);
     }
     if (!engine.e->evaluate(cmd, f)) {
-        if (engine.e->retry) {   // (longshot: this frame only, TemporalEngine::retry; a new history next)
+        if (engine.e->retry || (engine.e->retry_evaluation && engine.e->retry_evaluation())) {
             s.last_frame = 0;
-            return fail("its evaluation failed this frame");
+            return no("its evaluation failed this frame");
         }
         logf("vk: %s: its evaluation failed: the game's upscale from now on", engine.e->name);
         engine.failed = true;
         return false;   // (the network writes its output over whatever the evaluation did)
     }
-    full_barrier(cmd);
     {
         const int32_t opc[2] = {(int32_t)ow, (int32_t)oh};
         const VkDescriptorImageInfo info[2] = {{native ? s.linear : s.point, s.output.view, VK_IMAGE_LAYOUT_GENERAL},
@@ -1334,6 +1779,9 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
     // (NVIDIA DLSS Frame Generation through NGX, vk_dlss.cpp: this frame's depth, motion and camera for the present's made
     // frames. Nothing unless the run asked for it)
     dlss_fg_inputs(cmd, f, cam.projection, cam.current, cam.jitter, motion);
+    // (longshot) and AMD FSR 3.1's frame interpolation: this motion, the skinned draws' own in it, over the camera's alone that
+    // its own inputs made at this dispatch (vk_fsr3_inputs.h take_motion). Nothing unless it is asked for
+    if (motion && fsr3fi::frames_wanted()) (void)fsr3_inputs::take_motion(cmd, f.motion.image, rw, rh);
     s.last_frame = now;
     s.drawn_mode = draw_mode;
     s.last_jitter[0] = cam.jitter[0], s.last_jitter[1] = cam.jitter[1];
@@ -1343,17 +1791,116 @@ bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in
 
     std::memcpy(s.last_vp, cam.current, sizeof s.last_vp);
     s.jitter.publish(rw, rh, (uint32_t)dlss_jitter_phases(rw, rh, dw, dh), now);
+    if (pre) {   // (longshot: the network copies its input this frame, temporal_upscale)
+        s.pre_drawn = now, s.status_pre++;
+        if (s.pre_reason) logf("vk: NVIDIA DLAA runs before the bloom again (frame %llu)", (unsigned long long)now);
+        s.pre_reason = nullptr;
+        if (route_told(s, engine.e, true))
+            logf("vk: NVIDIA DLAA draws before the game's bloom and tone map: %ux%u, at program %016llx", rw, rh,
+                 (unsigned long long)key);
+        route_drawn(upscale_route::Route::Engine, mode, rw, rh, rw, rh);
+        return true;
+    }
     if (s.reason) logf("vk: %s draws the upscale again (frame %llu)", engine.e->name, (unsigned long long)now);
     s.reason = nullptr;
     // (RX_VK_DLSS_DEBUG=alternate, a test's reference: every other frame the game's own upscale over the engine's, which still
     // draws and keeps its history. A frame of it then has the game's picture of the frames either side to be measured against)
     static const bool alternate = getenv("RX_VK_DLSS_DEBUG") && !strcmp(getenv("RX_VK_DLSS_DEBUG"), "alternate");
     if (alternate && (now & 1)) return false;
-    if (s.told_first != engine.e) {
-        s.told_first = engine.e;
+    if (route_told(s, engine.e, false))
         logf("vk: %s draws OoT's upscale: %ux%u -> %ux%u%s", name_of(mode), rw, rh, ow, oh,
              show_motion ? " (its motion shown)" : "");
+    route_drawn(upscale_route::Route::Engine, mode, rw, rh, ow, oh);
+    return true;
+}
+}  // namespace
+
+bool temporal_fg_inputs() { return temporal_mode() == ur::GAME && fsr3fi::frames_wanted() != 0; }
+
+bool temporal_upscale(VkCommandBuffer cmd, uint64_t key, bool known, Texture* in, VkImageView in_view, Texture* out,
+                      VkImageView out_view, uint32_t out_level) {
+    const int mode = temporal_mode();
+    // (longshot) no engine, and AMD FSR 3.1's frame interpolation asked for: the chain's motion for it all the same, the
+    // network (or Off's stretch) drawing the picture as before
+    if (temporal_fg_inputs()) fg_inputs(cmd, known, in, in_view, out, out_level);
+    if (mode == ur::GAME) return temporal_off() && stretch(cmd, key, known, in, in_view, out, out_view, out_level);
+    State& s = st();
+    std::lock_guard lk(s.mu);
+    if (!known) {   // (another network of the upscale's shape: only the scene into the picture, the rest untouched and unsaid)
+        const Camera& c = s.cam;
+        // (the gameplay networks' own formats: they sample the scene's B10G11R11 colour and write the B10G11R11 picture.
+        // Other cooperative-matrix networks of the same shape (one RGBA8 into A2B10G10R10, RGB9E5 into B10G11R11) are not it)
+        if (!in || !out || !temporal_colour_pair(in->format, out->format) ||
+            (out->width >> out_level) <= in->width)
+            return false;
+        note_output(out, out_level);
+        // (one in the gameplay networks' formats whose input is not this frame's scene: counted for the status line)
+        if (!c.valid || texture_frame_no() - c.frame > 1 || in->width != c.width || in->height != c.height)
+            return s.status_passed++, false;
+        static std::atomic<uint64_t> told{0};
+        if (told.exchange(key) != key) logf("vk: upscaler: network %016llx is the gameplay upscale (%ux%u -> %ux%u)",
+                                            (unsigned long long)key, in->width, in->height, out->width >> out_level,
+                                            out->height >> out_level);
     }
+    // (the game's gameplay upscale, asked for: a 3D scene this frame, whether or not an engine then draws it)
+    s.asked_frame.store(texture_frame_no(), std::memory_order_relaxed);
+    free_dead(false);
+    if (known && in && out && temporal_colour_pair(in->format, out->format)) note_output(out, out_level);
+    const Camera cam = s.cam;
+    s.cam.valid = false;   // (each frame's own camera)
+    struct SkinsDone {     // (the skinned draws, each frame's own too: actor_motion takes them, or they go here)
+        State& s;
+        ~SkinsDone() { s.skins.clear(); }
+    } skins_done{s};
+    // (longshot) DLAA before the bloom (temporal_pre_bloom): this frame's passes teach the next where it runs (pre_bloom.h).
+    // Where it ran in this frame, the network's input is its picture through the game's bloom, tone map and the passes after
+    // them: copied in place of the network (its own anti-aliasing would go over DLAA's), as the Upscaler's Off copies it
+    const uint64_t now = texture_frame_no();
+    if (s.pre_frame == now && s.pre_scene_frame.load(std::memory_order_relaxed) == now) pre_learn(s);
+    if (s.pre_drawn == now) {
+        const uint32_t ow = out ? std::max(1u, out->width >> out_level) : 0, oh = out ? std::max(1u, out->height >> out_level) : 0;
+        if (!in || !in_view || !out || !out_view || !temporal_colour_pair(in->format, out->format) || ow != in->width ||
+            oh != in->height || !stretch_record(cmd, in_view, out, out_view, ow, oh))
+            return fail("DLAA ran before the bloom, and the network's input could not be copied");
+        static std::atomic<uint64_t> told{0};
+        if (told.exchange(key) != key)
+            logf("vk: NVIDIA DLAA ran before the bloom: network %016llx left out, its input copied (%ux%u)",
+                 (unsigned long long)key, ow, oh);
+        return true;
+    }
+    return draw_engine(cmd, s, mode, cam, key, false, in, in_view, out, out_view, out_level);
+}
+
+bool temporal_pre_bloom(VkCommandBuffer cmd, uint64_t key, const std::vector<const Texture*>& sampled, Texture* const* colors,
+                        int n) {
+    State& s = st();
+    const uint64_t now = texture_frame_no();
+    const Texture* scene = s.pre_scene.load(std::memory_order_relaxed);
+    if (!scene || s.pre_scene_frame.load(std::memory_order_relaxed) != now) return false;
+    bool writes = false;
+    for (int i = 0; i < n && !writes; i++) writes = colors[i] == scene;
+    if (!writes && std::find(sampled.begin(), sampled.end(), scene) == sampled.end()) return false;
+    std::lock_guard lk(s.mu);
+    if (s.pre_frame != now) s.pre = {}, s.pre_frame = now;
+    if (writes) return s.pre.scene_draw(), false;   // (a draw into the scene, reading it too or not: the scene's own)
+    if (!s.pre.sampler(key, s.pre_trigger)) return false;
+    // (the learned place: DLAA on the scene as it is now, its picture written back before this draw reads it)
+    const int mode = temporal_mode();
+    const Camera cam = s.cam;
+    const auto not_here = [&](const char* why) { return s.pre.ran = false, pre_fail(why); };
+    if (!pre_bloom_wanted(mode)) return not_here("DLAA is not the upscaler now");
+    if (!cam.valid || cam.frame != now || cam.color != scene) return not_here("not this frame's scene");
+    if (!(scene->usage & VK_IMAGE_USAGE_STORAGE_BIT) || !(scene->usage & VK_IMAGE_USAGE_SAMPLED_BIT) ||
+        scene->samples != VK_SAMPLE_COUNT_1_BIT)
+        return not_here("the scene's colour target cannot be sampled and stored into");
+    const VkImageView view = color_view(scene);
+    if (!view) return not_here("no view of the scene's colour");
+    end_pass(cmd);   // (compute from here: outside the open pass)
+    // (from here commands of its own are recorded, whether DLAA then draws or not: true, and the draw binds all of its
+    // own again, vk_draw.cpp. Not this frame: the skinned draws stay for the engine at the network)
+    if (!draw_engine(cmd, s, mode, cam, key, true, scene, view, scene, view, 0)) return s.pre.ran = false, true;
+    s.skins.clear();     // (actor_motion took them: the frame's own)
+    full_barrier(cmd);   // (the draw then reads the scene as DLAA wrote it)
     return true;
 }
 

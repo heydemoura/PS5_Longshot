@@ -5,16 +5,11 @@
 
 #include "vk_internal.h"
 
-struct ImFont;
+#include "vk_ui_fonts.h"
+
 struct ImTextureData;
 
 namespace mkwvk::ui {
-
-struct Fonts {
-    ImFont* body = nullptr;      // (rows, help, prompts)
-    ImFont* strong = nullptr;    // (the selected row, values, buttons)
-    ImFont* heading = nullptr;   // (tabs, titles, the wordmark)
-};
 
 /// A new ImGui frame for a w x h window image (the context made and the fonts loaded on the first call); false when ImGui
 /// cannot draw here (no views of the window's images: the surface does not allow drawing into them)
@@ -24,10 +19,10 @@ const Fonts& fonts();
 ImTextureData* logo(float* aspect);
 /// The frame's drawing over the window's image `index` (TRANSFER_DST_OPTIMAL before and after): new glyphs and textures
 /// copied in on cmd first (no wait on the queue), then one render pass
-void record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h);
+void record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h, int colour_vision);
 /// The same over another image (TRANSFER_DST_OPTIMAL before and after, colour-attachment use, a view of it; headless, the
 /// shots' RGBA: vk_replay.cpp RX_VK_SHOT_MENU)
-void record_to(VkCommandBuffer cmd, VkImage image, VkImageView view, uint32_t w, uint32_t h);
+void record_to(VkCommandBuffer cmd, VkImage image, VkImageView view, uint32_t w, uint32_t h, int colour_vision = 0);
 /// A present with nothing drawn: what record let go is destroyed once the GPU is done with it, all the same
 void idle();
 /// The glyphs (printable ASCII) of every font at these pixel sizes, baked a few sizes a frame from the next begin on: the

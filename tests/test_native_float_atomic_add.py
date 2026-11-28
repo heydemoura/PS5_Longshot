@@ -13,8 +13,9 @@ OpAtomicFAddEXT and no compare-exchange, the others the loop and no float-add ca
 extension asked for only when wanted, only that feature on, the profile and the program cache's stamp) and the
 global-address fallback are checked in the source. Whether it is wanted (native_fadd_wanted, vk_main.cpp) is compiled
 alone against a table: unset, NVIDIA's driver, and Intel's Windows driver on the Meteor Lake and Arrow Lake iGPUs (PCI
-device 0x7Dxx) from driver 101.9175 on and Battlemage (Arc B-series, 0xE2xx) from 101.9154 on, the families and drivers
-it was run on (not Intel's other GPUs, older drivers, RADV,
+device 0x7Dxx) from driver 101.9175 on, Battlemage (Arc B-series, 0xE2xx) from 101.9154 on, the Panther Lake iGPUs
+(0xB0xx) from 101.9150 on and the Lunar Lake iGPUs (0x64xx) from 101.8991 on, the families and drivers it was run on (Longshot issue 618: Panther Lake's loop lost the adds
+of the game's exposure, a milky white haze) (not Intel's other GPUs, older drivers, RADV,
 AMD's, Mesa's Intel driver or NVK); set, RX_VK_NATIVE_FADD by #2042's rule on any driver, so =on is on and =off, =false,
 =no and empty are off. Nothing runs on a GPU.
 
@@ -26,11 +27,14 @@ import struct
 import subprocess
 import tempfile
 
-RUN_ALL_ARGS = ["--cxx", "{cxx}", "--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}"]
+RUN_ALL_ARGS = ["--cxx", "{cxx}", "--headers", "{spirv_headers}", "--spirv-val", "{spirv_val}", "--vulkan-headers", "{vulkan_headers}"]
 # (spirv-val: SPIRV-Tools comes with the Linux runner's packages, not on Windows)
 RUN_ALL_SKIP = {"windows": "needs spirv-val: checked on Linux"}
 
 ROOT = Path(__file__).resolve().parents[1]
+# (a headers folder the compiler searches anyway, /usr/include: no -isystem for it, which would put it before the C++
+# library's own and break <cstdlib>'s #include_next <stdlib.h>)
+SYSTEM_INCLUDES = (Path("/usr/include"), Path("/usr/local/include"))
 VK = ROOT / "gpu" / "vk"
 SPIRV = VK / "eden" / "shader_recompiler" / "backend" / "spirv"
 
@@ -61,7 +65,9 @@ FIXTURE = r"""
 #include <vector>
 #include <sirit/sirit.h>
 #include "shader_recompiler/profile.h"
+#include "shader_recompiler/stage.h"
 using Sirit::Id;
+using Shader::Stage;
 struct NotImplementedException : std::runtime_error {
     template <typename... A> explicit NotImplementedException(const char* what, A&&...) : std::runtime_error(what) {}
 };
@@ -80,6 +86,8 @@ struct Info { bool uses_atomic_f32_add{}; };
 struct EmitContext : Sirit::Module {
     using Sirit::Module::Module;
     Shader::Profile profile{};
+    Stage stage{Stage::Compute};
+    bool mesh_fallback{};
     Id U1{};
     std::array<Id, 5> U32{}, F32{};
     Id u32_zero_value{};
@@ -102,6 +110,7 @@ void EmitContext::define_storage_buffers(const Info& info) {
 int main(int argc, char** argv) {
     if (argc < 4) return 2;
     EmitContext ctx{0x00010600};
+    ctx.profile.supported_spirv = 0x00010600;
     ctx.profile.support_float32_atomic_add = argv[2][0] == '1';
     ctx.profile.support_descriptor_aliasing = argv[3][0] == '1';
     ctx.AddCapability(spv::Capability::Shader);
@@ -186,14 +195,17 @@ def check_source():
         raise SystemExit("FAIL: EmitContext has no native_f32_add")
     main_cpp = (VK / "vk_main.cpp").read_text(encoding="utf-8")
     device = cut(main_cpp, "bool create_device() {", "vk_main.cpp")
+    if "#ifdef _WIN32\n    constexpr bool fadd_windows = true;\n#else\n    constexpr bool fadd_windows = false;\n#endif" not in device:
+        raise SystemExit("FAIL: create_device does not pass the platform to native_fadd_wanted")
     for piece, why in (
         ("if (fadd_wanted) optional(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME, atomic_float);",
          "VK_EXT_shader_atomic_float is not asked for, or is asked for where the native add is not wanted"),
         ('getenv("RX_VK_NATIVE_FADD")', "RX_VK_NATIVE_FADD is not read"),
-        ("const bool fadd_wanted = native_fadd_wanted(fadd_env, fadd_driver.driverID, dev.props.deviceID, dev.props.driverVersion);",
+        ("const bool fadd_wanted = native_fadd_wanted(fadd_env, fadd_driver.driverID, dev.props.deviceID, dev.props.driverVersion, fadd_windows);",
          "the native add is not decided by native_fadd_wanted from the switch, the driver, the GPU and its driver's version"),
-        ("vkGetPhysicalDeviceProperties2(dev.physical, &p2);\n    }\n    const bool fadd_wanted",
-         "the driver is not asked who it is before the native add is decided"),
+        # (the driver is asked once, at the function's start, for the mesh mode too: the order is checked below)
+        ("        p2.pNext = &fadd_driver;\n        vkGetPhysicalDeviceProperties2(dev.physical, &p2);\n    }\n",
+         "the driver is not asked who it is"),
         ("if (atomic_float) *tail = &afloat, tail = &afloat.pNext;", "the atomic float features are not queried"),
         ("dev.float_atomic_add = atomic_float && afloat.shaderBufferFloat32AtomicAdd;",
          "the native add does not follow shaderBufferFloat32AtomicAdd"),
@@ -203,6 +215,8 @@ def check_source():
     ):
         if piece not in device:
             raise SystemExit("FAIL: create_device: %s" % why)
+    if not device.index("p2.pNext = &fadd_driver;") < device.index("const bool fadd_wanted = native_fadd_wanted("):
+        raise SystemExit("FAIL: create_device: the driver is not asked who it is before the native add is decided")
     query, reset = device.index("vkGetPhysicalDeviceFeatures2(dev.physical, &f);"), device.index("afloat = VkPhysicalDevice")
     if not device.index("*tail = &afloat") < query < reset < device.index("vkCreateDevice("):
         raise SystemExit("FAIL: create_device: the features are not queried, then cut to the one used, before vkCreateDevice")
@@ -213,7 +227,8 @@ def check_source():
     # (the program cache's stamp: program_cache_stamp, vk_progcache.cpp, hashes translator_stamp's, which says what the
     # translator is told; it was disk_stamp's before #2323)
     progcache = (VK / "vk_progcache.cpp").read_text(encoding="utf-8")
-    if "translator_stamp()" not in cut(progcache, "uint64_t program_cache_stamp() {", "vk_progcache.cpp"):
+    if "program_cache_stamp_of(kProgramCacheFormat)" not in cut(progcache, "uint64_t program_cache_stamp() {", "vk_progcache.cpp") or \
+            "translator_stamp()" not in cut(progcache, "uint64_t program_cache_stamp_of(uint32_t format) {", "vk_progcache.cpp"):
         raise SystemExit("FAIL: the program cache's stamp no longer holds translator_stamp's: update this check")
     stamp = shader[shader.index("uint64_t translator_stamp() {"):]
     if "profile().support_float32_atomic_add" not in stamp[:stamp.index("return h;")]:
@@ -222,22 +237,34 @@ def check_source():
 
 # RX_VK_NATIVE_FADD's value (None: unset), the driver (VkDriverId: the Vulkan specification's numbers), the GPU (PCI
 # device), its driver's version (Intel's Windows encoding: 101.9175 is 101 << 14 | 9175), and whether the float add is then
-# asked to be the GPU's own: unset, NVIDIA's driver and Intel's Windows driver on 0x7Dxx from 101.9175 and on 0xE2xx
-# (Battlemage) from 101.9154; set, #2042's rule
+# asked to be the GPU's own: unset, NVIDIA's driver and Intel's Windows driver on 0x7Dxx from 101.9175, on 0xE2xx
+# (Battlemage) from 101.9154, on 0xB0xx (Panther Lake: the Arc B390, 0xB080, issue 618) from 101.9150 and on 0x64xx
+# (Lunar Lake: the Arc 140V, 0x64A0) from 101.8991; set, #2042's rule
 # (longshot_env.h env_value_off) whatever the driver
 DRIVERS = {"AMD_PROPRIETARY": 1, "MESA_RADV": 3, "NVIDIA_PROPRIETARY": 4, "INTEL_PROPRIETARY_WINDOWS": 5,
            "INTEL_OPEN_SOURCE_MESA": 6, "MESA_NVK": 24}
 MEASURED = 101 << 14 | 9175
 BMG_MEASURED = 101 << 14 | 9154   # (Battlemage: the driver a B580 was run on)
+PTL, PTL_MEASURED = 0xB080, 101 << 14 | 9150   # (Panther Lake: the Arc B390 and its driver, issue 618)
+LNL_MEASURED = 101 << 14 | 8991   # (Lunar Lake: the Arc 140V's driver)
 MTL, ARL, LNL, IRIS_XE, ARC_A770, BMG, BMG_B570 = 0x7D55, 0x7D51, 0x64A0, 0x9A49, 0x56A0, 0xE20B, 0xE20C
 INTEL_WIN = "INTEL_PROPRIETARY_WINDOWS"
 SWITCH_CASES = ([(None, "NVIDIA_PROPRIETARY", 0x2684, 0, 1)] +
                 [(None, INTEL_WIN, MTL, MEASURED, 1), (None, INTEL_WIN, ARL, MEASURED + 100, 1),
                  (None, INTEL_WIN, MTL, 101 << 14 | 9174, 0), (None, INTEL_WIN, MTL, 101 << 14 | 6000, 0)] +
-                [(None, INTEL_WIN, g, MEASURED, 0) for g in (LNL, IRIS_XE, ARC_A770)] +
+                [(None, INTEL_WIN, g, MEASURED, 0) for g in (IRIS_XE, ARC_A770)] +
                 [(None, INTEL_WIN, BMG, BMG_MEASURED, 1), (None, INTEL_WIN, BMG_B570, MEASURED, 1),
                  (None, INTEL_WIN, BMG, 101 << 14 | 9153, 0), (None, INTEL_WIN, ARC_A770, BMG_MEASURED, 0),
                  (None, "INTEL_OPEN_SOURCE_MESA", BMG, BMG_MEASURED, 0), ("0", INTEL_WIN, BMG, BMG_MEASURED, 0)] +
+                [(None, INTEL_WIN, PTL, PTL_MEASURED, 1), (None, INTEL_WIN, 0xB0A0, MEASURED, 1),
+                 (None, INTEL_WIN, PTL, PTL_MEASURED - 1, 0), (None, INTEL_WIN, MTL, PTL_MEASURED, 0),
+                 (None, "INTEL_OPEN_SOURCE_MESA", PTL, PTL_MEASURED, 0), ("0", INTEL_WIN, PTL, PTL_MEASURED, 0)] +
+                [(None, INTEL_WIN, LNL, LNL_MEASURED, 1), (None, INTEL_WIN, 0x6420, MEASURED, 1),
+                 (None, INTEL_WIN, LNL, LNL_MEASURED - 1, 0), (None, INTEL_WIN, MTL, LNL_MEASURED, 0),
+                 (None, INTEL_WIN, PTL, LNL_MEASURED, 0), (None, "INTEL_OPEN_SOURCE_MESA", LNL, LNL_MEASURED, 0),
+                 ("0", INTEL_WIN, LNL, LNL_MEASURED, 0)] +
+                [(None, "AMD_PROPRIETARY", 0x1114, 0x8001a0, 1), (None, "AMD_PROPRIETARY", 0x1114, 0x80019f, 0),
+                 (None, "AMD_PROPRIETARY", 0x7550, 0x8001a0, 0), ("0", "AMD_PROPRIETARY", 0x1114, 0x8001a0, 0)] +
                 [(None, d, MTL, MEASURED, 0) for d in DRIVERS if d not in ("NVIDIA_PROPRIETARY", INTEL_WIN)] +
                 [(v, d, 0, 0, 1) for v in ("1", "on", "yes", "true", "2") for d in ("MESA_RADV", "NVIDIA_PROPRIETARY")] +
                 [(v, "AMD_PROPRIETARY", 0, 0, 1) for v in ("1", "on")] + [("1", "INTEL_OPEN_SOURCE_MESA", MTL, 0, 1)] +
@@ -249,7 +276,9 @@ SWITCH_FIXTURE = r"""
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-enum VkDriverId { @@DRIVERS@@ };
+#include "device_policy.h"   // (policy_rule::native_fadd_listed: the one list of drivers and families, which native_fadd_wanted asks)
+using namespace mkwvk;
+static_assert(@@DRIVERS@@, "DRIVERS' numbers are not the Vulkan headers'");
 @@WANTED@@
 int main(int argc, char** argv) {
     // (argv: value or -unset, the driver's number, the PCI device, the driver's version, 1 native or 0 the loop, ...)
@@ -257,10 +286,15 @@ int main(int argc, char** argv) {
         const char* v = strcmp(argv[i], "-unset") ? argv[i] : nullptr;
         const VkDriverId driver = static_cast<VkDriverId>(atoi(argv[i + 1]));
         const uint32_t device = (uint32_t)strtoul(argv[i + 2], nullptr, 0), version = (uint32_t)strtoul(argv[i + 3], nullptr, 0);
-        const bool got = native_fadd_wanted(v, driver, device, version);
+        const bool got = native_fadd_wanted(v, driver, device, version, true);
         if (got != (atoi(argv[i + 4]) != 0)) {
             printf("FAIL: RX_VK_NATIVE_FADD=[%s], driver %d, device 0x%04x, version %u.%u: %s\n", v ? v : "(unset)",
                    static_cast<int>(driver), device, version >> 14, version & 0x3fff, got ? "native" : "the loop");
+            return 1;
+        }
+        if (!v && driver == VK_DRIVER_ID_AMD_PROPRIETARY && device == 0x1114 &&
+            native_fadd_wanted(v, driver, device, version, false)) {
+            puts("FAIL: AMD proprietary Linux driver defaults to native float add");
             return 1;
         }
     }
@@ -269,14 +303,20 @@ int main(int argc, char** argv) {
 """
 
 
-def check_switch(cxx, tmp):
+def check_switch(cxx, tmp, vulkan_headers):
     main_cpp = (VK / "vk_main.cpp").read_text(encoding="utf-8")
     wanted = cut(main_cpp, "static bool native_fadd_wanted(", "vk_main.cpp")
+    # (the list itself is device_policy.h's, asked by the function cut here: the two are compiled together, with the Vulkan
+    # headers' own driver numbers, which DRIVERS must be)
+    if "policy_rule::native_fadd_listed(driver, device, version, windows)" not in wanted:
+        raise SystemExit("FAIL: native_fadd_wanted no longer asks device_policy.h's list (a second copy of it?)")
     cpp, exe = tmp / "switch.cpp", tmp / "switch"
-    drivers = ", ".join("VK_DRIVER_ID_%s = %d" % kv for kv in DRIVERS.items())
+    drivers = " && ".join("VK_DRIVER_ID_%s == %d" % kv for kv in DRIVERS.items())
     cpp.write_text(SWITCH_FIXTURE.replace("@@DRIVERS@@", drivers).replace("@@WANTED@@", wanted), encoding="utf-8")
+    # (-isystem: the renderer's headers are not this check's to warn about)
+    headers = ["-isystem", str(VK)] + (["-isystem", str(vulkan_headers)] if vulkan_headers and Path(vulkan_headers).resolve() not in SYSTEM_INCLUDES else [])
     r = subprocess.run([cxx, "-std=c++20", "-include", str(VK / "compat" / "longshot_env.h"), "-Wall", "-Wextra", "-Werror",
-                        str(cpp), "-o", str(exe)], capture_output=True, text=True, timeout=120)
+                        *headers, str(cpp), "-o", str(exe)], capture_output=True, text=True, timeout=120)
     if r.returncode:
         print(r.stdout + r.stderr)
         raise SystemExit("FAIL: native_fadd_wanted did not build alone")
@@ -287,10 +327,11 @@ def check_switch(cxx, tmp):
     if r.returncode:
         print(r.stdout + r.stderr)
         raise SystemExit("FAIL: the native float add is not wanted as it should be (NVIDIA's driver and Intel's Windows "
-                         "driver on Meteor Lake and Arrow Lake from 101.9175 and on Battlemage from 101.9154 by default, RX_VK_NATIVE_FADD by the "
+                         "driver on Meteor Lake and Arrow Lake from 101.9175, on Battlemage from 101.9154, on Panther Lake from 101.9150 and on Lunar Lake from 101.8991 "
+                         "by default, RX_VK_NATIVE_FADD by the "
                          "switches' rule)")
     print("switch: %d cases: unset, NVIDIA's driver and Intel's Windows driver on Meteor Lake and Arrow Lake from 101.9175 "
-          "and on Battlemage from 101.9154; "
+          "and on Battlemage from 101.9154, on Panther Lake from 101.9150 and on Lunar Lake from 101.8991; "
           "RX_VK_NATIVE_FADD by the switches' rule on any driver" % len(SWITCH_CASES))
 
 
@@ -299,9 +340,11 @@ def main():
     parser.add_argument("--headers", type=Path, required=True)
     parser.add_argument("--cxx", default="g++")
     parser.add_argument("--spirv-val", default="spirv-val")
+    # (for native_fadd_wanted, compiled with device_policy.h's list; without it, the compiler's own include path)
+    parser.add_argument("--vulkan-headers", type=Path, default=None)
     args = parser.parse_args()
     check_source()
-    context = (SPIRV / "spirv_emit_context.cpp").read_text(encoding="utf-8")
+    context =(SPIRV / "spirv_emit_context.cpp").read_text(encoding="utf-8")
     atomic = (SPIRV / "emit_spirv_atomic.cpp").read_text(encoding="utf-8")
     storage = cut(context, "void EmitContext::DefineStorageBuffers(", "spirv_emit_context.cpp")
     decide = storage[storage.index("    native_f32_add = "):storage.index("if (info.storage_buffers_descriptors.empty())")]
@@ -311,7 +354,8 @@ def main():
                      ceiling[:ceiling.index("\n") + 1],
                      cut(context, "Id CasTriesVariable(EmitContext& ctx)", "CasTriesVariable"),
                      cut(context, "Id CasLoopDone(EmitContext& ctx", "CasLoopDone"),
-                     cut(context, "Id CasLoop(EmitContext& ctx", "CasLoop")])
+                     cut(context, "Id CasLoop(EmitContext& ctx", "CasLoop"),
+                     cut(context, "Id SubgroupCasLoop(EmitContext& ctx", "SubgroupCasLoop")])
     helpers = "\n".join(cut(atomic, marker, "emit_spirv_atomic.cpp") for marker in (
         "Id StorageIndex(EmitContext& ctx", "Id StoragePointer(EmitContext& ctx", "std::pair<Id, Id> AtomicArgs(EmitContext& ctx",
         "Id EmitStorageAtomicAddF32(EmitContext& ctx"))
@@ -321,7 +365,7 @@ def main():
     sirit = VK / "sirit"
     with tempfile.TemporaryDirectory(prefix="native-float-add-") as tmp:
         tmp = Path(tmp)
-        check_switch(args.cxx, tmp)
+        check_switch(args.cxx, tmp, args.vulkan_headers)
         cpp, exe = tmp / "fixture.cpp", tmp / "fixture"
         cpp.write_text(fixture, encoding="utf-8")
         r = subprocess.run([args.cxx, "-std=c++20", "-O1", "-I" + str(sirit / "include"), "-I" + str(sirit / "src"),

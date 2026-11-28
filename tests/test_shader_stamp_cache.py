@@ -53,6 +53,9 @@ class ShaderStampCacheTests(unittest.TestCase):
             "gpu/vk/vk_bank.cpp": "int bank;\n",
             "gpu/vk/vk_draw.cpp": "int draw;\n",
             "gpu/vk/vk_menu.cpp": "int menu;\n",
+            "gpu/vk/vk_version.cpp": "int version;\n",
+            "gpu/vk/menu/audio.cpp": "int menu_audio;\n",   # (#1633: the Audio tab's module, a user of the playback header)
+            "gpu/vk/menu/hdr.cpp": "int menu_hdr;\n",       # (a module that is not)
             "gpu/vk/vk_state.h": "struct State {};\n",
             "gpu/vk/vk_api.h": "struct Api {};\n",
             "gpu/vk/vk_dlss.cpp": "int dlss;\n",
@@ -69,9 +72,9 @@ class ShaderStampCacheTests(unittest.TestCase):
             "gpu/vk/compat/compat.h": "struct Compat {};\n",
             "gpu/compat/common.h": "struct Common {};\n",
             "gpu/render/render.h": "struct Render {};\n",
-            "gpu/third_party/suyu/video_core/textures/decoders.cpp": "int decoder;\n",
-            "gpu/third_party/suyu/video_core/textures/astc.cpp": "int astc;\n",
-            "gpu/third_party/suyu/video_core/textures/texture.h": "struct Texture {};\n",
+            "gpu/vk/texdecode/block_linear.cpp": "int block_linear;\n",
+            "gpu/vk/texdecode/astc.cpp": "int astc;\n",
+            "gpu/vk/texdecode/texdecode.h": "struct Texdecode {};\n",
             "host/posix/windows.h": "struct Posix {};\n",
             "host/posix/win32_posix.c": "int win32;\n",
             "gen/ui_fonts.cpp": "int fonts;\n",
@@ -130,9 +133,11 @@ class ShaderStampCacheTests(unittest.TestCase):
             # (the back end's branch makes its logo header and fonts file itself since #1567: no files written here)
             "logo_rgba": SimpleNamespace(write=lambda path: ""),
             "ui_fonts": SimpleNamespace(write=lambda path: None),
+            "reshade_fx": SimpleNamespace(build_jobs=lambda *args, **kwargs: []),
             "NGX_SDK": ngx,   # ("": no NVIDIA NGX SDK, vk_dlss.cpp built without DLSS, as by default)
             "NGX_MSVC_RT": "vk_ngx_msvc_rt.cpp",
             "FSR": fsr,   # (LONGSHOT_FSR=1: vk_fsr4.cpp built with AMD FSR 4)
+            "TRACY": False, "TRACY_FLAGS": [],   # (LONGSHOT_TRACY: a developer's build with the Tracy profiler; off, as by default)
             "translator_files": self.translator_files,
         }
         environ = dict({"RX_RELEASE": "1"} if release else {}, **({"RX_VK_PGO": pgo} if pgo else {}))   # (pgo: gen, or a profile)
@@ -197,8 +202,9 @@ class ShaderStampCacheTests(unittest.TestCase):
                 before = self.jobs(linux)
                 path.write_bytes(b"enum { HOS_OUTPUT_ID_CAP = 8192 };\n")
                 after = self.jobs(linux)
-                # Main's dependency tracking keeps this host contract on its one renderer consumer.
-                self.assertEqual(self.changed(before, after), {"gpu/vk/vk_menu.cpp"})
+                # Main's dependency tracking keeps this host contract on its renderer consumers: the menu and, since
+                # #1633, the Audio tab's module (gpu/vk/menu/audio.cpp includes it too), no other module
+                self.assertEqual(self.changed(before, after), {"gpu/vk/vk_menu.cpp", "gpu/vk/menu/audio.cpp"})
                 self.assertEqual([f for f in before["gpu/vk/vk_shader.cpp"]["flags"] if f.startswith("-DLONGSHOT_SHADER_STAMP=")],
                                  [f for f in after["gpu/vk/vk_shader.cpp"]["flags"] if f.startswith("-DLONGSHOT_SHADER_STAMP=")])
 
@@ -219,18 +225,18 @@ class ShaderStampCacheTests(unittest.TestCase):
                     shader = [f for f in job["flags"] if f.startswith("-DLONGSHOT_SHADER_STAMP=")]
                     version = [f for f in job["flags"] if f.startswith("-DLONGSHOT_VERSION=")]
                     self.assertEqual(len(shader), int(name == "gpu/vk/vk_shader.cpp"))
-                    self.assertEqual(len(version), int(name == "gpu/vk/vk_menu.cpp"))
+                    self.assertEqual(len(version), int(name == "gpu/vk/vk_version.cpp"))
                     if name.startswith(THIRD_PARTY):   # (none of them reads it: a set made for players fits any build)
                         self.assertNotIn("-DLONGSHOT_RELEASE", job["flags"])
                     elif not name.startswith(("host/posix/", "third_party/zstd/", "third_party/zbic/", "gen/")):   # (plain C libraries, the fonts' bytes)
                         self.assertIn("-DLONGSHOT_RELEASE", job["flags"])
                 self.assertEqual(self.changed(before, self.jobs(linux, version="new", release=True)),
-                                 {"gpu/vk/vk_menu.cpp"})
+                                 {"gpu/vk/vk_version.cpp"})
 
     def test_third_party_parts_are_built_for_x86_64_v3_with_the_stamp(self):
         """(nx2/third_party_objects.py) Eden's recompiler, sirit, Dear ImGui and zbic's zstd at THIRD_PARTY_CPU, with the stamp at
-        the end of their headers, so the release's set fits every CPU with v3's features; the back end's own files (and suyu's
-        texture decoders, built with its profile) at the game's CPU, without it"""
+        the end of their headers, so the release's set fits every CPU with v3's features; the back end's own files (and the CPU
+        texture decoders, gpu/vk/texdecode, built with its profile) at the game's CPU, without it"""
         for linux in (False, True):
             with self.subTest(linux=linux):
                 plain = self.jobs(linux)
@@ -281,7 +287,7 @@ class ShaderStampCacheTests(unittest.TestCase):
     # (RX_VK_PGO, after ProjectReLink: the back end's own files, not Eden's recompiler, sirit, Dear ImGui, the fonts, zstd or the
     # POSIX calls)
     def own(self, jobs):
-        return {n for n in jobs if n.startswith(("gpu/vk/vk_", "gpu/third_party/suyu/"))}
+        return {n for n in jobs if n.startswith(("gpu/vk/vk_", "gpu/vk/menu/", "gpu/vk/texdecode/"))}   # (the menu's modules too, #1633; the CPU texture decoders)
 
     def test_no_profile_is_the_build_as_it_was(self):
         for linux in (False, True):
@@ -298,7 +304,9 @@ class ShaderStampCacheTests(unittest.TestCase):
                     gen = self.jobs(linux, pgo="gen")
                 own = self.own(plain)
                 self.assertIn("gpu/vk/vk_draw.cpp", own)
-                self.assertIn("gpu/third_party/suyu/video_core/textures/astc.cpp", own)
+                self.assertIn("gpu/vk/texdecode/astc.cpp", own)
+                self.assertIn("gpu/vk/texdecode/block_linear.cpp", own)
+                self.assertFalse([n for n in plain if n.startswith("gpu/third_party/")])   # (suyu's texture decoders are no longer built)
                 self.assertEqual(set(gen) - set(plain), {"host/pgo_rt.c"})   # (the counters' writer, the module's own copy)
                 self.assertEqual({n for n, j in gen.items() if "-fprofile-instr-generate" in j["flags"]}, own)
                 self.assertEqual(self.changed(plain, {n: gen[n] for n in plain}), own)

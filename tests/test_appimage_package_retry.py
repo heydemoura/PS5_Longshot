@@ -47,6 +47,11 @@ def step(stage):
         if os.environ.get('BOOTSTRAP_STALL')=='2':signal.signal(signal.SIGTERM,signal.SIG_IGN)
         time.sleep(3)
     if fail:raise SystemExit(int(os.environ.get('BOOTSTRAP_FAIL_CODE','100')))
+if name=='sed':
+    # (#2373: the enrolled source moved to ppa.launchpad.net, in place; never the machine's own apt sources)
+    data['seds'].append({'argv':args[:2],'configured':data['configured']})
+    state.write_text(json.dumps(data))
+    raise SystemExit(0)
 if name=='timeout':
     data['timeouts'].append(args[:2])
     state.write_text(json.dumps(data))
@@ -88,13 +93,13 @@ class PackageRetry(unittest.TestCase):
             folder = Path(temp)
             tools = folder / "bin"
             tools.mkdir()
-            for command in ("apt-get", "add-apt-repository", "sleep", "timeout"):
+            for command in ("apt-get", "add-apt-repository", "sed", "sleep", "timeout"):
                 path = tools / command
                 path.write_text(STUB, encoding="utf-8")
                 path.chmod(0o755)
             state = folder / "state.json"
             state.write_text(json.dumps({"calls": [], "failures": 0, "configured": False,
-                                         "key_valid": False, "signed_index": False, "timeouts": []}), encoding="utf-8")
+                                         "key_valid": False, "signed_index": False, "timeouts": [], "seds": []}), encoding="utf-8")
             script = folder / "bootstrap.sh"
             script.write_text(bootstrap(ROOT), encoding="utf-8")
             env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"],
@@ -113,6 +118,9 @@ class PackageRetry(unittest.TestCase):
         code, calls = self.run_bootstrap()
         self.assertEqual(code, 0)
         self.assertEqual([c["stage"] for c in calls], list(STAGES))
+        # (the enrolled PPA source is rewritten to ppa.launchpad.net once, after enrollment and before its signed refresh)
+        self.assertEqual(self.last_state["seds"], [{"argv": ["-i", r"s|https://ppa\.launchpadcontent\.net/|http://ppa.launchpad.net/|g"],
+                                                     "configured": True}])
 
     def test_each_transient_failure_retries_its_own_recovery_boundary(self):
         for stage in STAGES:

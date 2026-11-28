@@ -29,7 +29,8 @@ function downloadButtons(body) {
     const buttons = `<div class="download-buttons">\n${links.map(([, text, url], i) =>
       `<a class="button${i < 2 ? ' primary' : ''}" href="${url}">${text}</a>`).join('\n')}\n</div>\n`;
     return (links.some(([, , url]) => url.startsWith('/download/launcher/')) ? channelPicker() +
-      '<p class="launcher-version"><span data-launcher-version role="status">Enable JavaScript to see the current launcher version.</span></p>\n' : '') + buttons;
+      '<p class="launcher-version"><span data-launcher-version role="status">Enable JavaScript to see the current launcher version.</span><br>\n' +
+      'This is the launcher\'s own version. The game it builds is numbered as a Longshot version, separately: the launcher downloads it for you.</p>\n' : '') + buttons;
   });
 }
 
@@ -38,7 +39,6 @@ function downloadButtons(body) {
 // No channel starts selected: the best-channel download route stays current even if metadata fails.
 export const launcherChannels = [
   { value: 'stable', name: 'Stable', note: 'For playing.' },
-  { value: 'rc', name: 'Release candidate', note: 'The next version, to try before it is stable.' },
   { value: 'nightly', name: 'Nightly', note: 'Every change, untested: it may break your saves or settings, so copy them first.' },
 ];
 
