@@ -187,6 +187,12 @@ screen, so a screenshot or a stream says which change it is (default: the job's 
 | `timing-cpu` | A measured build | GPU runs on the other CPUs |
 | `profile` | A profile recorded in the game | As `timing` |
 
+Every job gets the queue's own NVIDIA shader cache, `queue/nvcache/` in the development folder (`LONGSHOT_QUEUE_NV_CACHE`;
+a `__GL_SHADER_DISK_CACHE_PATH` you set is kept). NVIDIA files its cache by the program's name alone, so without it a
+build's shader preparation and the queue's runs would fill and evict the cache of the game you play on this PC.
+The queue-managed cache allows NVIDIA's cleanup and defaults to a 10 GiB limit (`__GL_SHADER_DISK_CACHE_SIZE` can
+override it). If its folder cannot be created, the job stops instead of using the player's cache.
+
 - **Measure with `timing`, run everything else with `shared`.** Keep each GPU job short: a long batch holds the queue.
 - **A timed run says when the PC was busy.** While it measures, the queue samples every 2 s what the run's own processes
   stalled on (CPU, memory and disk: its job's cgroup), the other CPUs' use, builds outside the queue and jobs beside it.

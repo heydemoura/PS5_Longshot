@@ -178,7 +178,34 @@ class Environment(unittest.TestCase):
                 self.assertEqual(added, set(), mode)
                 self.assertEqual(env["LONGSHOT_JOB_NAME"], "a-job")
             self.assertIn("__GL_SHADER_DISK_CACHE_PATH", q.job_env(base, "g", "shared", s, 42))
-            self.assertNotIn("__GL_SHADER_DISK_CACHE_PATH", q.job_env(base, "b", "build", s, 42))
+            # (a build too: its shader preparation runs on the GPU, and must not fill the player's game's cache)
+            self.assertEqual(q.job_env(base, "b", "build", s, 42)["__GL_SHADER_DISK_CACHE_PATH"],
+                             q.job_env(base, "g", "shared", s, 42)["__GL_SHADER_DISK_CACHE_PATH"])
+            own = dict(base, __GL_SHADER_DISK_CACHE_PATH="/mine")
+            self.assertEqual(q.job_env(own, "b", "build", s, 42)["__GL_SHADER_DISK_CACHE_PATH"], "/mine")
+
+    def test_queue_shader_cache_policy(self):
+        with tempfile.TemporaryDirectory() as d:
+            s = dict(q.DEFAULTS, LONGSHOT_QUEUE_STATE=d)
+            base = {"TMPDIR": d, "__GL_SHADER_DISK_CACHE_SKIP_CLEANUP": "1"}
+            env = q.job_env(base, "b", "build", s, 42)
+            self.assertEqual(env["__GL_SHADER_DISK_CACHE_SIZE"], str(10 << 30))
+            self.assertNotIn("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", env)
+            own = dict(base, __GL_SHADER_DISK_CACHE_PATH="/mine", __GL_SHADER_DISK_CACHE_SIZE="123")
+            env = q.job_env(own, "b", "build", s, 42)
+            self.assertEqual(env["__GL_SHADER_DISK_CACHE_SIZE"], "123")
+            self.assertEqual(env["__GL_SHADER_DISK_CACHE_SKIP_CLEANUP"], "1")
+
+    def test_shader_cache_creation_failure_stops_job(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache = os.path.join(d, "unwritable", "cache")
+            s = dict(q.DEFAULTS, LONGSHOT_QUEUE_STATE=d, LONGSHOT_QUEUE_NV_CACHE=cache)
+            with mock.patch.object(common, "on_ram", return_value=False), \
+                 mock.patch.object(q.os, "makedirs", side_effect=OSError("denied")):
+                with self.assertRaises(SystemExit) as error:
+                    q.job_env({"TMPDIR": d}, "b", "build", s, 42)
+            self.assertIn(cache, str(error.exception))
+            self.assertIn("denied", str(error.exception))
 
     def test_run_named_on_screen(self):
         # (a game run says what it tests under the version: desc, else what the run set, else the job's name; a build never)

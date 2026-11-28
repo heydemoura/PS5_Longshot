@@ -25,7 +25,7 @@ markers: a job never queues again.
 
 A job gets LONGSHOT_JOB, LONGSHOT_JOB_NAME and LONGSHOT_JOB_MODE, never an OOT_, RX_ or A64_ variable (those are the
 build's and the game's switches: a variable naming the job would change what every job builds or runs); TMPDIR moved off a RAM file
-system; for the GPU modes its own NVIDIA shader cache folder (LONGSHOT_QUEUE_NV_CACHE); on Linux its own systemd scope (the
+system; for every mode its own NVIDIA shader cache folder (LONGSHOT_QUEUE_NV_CACHE); on Linux its own systemd scope (the
 OOM killer stops that job, not your terminal) and CPU affinity while a timed run measures. Every job also waits for memory
 (LONGSHOT_QUEUE_MIN_FREE_GB, _MAX_PRESSURE, _MAX_SWAP_GB), and a timed run for builds outside the queue. While a timed run
 measures, the queue samples every 2 s what its processes stalled on (Noise: CPU, memory and disk, its job's cgroup's PSI),
@@ -549,15 +549,18 @@ def job_env(environ, name, mode, s, me_pid, desc=None):
             env.update(TMPDIR=d, TMP=d, TEMP=d)
         except OSError:
             pass
-    if MODES[mode][0] and not env.get("__GL_SHADER_DISK_CACHE_PATH"):
+    # (every mode, builds too: a build's shader preparation starts the game on the GPU, and NVIDIA files its cache by the
+    # program's name alone, so a build left on ~/.cache/nvidia fills the player's game's cache with its own pipelines and
+    # evicts the game's; in this folder it warms the one the queue's runs read)
+    if not env.get("__GL_SHADER_DISK_CACHE_PATH"):
         nv = s["LONGSHOT_QUEUE_NV_CACHE"] or os.path.join(state, "nvcache")
         try:
             os.makedirs(nv, exist_ok=True)   # (NVIDIA keeps no cache at all in a folder that isn't there)
-            env["__GL_SHADER_DISK_CACHE_PATH"] = nv
-            env.setdefault("__GL_SHADER_DISK_CACHE_SIZE", str(10 << 30))
-            env.setdefault("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", "1")
-        except OSError:
-            pass
+        except OSError as e:
+            sys.exit("dev.py queue: can't create NVIDIA shader cache at %s (%s)" % (nv, e))
+        env["__GL_SHADER_DISK_CACHE_PATH"] = nv
+        env.setdefault("__GL_SHADER_DISK_CACHE_SIZE", str(10 << 30))
+        env.pop("__GL_SHADER_DISK_CACHE_SKIP_CLEANUP", None)
     return env
 
 
