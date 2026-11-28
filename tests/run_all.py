@@ -43,6 +43,11 @@ parts, which split the checks by those times so the parts take about as long (CI
 in exactly one part, whatever the times say, so stale times only make the parts uneven. After a full run on one OS,
 --write-times puts that run's times in the file, for that OS.
 
+Each check starts through tests/check_cache_boot.py, which sends its compiler calls (and the C++ checks' own) through
+tests/check_cache.py: a compile keyed by its preprocessed source, flags and compiler, kept in a folder shared by every
+worktree, so a compile done before is copied instead of run. The summary ends with its hits and misses.
+LONGSHOT_CHECK_CACHE=<dir> moves it; LONGSHOT_CHECK_CACHE=0 starts each check as `python -I -B <check>` again.
+
 The byte-compile of every tracked .py is listed as BYTE_COMPILE_ATOM, a name with no spaces, so it can be passed on a
 command line (--exact).
 """
@@ -81,6 +86,15 @@ TIMES = os.path.join(ROOT, "tests", "run_all_times.json")
 BYTE_COMPILE_ATOM = "tests/byte_compile_tracked.py"
 DEFAULT_SECS = 1.0   # (a check not in TIMES: most take about that or less)
 TIMES_MIN = 2.0      # (--write-times keeps only the checks that took this long or longer)
+# (the checks' compiles through tests/check_cache.py; None when it is turned off, or not beside this file)
+BOOT = os.path.join(ROOT, "tests", "check_cache_boot.py")
+try:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import check_cache
+except ImportError:
+    check_cache = None
+finally:
+    sys.path.pop(0)
 
 # Retired: the central tables these declarations replaced. They stay, empty, so that an entry a branch from before the
 # move adds here stops the run and says where it belongs, instead of being dropped without a word. Do not add to them.
@@ -293,7 +307,8 @@ def python_check(rel, decl, tools, timeout):
     missing += [m for m in decl["modules"] if importlib.util.find_spec(m) is None]
 
     def run():
-        return run_check([sys.executable, "-I", "-B", os.path.join(ROOT, rel)] + args, timeout)
+        boot = [BOOT] if cache_root() else []
+        return run_check([sys.executable, "-I", "-B"] + boot + [os.path.join(ROOT, rel)] + args, timeout)
     return run, missing
 
 
@@ -395,6 +410,22 @@ def end_check(root, token):
         time.sleep(0.005)
 
 
+def cache_root():
+    """The compile cache's folder (tests/check_cache.py), or None: turned off (LONGSHOT_CHECK_CACHE=0), or not here"""
+    if check_cache is None or not os.path.isfile(BOOT):
+        return None
+    return check_cache.root()
+
+
+def cached(argv):
+    """A compiler's command line through the compile cache, when it is on"""
+    base = cache_root()
+    if not base:
+        return argv
+    return [sys.executable, "-I", "-B", check_cache.__file__, "--cache", base,
+            "--stats", os.environ.get("LONGSHOT_CHECK_CACHE_STATS", ""), "--"] + argv
+
+
 def cpp_checks(tools, timeout):
     """gpu/vk/tests: the presentation rectangle (all of it), the lowering harness built and run over no programs
     (the programs it reads are dumped from the game, so here it only shows the lowering still compiles), the
@@ -406,7 +437,7 @@ def cpp_checks(tools, timeout):
         def run():
             with tempfile.TemporaryDirectory() as tmp:
                 exe = os.path.join(tmp, "t.exe")
-                r = run_check([cxx, "-std=c++20", *flags, os.path.join(ROOT, src), "-o", exe], timeout)
+                r = run_check(cached([cxx, "-std=c++20", *flags, os.path.join(ROOT, src), "-o", exe]), timeout)
                 if r.returncode:
                     return r
                 return run_check([exe] + [a.replace("{tmp}", tmp) for a in args], timeout)
@@ -788,6 +819,12 @@ def main():
                 print(c.name)
         return 0
     rank = {name: i for i, name in enumerate(by_time([c.name for c in checks], times))}
+    stats = None
+    if cache_root():
+        check_cache.prune()
+        fd, stats = tempfile.mkstemp(prefix="check-cache-", suffix=".txt")
+        os.close(fd)
+        os.environ["LONGSHOT_CHECK_CACHE_STATS"] = stats   # (the checks' compiles each add a line: hit, miss or pass)
 
     def one(c):
         t = time.time()
@@ -839,6 +876,15 @@ def main():
     for c in order:
         print("%-8s %8s  %s%s" % (c.status, "" if c.why_skip else "%.1fs" % c.secs, c.name,
                                   "  (%s)" % c.why_skip if c.why_skip else ""))
+    if stats:
+        try:
+            with open(stats, encoding="ascii", errors="replace") as f:
+                words = f.read().split()
+            os.remove(stats)
+        except OSError:
+            words = []
+        print("compile cache: %d hits, %d misses, %d passed through (%s)" % (
+            words.count("hit"), words.count("miss"), words.count("pass"), cache_root()))
     print(head, flush=True)
 
     summary = os.environ.get("GITHUB_STEP_SUMMARY")

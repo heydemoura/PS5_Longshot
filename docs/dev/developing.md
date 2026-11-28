@@ -234,6 +234,11 @@ the whole suite's stand-in. Ruff (`ruff.toml`: pyflakes and a few error rules, 1
 compile with `-Werror`; when you change C++ that a check compiles, run them with both compilers (`CXX=g++ ...`, then
 `CXX=clang++ ...`). Before a pull request, run the whole suite.
 
+The checks' compiles are cached by what they compile (the preprocessed source, the flags, the compiler), in one folder
+every clone and worktree on the PC shares, so a second run, or a run in another worktree, compiles only what changed;
+the run's last lines count the hits. `LONGSHOT_CHECK_CACHE=<dir>` moves the cache, and `LONGSHOT_CHECK_CACHE=0` turns
+it off (`tests/check_cache.py` says what it keys on and what it leaves alone).
+
 `tests/run_vulkan_fixtures.py` runs write-back, copy and aspect/crop cases on Mesa's software Vulkan driver (lavapipe)
 with validation. It needs the loader, headers, `vulkaninfo`, lavapipe and the validation layer, and is CPU Vulkan, not
 a GPU or a game run:

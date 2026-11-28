@@ -131,6 +131,12 @@ The switches players are pointed to (`RX_VK_ASTC_RGBA8`, `RX_VK_MESH_NOCULL` on 
 Scripted input, screenshots, frame dumps and crash switches are in [developing](../developing.md#run-the-game-for-a-test).
 Upscaler switches are in [upscalers](upscalers.md#switches).
 
+### Game-free checks
+
+| Switch | What it does |
+|---|---|
+| `LONGSHOT_CHECK_CACHE=<folder>\|0` | Where `tests/run_all.py` keeps compiled checks, shared across worktrees. Unset: `%LOCALAPPDATA%\Longshot\check-cache` on Windows when available, else `$XDG_CACHE_HOME/longshot-checks` or `~/.cache/longshot-checks`. Set a folder to move it, or `0` to turn it off. |
+
 ### Switches for test runs
 
 | Switch | What it does |
