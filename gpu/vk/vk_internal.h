@@ -291,6 +291,7 @@ bool memory_init();                                   // vk_memory.cpp
 enum class TableCover : uint8_t { Held, Written, Conflict, Outside, Copy };
 TableCover memory_table_cover(uint64_t gpu, uint64_t n, uint64_t address);
 void page_table_check_close();   // (vk_draw.cpp: RX_VK_GP_TABLE's last line, the GPU waited for with =2)
+void present_probe_close();   // (vk_replay.cpp: RX_VK_PRESENT_PROBE's lines queued written, its file closed; at the window's close)
 void memory_cpu_owned(uint64_t guest, uint64_t size);   // (longshot: words the replay writes on the CPU, left out of write-backs)
 // (longshot) The replay's own CPU writes of guest memory, by GPU address: every one goes through guest_cpu_write (or, for a
 // write made in pieces, host->gpu_write and then guest_cpu_wrote over the whole range), so that the write-back diff's shadows

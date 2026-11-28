@@ -896,10 +896,12 @@ void display_main() {
         int first = 0;   // (made frames left out, spread over the set: FIFO's catch-up, take; frame k shown is fifo_pick's)
         int64_t step = 0, ready_at = 0;
         int64_t refresh = 0;   // (on the game's timeline: the display's refresh, ns, for fifo_slot; 0 not known)
+        uint64_t id = 0;       // (the sets taken so far, this one included: its presents' set for RX_VK_PRESENT_PROBE)
         PendingPresent pending[kMaxMult];
     };
     Taken taken[2];   // (the set being shown, and the next one, taken early: take_early)
     int held = 0;
+    uint64_t sets_taken = 0;
     // A fixed multiplier's set at its times on the game's timeline (by_time): fixed_on_timeline. Its game[] marks its
     // game frame, as Auto's
     const auto on_line = [&](const OutSet* set) { return set->shown < 0 && fixed_on_timeline(set->by_time, timeline_off); };
@@ -915,6 +917,8 @@ void display_main() {
         const int64_t t0 = now_ns();
         present_image(j.set->frame[f].image, fg.w, fg.h, nullptr, j.set->frame[f].view, false, true, fg.color_format);
         present_defer_into = nullptr;
+        s.pending[k].game = timed ? j.set->game[f] : f == j.set->made;   // (RX_VK_PRESENT_PROBE's columns, as at its copy)
+        s.pending[k].set = s.id;
         // (as it came: taken within 3 ms of its coming, and its first copy not held in present_image over 3 ms, waiting for a
         // frame slot, a swapchain image or a new swapchain. A wait there grows with the delay; the
         // copy's own time to submit (the game's held submits, the queue's lock) is the pipeline's and counts in the delay:
@@ -931,6 +935,7 @@ void display_main() {
     const auto take = [&](Taken& s, const Job& j, int room, int left) {
         s = Taken{};
         s.j = j;
+        s.id = ++sets_taken;
         if (last_at) {
             const int64_t d = j.at - last_at;
             if (d > 0 && d < 100000000) interval = (interval * 7 + std::clamp<int64_t>(d, 4000000, 50000000)) / 8;

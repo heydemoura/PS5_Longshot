@@ -6171,6 +6171,383 @@ bool present_thread_on();
 void present_hand_off(uint32_t index, VkFence done, uint64_t reflex_id, uint64_t antilag_id, OutputTrialFrame trial);
 void present_finish(VkResult res, bool on_presenter);
 std::atomic<bool> presenter_surface_lost{false};   // (the presenter thread's present: VK_ERROR_SURFACE_LOST_KHR, for present_image)
+
+// (longshot, RX_VK_PRESENT_PROBE=<file>: diag) Where a present's time goes on the GPU. Each present of present_out has a
+// timestamp submitted alone on its queue right before it and another right after it, each with a fence of its own, and its
+// image's copy a timestamp at its end. A thread of the probe's own waits for the two fences and writes one CSV line a present:
+// the clock (QueryPerformanceCounter's ticks on Windows, as RX_VK_FG_LATENCY_LOG's; the steady clock's ns elsewhere) at each
+// probe's submit, at the present's call and return, and when each fence was seen signalled; whether the copy's fence was
+// signalled at the call and at the return; and the three GPU timestamps in ns of the GPU's own clock (a fence is seen no sooner
+// than its timestamp: the reader takes the clocks' offset from them). For the game frame's wait at its present with frame
+// generation (docs/dev/reference/architecture.md#frame-generations-presents). Only present_commit's presents are probed (a
+// fixed multiplier's sets presented ahead, present_ahead_wanted): present_image's go to the presenter thread (present_hand_off)
+// before present_out gets to its probe. The probe is made at the first copy presented ahead (probe_copy_stamp), so the first
+// set's copies have their timestamps; none presented ahead, none made, no file. The file's first line, after a `#`, says the
+// columns are brackets and observations, not waits, and that -1 is a timestamp the probe does not have.
+// A copy's query is handed to it reset from the CPU (vkResetQueryPool), so it reads unavailable until that copy has run:
+// a timestamp the reader finds is that copy's, on whichever queue the present goes (on the presents' own, nothing orders
+// the probe's fences after the copy). The query is then its image's until its present's line takes it, then the line's
+// until the reader has read it; never reset nor written before. One whose copy is not seen run (its timestamp not written
+// in 2 s, its line's fences not seen, or its image copied again before its present) is set aside for the run, never handed
+// out again: that copy may still write it. None free (kProbeCopies held or set aside): the copy goes without, its line's
+// gpu_copy_ns -1, said once in the log. The reader waits up to 2 s for a copy's timestamp to be written, and writes -1 if
+// it is not. A device that cannot reset queries from the CPU (hostQueryReset) has its copies stamped only where the
+// presents are on the replay's queue, which runs the probe's first submit after the copy; on the presents' own, none (said
+// once).
+// The reader writes the file out every 64 lines, and once no line has come for 250 ms. At the window's close
+// (present_probe_close, from mkwvk_close_asked) no probe is made nor present probed any more, and the reader writes the
+// lines queued, flushes and closes the file and ends; the log counts the lines written and not. A line's fences and copy
+// are waited for 2 s at most, and from the close only until 500 ms after it (the waits in steps of 50 ms), so the close
+// is held 500 ms at most past a line whose fence never signals; fences signalled are still seen after that
+constexpr int kProbeSlots = 32, kProbeCopies = 64;
+struct ProbeLine {
+    int slot = 0, queue = 0, copy_query = -1, copy_at_call = -1, copy_at_return = -1;
+    uint32_t index = 0;
+    uint64_t reflex_frame = 0;
+    int64_t before_submit = 0, call = 0, ret = 0, after_submit = 0;
+    int game = -1;      // (1 its set's game frame, 0 a made one; -1 not known)
+    uint64_t set = 0;   // (its set: the display thread's count of the sets it took)
+};
+struct PresentProbe {
+    bool tried = false;
+    FILE* file = nullptr;   // (none: off, or not made. The reader's to write, flush and close)
+    uint32_t family = 0;    // (the queue family its command buffers are for: the presents' queue as the device was made)
+    VkQueryPool pool = VK_NULL_HANDLE;   // (2 a slot, before and after; then kProbeCopies for the copies)
+    VkCommandPool cmd_pool = VK_NULL_HANDLE;
+    VkCommandBuffer before[kProbeSlots]{}, after[kProbeSlots]{};
+    VkFence fb[kProbeSlots]{}, fa[kProbeSlots]{};
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<ProbeLine> lines;   // (mu)
+    std::vector<int> free;         // (mu)
+    std::vector<int> copies_free;  // (mu: the copies' queries no image nor line holds)
+    std::vector<int> copy_query;   // (present_image_mu: each swapchain image's last copy's query, -1 none; the image's until
+                                   // its present's line takes it)
+    std::atomic<uint64_t> copies_unstamped{0};   // (copies that went without: no query free)
+    std::atomic<uint64_t> copies_set_aside{0};   // (queries whose copy was not seen run: never handed out again)
+    bool stamp_copies = true;   // (present_image_mu: false on the presents' own queue without hostQueryReset)
+    std::atomic<bool> off{false};   // (closed, or a submit of its refused: no present probed nor copy stamped from then on)
+    bool stopping = false;          // (mu: closed; the reader writes the lines queued and ends)
+    std::atomic<int64_t> drain_until{0};   // (closed: the steady clock's ns past which the reader waits for nothing)
+    std::thread* reader = nullptr;  // (mu: deleted only once joined, at the close: a reader still running as the process ends
+                                    // is never destroyed joinable)
+    uint64_t written = 0, unwritten = 0;   // (the reader's: lines written, and given up, their fences not seen)
+    VkFence copy_fence = VK_NULL_HANDLE;   // (present_image_mu: the presented image's copy, while present_out runs)
+    int game = -1;      // (present_image_mu: present_commit's frame, while present_out runs: ProbeLine's)
+    uint64_t set = 0;   // (present_image_mu: the same)
+};
+PresentProbe probe;
+bool probe_on() {
+    static const bool on = [] { const char* e = getenv("RX_VK_PRESENT_PROBE"); return e && *e; }();
+    return on;
+}
+int64_t probe_clock() {
+#ifdef _WIN32
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    return q.QuadPart;
+#else
+    return gtl_now();
+#endif
+}
+void probe_main() {
+#ifdef _WIN32
+    SetThreadDescription(GetCurrentThread(), L"mkw_vk present probe");
+#endif
+    const double period = dev.props.limits.timestampPeriod;
+    const auto ready = [] { return !probe.lines.empty() || probe.stopping; };
+    int unflushed = 0;
+    for (;;) {
+        ProbeLine l;
+        {
+            std::unique_lock lk(probe.mu);
+            if (unflushed && !probe.cv.wait_for(lk, std::chrono::milliseconds(250), ready)) {   // (none for 250 ms: written out)
+                lk.unlock();
+                std::fflush(probe.file);
+                unflushed = 0;
+                lk.lock();
+            }
+            probe.cv.wait(lk, ready);
+            if (probe.lines.empty()) break;   // (closed, every line queued written)
+            l = probe.lines.front();
+            probe.lines.pop_front();
+        }
+        const auto line_until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        const auto until = [line_until] {   // (2 s a line; once closed, the drain's end if sooner)
+            const int64_t d = probe.drain_until.load();
+            const auto drain = std::chrono::steady_clock::time_point(
+                std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::nanoseconds(d)));
+            return d && drain < line_until ? drain : line_until;
+        };
+        const auto seen = [&until](VkFence f) {
+            for (;;) {   // (in steps of 50 ms at most, so a close cuts a wait short; past the end, signalled or not at once)
+                const int64_t left = std::chrono::duration_cast<std::chrono::nanoseconds>(until() - std::chrono::steady_clock::now()).count();
+                const uint64_t ns = left > 0 ? (uint64_t)std::min<int64_t>(left, 50000000) : 0;
+                const VkResult r = (::vkx::vkWaitForFences)(dev.device, 1, &f, VK_TRUE, ns);
+                if (r == VK_SUCCESS) return probe_clock();
+                if (r != VK_TIMEOUT || !ns) return int64_t(-1);
+            }
+        };
+        const int64_t before_seen = seen(probe.fb[l.slot]);
+        const int64_t after_seen = seen(probe.fa[l.slot]);
+        if (before_seen < 0 || after_seen < 0) {   // (not signalled in time, or the device lost: the slot is not used again)
+            probe.unwritten++;
+            if (l.copy_query >= 0) probe.copies_set_aside++;   // (nor its copy's query: that copy not seen run)
+            continue;
+        }
+        uint64_t t[2] = {0, 0};
+        long long before_ns = -1, after_ns = -1;   // (none: not given by the driver)
+        if ((::vkx::vkGetQueryPoolResults)(dev.device, probe.pool, 2 * l.slot, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+            before_ns = (long long)(t[0] * period), after_ns = (long long)(t[1] * period);
+        long long copy_ns = -1;   // (none: no query free for the copy, or its timestamp not written in 2 s)
+        bool copy_run = false;    // (its copy seen run: its query free for another)
+        if (l.copy_query >= 0) {
+            for (;;) {   // (its value, and whether it is written yet)
+                uint64_t c[2] = {0, 0};
+                const VkResult r = (::vkx::vkGetQueryPoolResults)(dev.device, probe.pool, 2 * kProbeSlots + l.copy_query, 1, sizeof c,
+                                                                  c, sizeof c, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+                if (r >= 0 && c[1]) copy_ns = (long long)(c[0] * period), copy_run = true;
+                if (r < 0 || c[1] || std::chrono::steady_clock::now() >= until()) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        std::fprintf(probe.file, "%d,%u,%llu,%d,%d,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%d,%llu\n", l.queue, l.index,
+                     (unsigned long long)l.reflex_frame, l.copy_at_call, l.copy_at_return, (long long)l.before_submit, (long long)l.call,
+                     (long long)l.ret, (long long)l.after_submit, (long long)before_seen, (long long)after_seen,
+                     copy_ns, before_ns, after_ns, l.game, (unsigned long long)l.set);
+        probe.written++;
+        if (++unflushed == 64) std::fflush(probe.file), unflushed = 0;
+        VkFence both[2] = {probe.fb[l.slot], probe.fa[l.slot]};
+        (::vkx::vkResetFences)(dev.device, 2, both);
+        std::lock_guard lk(probe.mu);
+        probe.free.push_back(l.slot);
+        if (l.copy_query >= 0 && copy_run) probe.copies_free.push_back(l.copy_query);   // (read: free for another copy)
+        else if (l.copy_query >= 0) probe.copies_set_aside++;   // (its copy not seen run: it may still write it)
+    }
+    std::fclose(probe.file);   // (flushed first)
+}
+/// The queue family of present_out's presents: the presents' own queue's, else the replay's
+uint32_t probe_family() { return dev.present_queue_supported ? dev.present_family : dev.queue_family; }
+/// Whether present_out's present on a queue of `family` is probed: the probe made at the first ask, the first copy presented
+/// ahead's (present_image_mu held). None once closed
+bool probe_ready(uint32_t family) {
+    if (!probe_on() || probe.off) return false;
+    if (!probe.tried) {
+        probe.tried = true;
+        uint32_t n = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(dev.physical, &n, nullptr);
+        std::vector<VkQueueFamilyProperties> fams(n);
+        vkGetPhysicalDeviceQueueFamilyProperties(dev.physical, &n, fams.data());
+        if (family >= n || dev.queue_family >= n || !fams[family].timestampValidBits || !fams[dev.queue_family].timestampValidBits) {
+            logf("vk: present probe: no timestamps on the presents' queue family %u: off", family);
+            return false;
+        }
+        VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qi.queryCount = 2 * kProbeSlots + kProbeCopies;
+        VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pi.queueFamilyIndex = family;
+        if (vkCreateQueryPool(dev.device, &qi, nullptr, &probe.pool) != VK_SUCCESS ||
+            vkCreateCommandPool(dev.device, &pi, nullptr, &probe.cmd_pool) != VK_SUCCESS) {
+            logf("vk: present probe: its query pool or command pool not made: off");
+            return false;
+        }
+        VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ai.commandPool = probe.cmd_pool;
+        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ai.commandBufferCount = 1;
+        VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        for (int s = 0; s < kProbeSlots; s++) {
+            for (int k = 0; k < 2; k++) {   // (each a reset of its query and a timestamp once all before it is done)
+                VkCommandBuffer& cb = k ? probe.after[s] : probe.before[s];
+                if (vkAllocateCommandBuffers(dev.device, &ai, &cb) != VK_SUCCESS) {
+                    logf("vk: present probe: its command buffer %d not made: off", 2 * s + k);
+                    return false;
+                }
+                VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                (::vkx::vkBeginCommandBuffer)(cb, &bi);
+                (::vkx::vkCmdResetQueryPool)(cb, probe.pool, 2 * s + k, 1);
+                (::vkx::vkCmdWriteTimestamp2)(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, probe.pool, 2 * s + k);
+                (::vkx::vkEndCommandBuffer)(cb);
+            }
+            if (vkCreateFence(dev.device, &fi, nullptr, &probe.fb[s]) != VK_SUCCESS ||
+                vkCreateFence(dev.device, &fi, nullptr, &probe.fa[s]) != VK_SUCCESS) {
+                logf("vk: present probe: its fences for slot %d not made: off", s);
+                return false;
+            }
+            probe.free.push_back(s);
+        }
+        for (int q = kProbeCopies; q-- > 0;) probe.copies_free.push_back(q);
+        const char* path = getenv("RX_VK_PRESENT_PROBE");
+        FILE* f = std::fopen(path, "w");
+        if (!f) {
+            logf("vk: present probe: %s not opened: off", path);
+            return false;
+        }
+        std::fputs("# RX_VK_PRESENT_PROBE: one line a present of present_commit. The columns are brackets and observations, not "
+                   "waits: before_submit, call, return and after_submit are the PC's clock around the CPU's calls; copy_done_at_* "
+                   "whether the copy's fence was signalled then (1, 0; -1 none); before_seen and after_seen when the probe's own "
+                   "thread saw its fences; gpu_*_ns the GPU's own clock, -1 none (not given by the driver; gpu_copy_ns also no "
+                   "query free for the copy, its timestamp not written in 2 s, or no copy stamped: the log says why); game 1 for its set's game frame, 0 a made one; set its "
+                   "set, the display thread's count. A present's waits are RX_VK_FRAME_TRACE's slot_wait_ms, gpu_behind_ms and "
+                   "shown_ms\n", f);
+        std::fputs("queue,index,reflex_frame,copy_done_at_call,copy_done_at_return,before_submit,call,return,after_submit,"
+                   "before_seen,after_seen,gpu_copy_ns,gpu_before_ns,gpu_after_ns,game,set\n", f);
+        probe.file = f;
+        probe.family = family;
+        int64_t hz = 1000000000;
+#ifdef _WIN32
+        LARGE_INTEGER q;
+        QueryPerformanceFrequency(&q);
+        hz = q.QuadPart;
+#endif
+        logf("vk: present probe: %s, presents on the %s queue (family %u), clock %lld Hz", path,
+             dev.present_queue_supported ? "presents' own" : "replay's", family, (long long)hz);
+        probe.stamp_copies = dev.host_query_reset || !dev.present_queue_supported;
+        if (!probe.stamp_copies)
+            logf("vk: present probe: no copy timestamps: the presents' own queue does not wait for the copies, and this device "
+                 "cannot reset queries from the CPU (hostQueryReset): gpu_copy_ns -1");
+        std::lock_guard lk(probe.mu);
+        if (probe.stopping) {   // (closed while it was being made: no reader, no file)
+            std::fclose(probe.file);
+            probe.file = nullptr;
+            return false;
+        }
+        probe.reader = new std::thread(probe_main);
+    }
+    return probe.file && family == probe.family;
+}
+/// The copy's timestamp, at the end of the copy into swapchain image `index` when it is presented ahead (present_image_mu held):
+/// the probe made at the first, before its set's presents. In a query no image nor line holds, reset from the CPU first; none
+/// free, the copy goes without (said once). A copy not presented ahead has none: its present goes to the presenter thread, not
+/// probed
+void probe_copy_stamp(VkCommandBuffer cmd, uint32_t index, bool ahead) {
+    if (!ahead || !probe_ready(probe_family()) || !probe.stamp_copies) return;
+    if (probe.copy_query.size() <= index) probe.copy_query.resize(index + 1, -1);
+    int& q = probe.copy_query[index];
+    if (q >= 0) q = -1, probe.copies_set_aside++;   // (the image copied again before its present: that copy maybe not run yet)
+    {
+        std::lock_guard lk(probe.mu);
+        if (!probe.copies_free.empty()) q = probe.copies_free.back(), probe.copies_free.pop_back();
+    }
+    if (q < 0) {
+        if (probe.copies_unstamped++ == 0)
+            logf("vk: present probe: no copy timestamp free (%d, each held from its copy until its line is read): a copy without "
+                 "one, its line's gpu_copy_ns -1", kProbeCopies);
+        return;
+    }
+    if (dev.host_query_reset)   // (unavailable until this copy runs; its last copy seen run, so nothing pending on it)
+        (::vkx::vkResetQueryPool)(dev.device, probe.pool, 2 * kProbeSlots + q, 1);
+    vkCmdResetQueryPool(cmd, probe.pool, 2 * kProbeSlots + q, 1);
+    vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, probe.pool, 2 * kProbeSlots + q);
+}
+/// The present of present_out on `queue` between its two probes (its queue's lock held), or alone with no slot free
+VkResult probe_present(VkQueue queue, const VkPresentInfoKHR& pi, uint32_t index, uint64_t reflex_frame) {
+    int slot = -1;
+    {
+        std::lock_guard lk(probe.mu);
+        if (!probe.free.empty()) slot = probe.free.back(), probe.free.pop_back();
+    }
+    if (slot < 0) return vkQueuePresentKHR(queue, &pi);
+    const auto submit = [&](VkCommandBuffer cmd, VkFence f) {
+        VkCommandBufferSubmitInfo cb{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+        cb.commandBuffer = cmd;
+        VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+        si.commandBufferInfoCount = 1;
+        si.pCommandBufferInfos = &cb;
+        const VkResult r = vkQueueSubmit2(queue, 1, &si, f);
+        if (r == VK_ERROR_DEVICE_LOST) device_lost();
+        return r;
+    };
+    const auto refused = [](const char* which, VkResult r) {   // (off from now on; the present made all the same)
+        probe.off = true;
+        logf("vk: present probe: its timestamp %s the present not submitted (VkResult %d): off", which, (int)r);
+    };
+    const VkFence copy = probe.copy_fence;
+    const auto copy_done = [&] { return copy ? (::vkx::vkWaitForFences)(dev.device, 1, &copy, VK_TRUE, 0) == VK_SUCCESS : -1; };
+    ProbeLine l;
+    l.slot = slot;
+    l.queue = queue == dev.queue ? 0 : 1;
+    l.index = index;
+    l.reflex_frame = reflex_frame;
+    l.game = probe.game;
+    l.set = probe.set;
+    l.copy_query = index < probe.copy_query.size() ? probe.copy_query[index] : -1;
+    l.before_submit = probe_clock();
+    if (const VkResult r = submit(probe.before[slot], probe.fb[slot]); r != VK_SUCCESS) {
+        refused("before", r);
+        {
+            std::lock_guard lk(probe.mu);
+            probe.free.push_back(slot);   // (nothing submitted: its fences unsignalled, free again)
+        }
+        return vkQueuePresentKHR(queue, &pi);
+    }
+    l.copy_at_call = copy_done();
+    l.call = probe_clock();
+    const VkResult res = vkQueuePresentKHR(queue, &pi);
+    l.ret = probe_clock();
+    l.copy_at_return = copy_done();
+    l.after_submit = probe_clock();
+    if (const VkResult r = submit(probe.after[slot], probe.fa[slot]); r != VK_SUCCESS) {
+        refused("after", r);   // (no line: its after fence never signals, so the slot is not used again)
+        return res;
+    }
+    if (l.copy_query >= 0) probe.copy_query[index] = -1;   // (the line's now, until the reader has read it)
+    {
+        std::lock_guard lk(probe.mu);
+        if (!probe.stopping) probe.lines.push_back(l);   // (closed meanwhile: not written)
+    }
+    probe.cv.notify_one();
+    return res;
+}
+/// Whether present_out's presents are probed, in the log: a line when that changes, 5 s after the line before at the soonest,
+/// with the presents of each kind since then. Only present_commit's are (a fixed multiplier's sets presented ahead);
+/// present_image's go to the presenter thread first (present_image_mu held)
+void probe_note(bool probed) {
+    if (!probe_on() || (probe.tried && !probe.file) || probe.off) return;   // (off, not made or closed: its own line said so)
+    static int last = -1;
+    static uint64_t count[2] = {};
+    static std::chrono::steady_clock::time_point line_at;
+    const auto now = std::chrono::steady_clock::now();
+    if (int(probed) != last && (last < 0 || now - line_at >= std::chrono::seconds(5))) {
+        char since[96] = "";
+        if (last >= 0)
+            std::snprintf(since, sizeof since, "; since the line before, %llu probed and %llu not", (unsigned long long)count[1],
+                          (unsigned long long)count[0]);
+        logf("vk: present probe: the presents %s%s", probed ? "probed (a fixed multiplier's sets presented ahead)"
+                                                            : "not probed (handed to the presenter thread: frame generation off, "
+                                                              "or its sets not presented ahead)", since);
+        last = probed, count[0] = count[1] = 0, line_at = now;
+    }
+    count[probed]++;
+}
+/// RX_VK_PRESENT_PROBE at the window's close: no present probed from now on, the lines queued written by the reader (the
+/// fences waited for 500 ms at most in all, probe.drain_until), the file flushed and closed, the reader joined, and the
+/// counts in the log. Nothing when the probe was not made, or once closed
+void probe_close() {
+    probe.off = true;   // (first: none made nor probed from now on, whether it was made or not)
+    std::thread* reader;
+    {
+        std::lock_guard lk(probe.mu);
+        const bool closed = probe.stopping;
+        probe.stopping = true;   // (also for a probe being made now: probe_ready then makes no reader)
+        if (!probe.reader || closed) return;
+        reader = probe.reader;
+    }
+    probe.drain_until = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            (std::chrono::steady_clock::now() + std::chrono::milliseconds(500)).time_since_epoch()).count();
+    probe.cv.notify_all();
+    reader->join();
+    {
+        std::lock_guard lk(probe.mu);
+        probe.reader = nullptr;   // (joined: deleted. probe_ready makes none after the close, stopping set above)
+    }
+    delete reader;
+    logf("vk: present probe: closed: %llu lines written, %llu not (their fences not seen in time); %llu copies without their "
+         "timestamp (no query free), %llu queries set aside (their copy not seen run)", (unsigned long long)probe.written,
+         (unsigned long long)probe.unwritten, (unsigned long long)probe.copies_unstamped.load(),
+         (unsigned long long)probe.copies_set_aside.load());
+}
 }  // namespace
 // doc: docs/dev/reference/architecture.md#frame-generations-presents (rule 4: a frame slot per frame of both sets)
 /// (longshot) The frame slots present_image uses while frame generation runs, for the sets a swapchain is made for
@@ -6684,6 +7061,7 @@ void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int c
     menu_record(f.cmd, index, dev.swap_extent.width, dev.swap_extent.height, applied_colour ? colour : 0);   // (longshot) Dear ImGui's overlays, over all of it
     menu_rumble_tick();   // (longshot: the Rumble strength row's own rumble, vk_menu.cpp)
     image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    probe_copy_stamp(f.cmd, index, present_defer_into != nullptr);   // (RX_VK_PRESENT_PROBE: when the copy is done)
     // Allocate the trial backing before submitting this copy, so allocation cannot hold up its presenter hand-off.
     if (trial.generation && preview_path && present_thread_on())
         make_output_trial_frame(trial, dev.swapchain_generation, OutputPath::FifoShown);
@@ -6756,9 +7134,9 @@ void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int c
     dlssg_before_present(src != VK_NULL_HANDLE);
     // (acquire ahead: the presenter thread asks for the next present's image right after it makes this one, a game frame's)
     present_acquire_ahead = src && acquire_ahead_wanted();
-    present_copy_done = f.done;
+    present_copy_done = probe.copy_fence = f.done;
     present_out(index, qk, trial, preview_path);
-    present_copy_done = VK_NULL_HANDLE;
+    present_copy_done = probe.copy_fence = VK_NULL_HANDLE;
     present_acquire_ahead = false;
 }
 
@@ -6826,6 +7204,9 @@ static void acquire_ahead(VkSwapchainKHR sc, uint64_t generation) {
 }
 } // namespace
 
+/// (vk_internal.h) RX_VK_PRESENT_PROBE's file written out and closed, at the window's close (mkwvk_close_asked)
+void present_probe_close() { probe_close(); }
+
 bool present_commit(const PendingPresent& p) {
     if (!p.used) return false;
     rec::Settled settled;   // (RX_VK_RECORDER_PARTS: its copy was submitted after the parts before it; the present needs none)
@@ -6835,7 +7216,11 @@ bool present_commit(const PendingPresent& p) {
     const uint64_t was = reflex_present_frame, al_was = antilag_present_frame;
     reflex_present_frame = p.reflex_frame;   // (NVIDIA Reflex: the frame this present shows, as at its copy)
     antilag_present_frame = p.antilag_frame;   // (AMD Anti-Lag 2: the same)
+    probe.copy_fence = p.done;   // (RX_VK_PRESENT_PROBE: its copy's state at the present)
+    probe.game = p.game ? 1 : 0, probe.set = p.set;   // (and its frame: the set's game frame or a made one, and its set)
     const bool shown = present_out(p.index, qk);
+    probe.copy_fence = VK_NULL_HANDLE;
+    probe.game = -1, probe.set = 0;
     reflex_present_frame = was, antilag_present_frame = al_was;
     return shown;
 }
@@ -6856,6 +7241,7 @@ static bool present_out(uint32_t index, std::unique_lock<decltype(dev.present_mu
         frame = make_output_trial_frame(trial, dev.swapchain_generation, fifo_shown ? OutputPath::FifoShown : OutputPath::Unavailable);
     }
     if (hand_off) {
+        probe_note(false);   // (RX_VK_PRESENT_PROBE: not probed, in the log)
         const uint64_t reflex_id = pi.pNext ? static_cast<const VkPresentIdKHR*>(pi.pNext)->pPresentIds[0] : 0;
         if (reflex_id) reflex_present_handed_off();
         // (AMD Anti-Lag 2: snapshot the frame index now before the next input stage advances it; presenter_loop fires PRESENT right before vkQueuePresentKHR; skip the lock when unavailable)
@@ -6889,12 +7275,15 @@ static bool present_out(uint32_t index, std::unique_lock<decltype(dev.present_mu
     const auto copy_done = [&] { return (::vkx::vkWaitForFences)(dev.device, 1, &copy, VK_TRUE, 0) == VK_SUCCESS; };
     const bool copy_was_done = copy && copy_done();
     const int64_t present_t0 = fps_breakdown_on() ? fps_clock() : 0;
+    // (RX_VK_PRESENT_PROBE: with the probe's two timestamps around it)
+    const bool probed = probe_ready(probe_family());
+    probe_note(probed);
     if (dev.present_queue_supported) {
         qk.unlock();
         std::lock_guard pq(dev.present_queue_mu);
-        res = vkQueuePresentKHR(dev.present_queue, &pi);
+        res = probed ? probe_present(dev.present_queue, pi, index, reflex_present_frame) : vkQueuePresentKHR(dev.present_queue, &pi);
     } else {
-        res = vkQueuePresentKHR(dev.queue, &pi);
+        res = probed ? probe_present(dev.queue, pi, index, reflex_present_frame) : vkQueuePresentKHR(dev.queue, &pi);
     }
     if (present_t0) {
         const bool waited_gpu = copy && !copy_was_done && copy_done();

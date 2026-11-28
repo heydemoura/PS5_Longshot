@@ -204,10 +204,14 @@ struct PendingPresent {
     uint64_t swapchain, swapchain_generation;
     uint64_t reflex_frame = ~0ull;   // (NVIDIA Reflex: the frame it shows; vk_reflex.h reflex_present_frame)
     uint64_t antilag_frame = ~0ull;  // (AMD Anti-Lag 2: the same; vk_antilag.h antilag_present_frame)
+    uint64_t done = 0;   // (its copy's fence)
+    bool game = false;   // (RX_VK_PRESENT_PROBE: its set's game frame)
+    uint64_t set = 0;    // (RX_VK_PRESENT_PROBE: its set)
 };
 thread_local uint64_t reflex_present_frame = ~0ull;   // (vk_reflex.cpp: the frame the present shows, kept around present_out)
 thread_local uint64_t antilag_present_frame = ~0ull;  // (vk_antilag.cpp: the same for AMD Anti-Lag 2)
 PendingPresent* present_defer_into=nullptr;
+struct { uint64_t copy_fence = 0; int game = -1; uint64_t set = 0; } probe;   // (RX_VK_PRESENT_PROBE's: the presented image's copy and frame)
 unsigned committed=0, after_acquire=0;
 bool present_out(uint32_t, std::unique_lock<std::mutex>&) {++committed; return true;}
 void dlssg_before_present(bool) {}   // (vk_dlssg.cpp: NVIDIA Streamline's own, nothing without it)

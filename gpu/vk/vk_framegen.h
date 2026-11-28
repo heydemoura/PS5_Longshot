@@ -61,6 +61,8 @@ struct PendingPresent {
     uint64_t reflex_frame = ~0ull;           // (NVIDIA Reflex: the frame it shows, vk_reflex.h reflex_present_frame)
     uint64_t antilag_frame = ~0ull;          // (AMD Anti-Lag 2: the frame it shows, vk_antilag.h antilag_present_frame)
     uint64_t swapchain_generation = 0;
+    bool game = false;   // (RX_VK_PRESENT_PROBE: it shows its set's game frame, not a made one)
+    uint64_t set = 0;    // (RX_VK_PRESENT_PROBE: its set, the display thread's count of the sets it took)
 };
 extern thread_local PendingPresent* present_defer_into;
 bool present_commit(const PendingPresent& p);   // (false: not shown, nothing deferred or a swapchain made again since)

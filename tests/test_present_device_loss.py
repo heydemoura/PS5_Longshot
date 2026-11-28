@@ -73,21 +73,23 @@ bool was_held=false; int acquire_fence=6, acquire_semaphore=0;
 int bi=0, si=0, pi=0, index=0;
 uint64_t acquire_timeout=UINT64_MAX;
 int result=VK_SUCCESS, calls=0, reports=0, continued=0;
+bool probed=false; uint64_t reflex_present_frame=0;   // (RX_VK_PRESENT_PROBE: the present made by probe_present)
 struct Lost {};
 [[noreturn]] void device_lost() { ++reports; throw Lost{}; }
 '''
-    for call in calls:
+    for call in calls + ("probe_present",):
         fixture +="template<class... A> VkResult " + call + "(A...) { ++calls; return result; }\n"
     for i, (_, snippet) in enumerate(sites):
         fixture += "void site_%d() {\n%s\n(void)res; ++continued;\n}\n" % (i, snippet)
-    fixture += "int main() {\nint failed=0;\n"
+    fixture += "int main() {\nint failed=0;\nfor (int p=0; p<2; ++p) { probed = p != 0;\n"
     for i, (name, _) in enumerate(sites):
         for result in (0, -4, -1, 2, 1000001003, -1000001004):
             fixture += ("result=%d; calls=reports=continued=0; try { site_%d(); } catch (const Lost&) {}\n"
                         "if (calls!=1 || reports!=%d || continued!=%d) { "
-                        "std::printf(\"FAIL: %s site%d result%%d reports%%d continued%%d\\n\",result,reports,continued); ++failed; }\n"
+                        "std::printf(\"FAIL: %s site%d probed%%d result%%d reports%%d continued%%d\\n\",p,result,reports,continued); ++failed; }\n"
                         % (result, i, int(result == -4), int(result != -4), name, i))
-    fixture += 'if (!failed) { std::puts("PASS: all ten native WSI sites route device loss before continuing; other results preserved"); }\nreturn failed ? 1 : 0;\n}\n'
+    fixture += "}\n"
+    fixture += 'if (!failed) { std::puts("PASS: all ten native WSI sites route device loss before continuing, with and without the present probe; other results preserved"); }\nreturn failed ? 1 : 0;\n}\n'
     with tempfile.TemporaryDirectory(prefix="present-device-loss-") as temp:
         cpp, exe = Path(temp) / "fixture.cpp", Path(temp) / "fixture.exe"
         cpp.write_text(fixture, encoding="utf-8")

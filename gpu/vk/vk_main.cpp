@@ -592,6 +592,84 @@ bool create_device() {
     queues(dev.queue_family, 1);
     if (compute_family != UINT32_MAX) queues(compute_family, 1);
     (void)q;
+    // (longshot, diagnosis) The queues' global priority (VK_KHR_global_priority, else VK_EXT_global_priority): low, medium,
+    // high or realtime (any case; an off word none); RX_VK_QUEUE_PRIORITY for the replay's queue, RX_VK_PRESENT_QUEUE_PRIORITY
+    // for the presents' own (RX_VK_PRESENT_QUEUE=1). Unset: none asked, the driver's own. A level the queue's family does not
+    // list is not asked (device_policy.h's parse_queue_priority and queue_priority_listed, tests/test_queue_priority.py), and
+    // a device not made with them is made again without them (said refused only for the spec's refusals, its
+    // queue_priority_refused); the log says what was asked and what the device was made with.
+    // For where the game frame's present waits on the GPU with frame generation (RX_VK_PRESENT_PROBE, vk_replay.cpp).
+    VkDeviceQueueGlobalPriorityCreateInfoKHR queue_priority[2] = {{VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR},
+                                                                  {VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR}};
+    const char* priority_ext = nullptr;   // (set when a priority is chained: the extension added to `want`)
+    {
+        const char* const names[2] = {"RX_VK_QUEUE_PRIORITY", "RX_VK_PRESENT_QUEUE_PRIORITY"};
+        const char* const whose[2] = {"the replay's queue", "the presents' own queue"};
+        const uint32_t family_of[2] = {dev.queue_family, compute_family};
+        const char* const ext = has_extension(exts, VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME)   ? VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME
+                                : has_extension(exts, VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME) ? VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME
+                                                                                             : nullptr;
+        const bool can_list = has_extension(exts, VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME) ||
+                              has_extension(exts, VK_EXT_GLOBAL_PRIORITY_QUERY_EXTENSION_NAME);
+        for (int k = 0; k < 2; k++) {
+            const char* const e = getenv(names[k]);
+            if (!e || !*e) continue;
+            uint32_t level = 0;   // (device_policy.h's rules: the level's read, then the family's gate)
+            if (!policy_rule::parse_queue_priority(e, level)) {
+                logf("vk: %s=%s: not low, medium, high, realtime or off; no priority asked for %s", names[k], e, whose[k]);
+                continue;
+            }
+            if (!level) continue;   // (an off word: none asked, the driver's own)
+            if (family_of[k] == UINT32_MAX) {
+                logf("vk: %s=%s: the presents have no queue of their own (RX_VK_PRESENT_QUEUE); no priority asked", names[k], e);
+                continue;
+            }
+            if (!ext) {
+                logf("vk: %s=%s: the driver has no VK_KHR_global_priority nor VK_EXT_global_priority; no priority asked", names[k], e);
+                continue;
+            }
+            std::string listed;   // (the family's levels, where its list is read)
+            std::vector<VkQueueFamilyGlobalPriorityPropertiesKHR> gp;   // (the families' lists, where the driver gives them)
+            if (can_list) {
+                auto props2 = (PFN_vkGetPhysicalDeviceQueueFamilyProperties2)instance_proc()(dev.instance,
+                                                                                            "vkGetPhysicalDeviceQueueFamilyProperties2");
+                uint32_t count = 0;
+                if (props2) props2(dev.physical, &count, nullptr);
+                if (props2 && family_of[k] < count) {
+                    gp.assign(count, {VK_STRUCTURE_TYPE_QUEUE_FAMILY_GLOBAL_PRIORITY_PROPERTIES_KHR});
+                    std::vector<VkQueueFamilyProperties2> fp(count, {VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2});
+                    for (uint32_t i = 0; i < count; i++) fp[i].pNext = &gp[i];
+                    props2(dev.physical, &count, fp.data());
+                    const VkQueueFamilyGlobalPriorityPropertiesKHR& g = gp[family_of[k]];
+                    for (uint32_t i = 0; i < g.priorityCount && i < VK_MAX_GLOBAL_PRIORITY_SIZE_KHR; i++) {
+                        listed += (listed.empty() ? "" : "/");
+                        listed += policy_rule::queue_priority_name((uint32_t)g.priorities[i]);
+                    }
+                    if (listed.empty()) listed = "none";
+                }
+            }
+            // (no list read: the level asked unlisted, the device made again without it if refused)
+            const VkQueueFamilyGlobalPriorityPropertiesKHR* const g = gp.empty() ? nullptr : &gp[family_of[k]];
+            const bool in_list = policy_rule::queue_priority_listed(level, g ? g->priorities : nullptr, g ? g->priorityCount : 0);
+            if (g)
+                logf("vk: %s=%s for %s (family %u): the family lists %s%s", names[k], e, whose[k], family_of[k], listed.c_str(),
+                     in_list ? "" : "; not asked");
+            else   // (the driver gives no list, or one it says it gives could not be read: no call, or not that family)
+                logf("vk: %s=%s for %s (family %u): %s; asked unlisted", names[k], e, whose[k], family_of[k],
+                     can_list ? "no list of the family's levels could be read"
+                              : "the driver gives no list of the family's levels (no VK_KHR_global_priority nor "
+                                "VK_EXT_global_priority_query)");
+            if (!in_list) continue;
+            for (auto& x : qs)
+                if (x.queueFamilyIndex == family_of[k]) {
+                    queue_priority[k].globalPriority = (VkQueueGlobalPriorityKHR)level;
+                    x.pNext = &queue_priority[k];
+                    priority_ext = ext;
+                }
+        }
+        if (priority_ext && std::find_if(want.begin(), want.end(), [&](const char* w) { return !strcmp(w, priority_ext); }) == want.end())
+            want.push_back(priority_ext);
+    }
     // (the presenter thread's waits for its presents to be shown: VK_KHR_present_id + VK_KHR_present_wait, where the driver has them)
     const bool want_present_wait = has_extension(exts, VK_KHR_PRESENT_ID_EXTENSION_NAME) &&
                                    has_extension(exts, VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
@@ -911,7 +989,28 @@ bool create_device() {
     ci.pQueueCreateInfos = qs.data();
     ci.enabledExtensionCount = (uint32_t)want.size();
     ci.ppEnabledExtensionNames = want.data();
-    if (vkCreateDevice(dev.physical, &ci, nullptr, &dev.device) != VK_SUCCESS) {
+    VkResult made = vkCreateDevice(dev.physical, &ci, nullptr, &dev.device);
+    if (priority_ext) {   // (the queues' global priority, RX_VK_QUEUE_PRIORITY / RX_VK_PRESENT_QUEUE_PRIORITY above)
+        if (made == VK_SUCCESS) {
+            const std::string presents = compute_family == UINT32_MAX ? std::string("the presents on the replay's queue (none of their own)")
+                                         : std::string("the presents' own ") +
+                                               (queue_priority[1].globalPriority ? getenv("RX_VK_PRESENT_QUEUE_PRIORITY") : "unasked");
+            logf("vk: the device was made with the queues' global priority asked (%s; the replay's %s, %s)", priority_ext,
+                 queue_priority[0].globalPriority ? getenv("RX_VK_QUEUE_PRIORITY") : "unasked", presents.c_str());
+        } else {
+            if (policy_rule::queue_priority_refused(made))   // (the spec's: no privilege, or no resources, for the level)
+                logf("vk: vkCreateDevice refused the queues' global priority (VkResult %d): made again without it", (int)made);
+            else
+                logf("vk: vkCreateDevice failed (VkResult %d) with the global priority asked: made again without it, the cause "
+                     "may be another", (int)made);
+            for (auto& x : qs) x.pNext = nullptr;
+            want.erase(std::remove_if(want.begin(), want.end(), [&](const char* w) { return !strcmp(w, priority_ext); }), want.end());
+            ci.enabledExtensionCount = (uint32_t)want.size();
+            ci.ppEnabledExtensionNames = want.data();
+            made = vkCreateDevice(dev.physical, &ci, nullptr, &dev.device);
+        }
+    }
+    if (made != VK_SUCCESS) {
         logf("vk: vkCreateDevice failed");
         return false;
     }
@@ -2116,6 +2215,7 @@ void mkwvk_close_asked(void) {
     module_ids_flush();
     page_table_census_log("close");   // (the guest pools the page table cannot reach: how many came, vk_memory.cpp)
     page_table_check_close();         // (RX_VK_GP_TABLE: its bindings covered, and with =2 the loads checked, vk_draw.cpp)
+    present_probe_close();            // (RX_VK_PRESENT_PROBE: its lines queued written, its file flushed and closed, vk_replay.cpp)
     import_stats_log("close");        // (guest-memory imports made, refused by the driver, held after a refusal: vk_memory.cpp)
     fsr4_close();             // (AMD FSR 4's tuned layers: their background builds stopped first, what they made then saved below)
     pipeline_cache_close();   // (in play: the pipelines made since the last save, kept for the next start)

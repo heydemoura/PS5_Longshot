@@ -260,6 +260,7 @@ void vkDestroySemaphore(int, VkSemaphore semaphore, void*) {
 }
 VkResult vkEndCommandBuffer(VkCommandBuffer) { return VK_SUCCESS; }
 VkFence present_copy_done = VK_NULL_HANDLE;
+struct { VkFence copy_fence = VK_NULL_HANDLE; } probe;   // (RX_VK_PRESENT_PROBE's: the presented image's copy)
 bool present_acquire_ahead = false;
 void present_finish(VkResult r, bool on_presenter) {   // (the presenter's: out of date or suboptimal asks for a new swapchain)
     if (on_presenter && (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR)) resize_asked = true;
@@ -615,8 +616,10 @@ int main() {
 
 BROKEN = [
     ("the ahead acquire made on the render thread at the hand-over, before the present",
-     "    present_out(index, qk, trial, preview_path);\n    present_copy_done = VK_NULL_HANDLE;\n    present_acquire_ahead = false;",
-     "    acquire_ahead(dev.swapchain, dev.swapchain_generation);\n    present_out(index, qk, trial, preview_path);\n    present_copy_done = VK_NULL_HANDLE;\n"
+     "    present_out(index, qk, trial, preview_path);\n    present_copy_done = probe.copy_fence = VK_NULL_HANDLE;\n"
+     "    present_acquire_ahead = false;",
+     "    acquire_ahead(dev.swapchain, dev.swapchain_generation);\n    present_out(index, qk, trial, preview_path);\n"
+     "    present_copy_done = probe.copy_fence = VK_NULL_HANDLE;\n"
      "    present_acquire_ahead = false;"),
     ("the hand-over not passing acquire ahead to the presenter",
      "presenter.ahead = present_acquire_ahead;",

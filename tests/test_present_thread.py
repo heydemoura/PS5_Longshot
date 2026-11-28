@@ -51,7 +51,8 @@ def main():
          "a present made directly may go out before the one handed over, or waits for it with the queue's lock held")
 
     image = block(replay, "void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view,\n                              bool source_srgb, bool allow_scale, OutputTrialSource trial, VkFormat framegen_format) {")
-    need("present_copy_done = f.done;\n    present_out(index, qk, trial, preview_path);\n    present_copy_done = VK_NULL_HANDLE;" in image,
+    need("present_copy_done = probe.copy_fence = f.done;\n    present_out(index, qk, trial, preview_path);\n"
+         "    present_copy_done = probe.copy_fence = VK_NULL_HANDLE;" in image,
          "present_image does not let its present (and only it) be handed over")
     for site in ("reflex_swapchain_stale() || hdr_changed || vsync_changed) {", "if (res == VK_ERROR_OUT_OF_DATE_KHR) {"):
         at = image[image.index(site):]
