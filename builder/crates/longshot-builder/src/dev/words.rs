@@ -5,9 +5,12 @@
 //! (hex), each as one function more (`f_<pc>`: the words at `pc`, `pc + 4`, ..., then a return), so that the check also
 //! runs them one after another, each the next one's input; every word of a sequence must lift (the check takes them
 //! from the listing). `--count-checks`: the fast paths count their runs and their slow ones
-//! ([`llvm::Options::count_checks`]). `--hot-split`: the module made as the build makes a hot unit
-//! (`LONGSHOT_HOT_SPLIT` on, the default; [`llvm::Module::split_cold`]), for a compile with LLVM's hot-cold splitting
-//! (tests/test_lifter_semantics.py `--hot-split`).
+//! ([`llvm::Options::count_checks`]). `--fp-nan-mid`: the float slow paths with their middle path, as a lift makes them
+//! in its hot units (by default; `LONGSHOT_FP_NAN_MID=0` turns it off) ([`lift::nan_mid`]; the count is printed);
+//! without it, as the lift makes every other unit's; `--fp-nan-mid-broken`: the same with a wrong test, the check's
+//! negative control ([`lift::nan_mid_broken`]), which must fail it. `--hot-split`: the module made as the build makes a
+//! hot unit (`LONGSHOT_HOT_SPLIT` on, the default; [`llvm::Module::split_cold`]), for a compile with LLVM's hot-cold
+//! splitting (tests/test_lifter_semantics.py `--hot-split`).
 //!
 //! `--list` gets a line per word written: `<index> <word> <kind> <base> <index register> <bytes> <text>`, where kind is
 //! `alu`, `mem` (it reads or writes memory: the check points its base register at a page of its own, and its index
@@ -87,6 +90,7 @@ pub fn run(args: &[String]) -> ExitCode {
 fn words(args: &[String]) -> Result<usize, String> {
     let (mut input, mut out, mut list, mut pc, mut seq) = (None, None, None, None, None);
     let (mut count_checks, mut hot_split) = (false, false);
+    let mut mid: Option<fn(&mut mir::Function) -> lift::NanMidStats> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut value = || it.next().cloned().ok_or(format!("{a} needs a value"));
@@ -96,6 +100,8 @@ fn words(args: &[String]) -> Result<usize, String> {
             "--list" => list = Some(PathBuf::from(value()?)),
             "--seq" => seq = Some(PathBuf::from(value()?)),
             "--count-checks" => count_checks = true,
+            "--fp-nan-mid" => mid = Some(lift::nan_mid),
+            "--fp-nan-mid-broken" => mid = Some(lift::nan_mid_broken),
             "--hot-split" => hot_split = true,
             "--pc" => pc = Some(u64::from_str_radix(value()?.trim_start_matches("0x"), 16).map_err(|e| e.to_string())?),
             other => return Err(format!("unknown argument {other:?}")),
@@ -112,6 +118,14 @@ fn words(args: &[String]) -> Result<usize, String> {
         module.split_cold(std::collections::BTreeSet::new());
     }
     let mut listing = String::new();
+    let mut given = lift::NanMidStats::default();
+    let mut passes_of = |f: &mut mir::Function| {
+        passes::share_marks(f);
+        passes::simplify(f);
+        if let Some(mid) = mid {
+            given += mid(f);
+        }
+    };
     for (i, line) in text.lines().enumerate() {
         let word = u32::from_str_radix(line.trim(), 16)
             .map_err(|_| format!("{}: line {}: {line:?}", input.display(), i + 1))?;
@@ -122,8 +136,7 @@ fn words(args: &[String]) -> Result<usize, String> {
             continue;
         }
         // (the passes as emit runs them, so that the check covers them too)
-        passes::share_marks(&mut f);
-        passes::simplify(&mut f);
+        passes_of(&mut f);
         f.verify().map_err(|e| format!("{word:08x}: {e}"))?;
         module.add(&f, llvm::Runs::default());
         let literal = matches!(insn, Insn::LoadStore { addr: Addr::Literal { .. }, .. });
@@ -144,11 +157,16 @@ fn words(args: &[String]) -> Result<usize, String> {
             let at = u64::from_str_radix(fields.next().unwrap_or_default(), 16).map_err(|_| bad())?;
             let words = fields.map(|t| u32::from_str_radix(t, 16).map_err(|_| bad())).collect::<Result<Vec<_>, _>>()?;
             let mut f = lift::straight(&words, at).ok_or_else(|| format!("{}: a word does not lift", bad()))?;
-            passes::share_marks(&mut f);
-            passes::simplify(&mut f);
+            passes_of(&mut f);
             f.verify().map_err(|e| format!("sequence at {at:x}: {e}"))?;
             module.add(&f, llvm::Runs::default());
         }
+    }
+    if mid.is_some() {
+        println!(
+            "longshot-builder dev words: fp nan mid: {} of {} float fast paths with a middle path",
+            given.mid, given.checks
+        );
     }
     let n = module.len();
     std::fs::write(&out, module.finish()).map_err(|e| format!("{}: {e}", out.display()))?;

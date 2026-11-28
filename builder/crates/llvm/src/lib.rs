@@ -11,7 +11,9 @@
 //!
 //! **Fast paths** ([`Op::Checked`]): the fast value is computed inline, and a branch weighted unlikely goes around a
 //! call of the helper, whose value a phi takes. Each helper is written once per module, `internal`, `noinline` and
-//! `cold`, reading no memory: LLVM keeps the slow path out of the hot code and lays it apart.
+//! `cold`, reading no memory: LLVM keeps the slow path out of the hot code and lays it apart. A helper with a middle
+//! path ([`mir::Mid`]) has the slow path call its test first, then its value where the test is false and the helper
+//! where it is true; the middle path's two are `alwaysinline`, so they are code of the slow path itself.
 
 use mir::{
     BinOp, BlockId, Callee, Dest, Edge, FBinOp, FCast, FClass, FPred, FUnOp, Flag, Function, Global, HostArg, Loc, Op,
@@ -65,7 +67,8 @@ pub struct Options {
     /// it (sync.rs).
     pub callee_saved: bool,
     /// Each fast path ([`Op::Checked`]) counts its runs into the external `i64` `lifter_fast_checks`, and those that
-    /// took the slow path into `lifter_slow_checks` (for tests/test_lifter_semantics.py: both paths run).
+    /// took the slow path into `lifter_slow_checks` (for tests/test_lifter_semantics.py: both paths run); of those, the
+    /// ones its middle path ([`mir::Mid`]) took into `lifter_mid_checks` (declared only where a middle path is).
     pub count_checks: bool,
 }
 
@@ -100,8 +103,11 @@ pub struct Module {
     counters: u32,
     /// Metadata nodes after `!0` (branch weights, entry counts), `!1` on.
     meta: Vec<String>,
-    /// The helpers written so far, by name.
-    helpers: BTreeSet<String>,
+    /// The helpers written so far, by name; in a debug build with what each computes (its parameters, body and result:
+    /// a name is written once, so two helpers of one name, from two functions, must compute the same).
+    helpers: BTreeMap<String, Option<Box<mir::Helper>>>,
+    /// Whether a middle path's helpers were written (their attributes, their counter).
+    mid: bool,
     /// The node of an unlikely branch's weights (`!{1, 2000}`), once one is needed.
     unlikely: Option<String>,
     /// Every symbol a function of the module is defined as (`f_<entry>`, or a body's own).
@@ -168,7 +174,8 @@ impl Module {
             counted: Vec::new(),
             counters: 0,
             meta: Vec::new(),
-            helpers: BTreeSet::new(),
+            helpers: BTreeMap::new(),
+            mid: false,
             unlikely: None,
             symbols: BTreeSet::new(),
             host_functions: BTreeMap::new(),
@@ -217,9 +224,24 @@ impl Module {
         }
         self.symbols.insert(f.name());
         for (_, h) in f.helpers() {
-            if self.helpers.insert(h.name.clone()) {
-                let text = FnWriter::new(self, &h.body, Runs::default()).write_helper(h);
-                self.body.push_str(&text);
+            // (a middle path's helpers are inline; the helper itself is the same text with one or without: a function
+            // left without it, in the same module, calls the helper alone)
+            for (m, inline) in h.mid.iter().flat_map(|m| [(&m.test, true), (&m.value, true)]).chain([(h, false)]) {
+                match self.helpers.get(&m.name) {
+                    Some(Some(seen)) => assert!(
+                        seen.params == m.params && seen.body == m.body && seen.result == m.result,
+                        "two helpers named {} compute differently",
+                        m.name
+                    ),
+                    Some(None) => {}
+                    None => {
+                        let kept = cfg!(debug_assertions).then(|| Box::new(mir::Helper { mid: None, ..m.clone() }));
+                        self.helpers.insert(m.name.clone(), kept);
+                        self.mid |= inline;
+                        let text = FnWriter::new(self, &m.body, Runs::default()).write_helper(m, inline);
+                        self.body.push_str(&text);
+                    }
+                }
             }
         }
         let text = FnWriter::new(self, f, runs).write();
@@ -288,6 +310,9 @@ impl Module {
         }
         if self.opts.count_checks {
             out.push_str("@lifter_fast_checks = external global i64\n@lifter_slow_checks = external global i64\n");
+            if self.mid {
+                out.push_str("@lifter_mid_checks = external global i64\n");
+            }
         }
         out.push_str(&self.globals);
         for t in &self.tables {
@@ -333,6 +358,10 @@ impl Module {
         out.push_str("attributes #2 = { nounwind willreturn noinline cold optsize memory(none) }\n");
         out.push_str("attributes #3 = { nounwind willreturn noinline cold optsize memory(read) }\n");
         out.push_str("attributes #4 = { noinline }\n");
+        if self.mid {
+            out.push_str("attributes #5 = { nounwind willreturn alwaysinline memory(none) }\n");
+            out.push_str("attributes #6 = { nounwind willreturn memory(none) }\n");
+        }
         out.push_str("!0 = !{!\"branch_weights\", i32 2000, i32 1}\n");
         for (i, m) in self.meta.iter().enumerate() {
             let _ = writeln!(out, "!{} = {m}", i + 1);
@@ -663,12 +692,18 @@ impl<'m, 'f> FnWriter<'m, 'f> {
         self.out
     }
 
-    /// A helper's definition: its parameters `%p0` on, its body, and the return of its result.
-    fn write_helper(mut self, h: &mir::Helper) -> String {
+    /// A helper's definition: its parameters `%p0` on, its body, and the return of its result. `inline`: a middle
+    /// path's (which reads no memory), written into the slow path that calls it.
+    fn write_helper(mut self, h: &mir::Helper, inline: bool) -> String {
         let params: Vec<String> =
             h.params.iter().enumerate().map(|(i, &t)| format!("{} %p{i}", llvm_type(t))).collect();
         let reads = h.body.blocks().any(|(_, b)| b.insts.iter().any(|&v| matches!(h.body.inst(v).op, Op::Lookup(..))));
-        let attrs = if reads { "#3" } else { "#2" };
+        let attrs = match (inline, reads) {
+            (true, false) => "#5",
+            (true, true) => unreachable!("a middle path that reads memory ({})", h.name),
+            (false, true) => "#3",
+            (false, false) => "#2",
+        };
         let ret = llvm_type(h.ret());
         let _ = writeln!(self.out, "define internal {ret} @{}({}) {attrs} {{", h.name, params.join(", "));
         self.label("entry");
@@ -1228,13 +1263,34 @@ impl<'m, 'f> FnWriter<'m, 'f> {
                 self.line(format!("br i1 {cond}, label %{call}, label %{join}, !prof {unlikely}"));
                 self.label(&call);
                 self.count_check("@lifter_slow_checks");
+                let values = args;
+                let args: Vec<String> = values.iter().map(|&a| self.typed(a)).collect();
+                // (a middle path: its test of the operands (the arguments but the last, FPCR) and the fast value, then
+                // its value or the helper's)
+                let mid = h.mid.as_ref().map(|mid| {
+                    let (test, m, full) = (self.temp(), self.temp(), self.temp());
+                    let (mid_at, full_at) = (format!("m{}", &m[2..]), format!("x{}", &full[2..]));
+                    let operands = &values[..values.len().saturating_sub(1)];
+                    let tested: Vec<String> = operands.iter().chain([&fast]).map(|&x| self.opaque(x)).collect();
+                    self.line(format!("{test} = call i1 @{}({})", mid.test.name, tested.join(", ")));
+                    self.line(format!("br i1 {test}, label %{full_at}, label %{mid_at}, !prof {unlikely}"));
+                    self.label(&mid_at);
+                    self.count_check("@lifter_mid_checks");
+                    self.line(format!("{m} = call {ty} @{}({})", mid.value.name, args.join(", ")));
+                    self.line(format!("br label %{join}"));
+                    self.label(&full_at);
+                    (m, mid_at, full_at)
+                });
                 let r = self.temp();
-                let args: Vec<String> = args.iter().map(|&a| self.typed(a)).collect();
                 self.line(format!("{r} = call {ty} @{}({})", h.name, args.join(", ")));
                 self.line(format!("br label %{join}"));
                 self.label(&join);
                 let fast = self.val(fast);
-                self.line(format!("{dst} = phi {ty} [ {fast}, %{from} ], [ {r}, %{call} ]"));
+                match mid {
+                    None => self.line(format!("{dst} = phi {ty} [ {fast}, %{from} ], [ {r}, %{call} ]")),
+                    Some((m, mid_at, full_at)) => self
+                        .line(format!("{dst} = phi {ty} [ {fast}, %{from} ], [ {m}, %{mid_at} ], [ {r}, %{full_at} ]")),
+                }
             }
             Op::Svc { imm } => {
                 let (spill, reload) = self.around(v);
@@ -1325,6 +1381,39 @@ impl<'m, 'f> FnWriter<'m, 'f> {
         };
         let call = format!("call {r} {target}({})", operands.join(", "));
         if ret.is_some() { self.line(format!("{dst} = {call}")) } else { self.line(call) }
+    }
+
+    /// `x` typed, as a middle path's test reads it: a single or double float, or a vector of them, through an empty
+    /// `asm` in a vector register (the same bits, which LLVM cannot see into), else as it is. Without it LLVM would
+    /// share the test's classifications with the fast path's own (the same calls of the same values), and to give them
+    /// to the slow path the fast path would compute them one by one instead of merged: work on the fast path.
+    /// (The builder targets x86-64 only: `x` is an SSE register; a 64-bit vector goes through a double.)
+    fn opaque(&mut self, x: Value) -> String {
+        let ty = self.ty(x);
+        if !matches!(ty.elem(), Type::F32 | Type::F64) {
+            return self.typed(x);
+        }
+        let t = llvm_type(ty);
+        let carrier = match ty.bits() {
+            32 => "float",
+            64 => "double",
+            _ => t.as_str(),
+        }
+        .to_string();
+        let mut v = self.val(x);
+        if carrier != t {
+            let b = self.temp();
+            self.line(format!("{b} = bitcast {t} {v} to {carrier}"));
+            v = b;
+        }
+        let o = self.temp();
+        self.line(format!("{o} = call {carrier} asm \"\", \"=x,0\"({carrier} {v}) #6"));
+        if carrier == t {
+            return format!("{t} {o}");
+        }
+        let back = self.temp();
+        self.line(format!("{back} = bitcast {carrier} {o} to {t}"));
+        format!("{t} {back}")
     }
 
     /// With [`Options::count_checks`], one more in the counter `global`.

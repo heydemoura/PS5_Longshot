@@ -677,6 +677,7 @@ test's override: the launcher sets none of them.
 | `RX_COLD_OPT=<level>` | The level of the units of the functions the guest profile saw never run (`O0`; `O1` builds them as the rest) |
 | `LONGSHOT_HOT_SPLIT=0` | The hot units' blocks the guest profile never saw run stay where LLVM puts them, as before the splitting. On by default (unset, `1` or any word but an off one), they move out of the hot code: the lift weights each branch of the hot units that ran but was never taken 0 (1 when it goes to a block that ran through another edge; else such a branch has no weights); the compile builds the hot units with LLVM's hot-cold splitting for those regions alone ([builder](builder.md#the-guest-profile)). `LONGSHOT_HOT_SPLIT_SKIP=<entries>` (hex, comma-separated) leaves functions out, as the functions the edits change always are: they get no new zero weights (their other weights are kept from a probability that would make a block that ran cold, as every function's in a hot unit). The compile's flags are a whole hot unit's, so LLVM can still move out such a function's region at a call of a cold helper (a float's slow path). Both are in the lift's key; a `longshot-builder compile` on its own refuses a lift made with the switch otherwise. At `0`, the IR, the compile's flags and every key are as without the splitting |
 | `RX_A64_RT_O2=0` | The lift's runtime (`gen/rt`) at the lifted units' level instead of `-O2` |
+| `LONGSHOT_FP_NAN_MID=0` | The hot units' float slow paths without their middle path ([the lift](#the-lift-switches), below); `LONGSHOT_FP_NAN_MID_SKIP=<entries>` leaves those functions out of it |
 | `RX_MARCH=<level>` | The game's CPU level. Default: this PC's CPU (`-march=native`); `cpu_unknown` when clang cannot say what that is |
 | `RX_VK_PGO=gen\|<file>` | The renderer counts branches for a profile, or builds with this one. Default: `assets/profiles/longshot_vk.profdata.xz` ([recording one](../developing.md#record-the-renderers-play-profile)) |
 | `RX_RELEASE=1` | A release build: no console window, shaders prepared before the title. `build` and `update` always are; `compile` only with it |
@@ -714,8 +715,16 @@ says a mod left in an emulator's layout in its `mods/` (`mod_needs_import`), nev
 shader preparation runs the game without the builder's own environment (its `LONGSHOT_*` switches, the tools'
 libraries on the search path), but with `LONGSHOT_SHADER_STORE`, so it prepares in the store the game plays with.
 
-**The lift** keeps no unit's text by default: the compile has each made as it needs it ([the
+<a id="the-lift-switches"></a>**The lift** keeps no unit's text by default: the compile has each made as it needs it ([the
 builder](builder.md#the-units-texts)). `LONGSHOT_KEEP_IR=1` writes them to gen/ (5.7 GB), to read or compare them.
+The hot units' float slow paths have a middle path for a NaN lane with no subnormal one by default ([floating
+point](builder.md#floating-point)), and the log counts them; `LONGSHOT_FP_NAN_MID=0` (or `off`, `no`, `false`, empty)
+lifts without it, as before the middle path existed (unset, `1` or any other value: on).
+`LONGSHOT_FP_NAN_MID_SKIP=<entries>` (hex, `f_81c7f880,f_820e2520`) leaves those functions out of it (a developer's
+switch, for finding a function by halves; with the middle path off it is not read). On, the switch is in the lift's key
+and in each hot unit's key, with the entries of the list among that unit's functions (a hot unit whose functions are
+all on the list keeps its key without the option): turning it on or off moves the hot units' keys, and a change of the
+list only those of the hot units whose functions it adds or removes; no other unit's key moves.
 A function of more than 60,000 mid IR instructions is split into pieces of
 about 20,000 for the compiler (`longshot-builder dev lift --split-over N --split-piece N`; `0`: no split), and lifted units are
 compiled with two caps on LLVM's slowest passes (`-mllvm -cgpp-huge-func=1000 -grow-region-complexity-budget=1000`).

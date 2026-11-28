@@ -555,6 +555,22 @@ check is a NaN result or any subnormal (FZ or not: rare, and it keeps the check 
 branch weighted unlikely) the exact semantics run instead, in a helper written once per unit (`internal`, `noinline`,
 `cold`), taking the operands and FPCR. The semantics check counts both paths and fails unless both ran.
 
+By default (`LONGSHOT_FP_NAN_MID=0` turns it off: [build switches](build.md#build-switches)), the slow path of an add,
+subtract, multiply, divide, FMULX or fused multiply-add in a hot unit has a middle path (`nan_mid` in
+`crates/sem/src/fpfast.rs`, after `simplify`): where no operand lane and no lane of the fast value is subnormal, every
+flush of the exact semantics is the identity, so their value is the NaN choice applied to the host's operation, inline;
+only a subnormal lane takes the helper. A vector with a NaN in one lane (the cloth keeps one in its fourth) so takes a
+few instructions instead of the call. The test reads its values through an empty `asm` so that LLVM keeps it apart
+from the fast path's own classifications, which stay merged (the slow path's code can still make a function save more
+callee-saved registers on Windows: 14 of the 1,470 hot functions at `-march=native` on a Zen 3); the middle path's code
+is the hot units' only (about the size of the fast path again in a float-heavy unit; their compile takes about a third
+longer). The log counts the fast paths given one, of the functions given it. The switch is in the hot units' keys
+alone (with the skip list's entries among each one's functions; a hot unit with all of them on the list keeps its key
+without the option) and in the lift's whole key; the other units' keys do not move. The semantics check runs
+fixed NaN cases without it, with it and with a wrong test (the operands' lanes untested), which must fail under FZ, and
+counts the middle path's runs (`--fp-nan-mid` runs all of it so; `--march x86-64-v2` or `v3` compiles for the shipped
+targets).
+
 ## Building and checking the builder
 
 Rust 1.99.1, as `mise.toml` pins it (`scripts/renhdrum.py`'s `RUST_VERSION` pins the same for the release's builds).

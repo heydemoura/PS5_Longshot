@@ -943,16 +943,22 @@ pub fn compile_only(
     let mut c = compile_options(p, upscalers, None)?;
     c.settings.release = env("RX_RELEASE").as_deref() == Some("1");
     c.mode = mode.unwrap_or(build_compile::Mode::Game);
-    // (a compile of the lift's units: the switch as the lift was made with it)
+    // (a compile of the lift's units: the hot split's switch as the lift was made with it)
     if matches!(c.mode, build_compile::Mode::Game | build_compile::Mode::GameOnly) {
         stages::check_hot_split(&p.work.gen_dir)?;
     }
-    // (the units' texts the lift did not write, made again as the compile needs them)
-    let texts = stages::lift_texts(&alone_ask(&p.root, &p.work, &p.stores, p.jobs), None);
+    // (the units' texts the lift did not write, made again as the compile needs them; only where it compiles the
+    // lifted units, so that the lift's switches are not read, nor refused, for the renderer alone or a dry run)
+    let texts = match c.mode {
+        build_compile::Mode::Game | build_compile::Mode::GameOnly => {
+            stages::lift_texts(&alone_ask(&p.root, &p.work, &p.stores, p.jobs), None)?
+        }
+        build_compile::Mode::RendererOnly | build_compile::Mode::DryRun | build_compile::Mode::ThirdPartySet(_) => None,
+    };
     c.ir_text = texts.clone().map(|t| build_compile::IrSource(t as std::sync::Arc<dyn build_compile::IrText>));
     let outcome = st.compile.compile(&c, r);
     if let Some(t) = &texts {
-        let _ = t.0.finish();
+        t.note(r);
     }
     match outcome? {
         Outcome::Built(b) => Ok(b),

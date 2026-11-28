@@ -82,6 +82,14 @@ pub struct LiftOptions {
     pub mark_each: bool,
     /// The guest state's reads and writes left as the semantics made them.
     pub no_simplify: bool,
+    /// The float operations' slow paths with a middle path where a NaN lane and no subnormal lane is why they were
+    /// taken ([`sem::nan_mid`]; on by default, `LONGSHOT_FP_NAN_MID=0` turns it off), in the hot units' functions
+    /// (where the profile says the time goes; inline, it is code of every slow path that has it), except those of
+    /// these entries (`LONGSHOT_FP_NAN_MID_SKIP`, to find a function it changes by halves). The default: on, none left
+    /// out. None: off, the IR and every key as before the option. On, it is in the hot units' keys (with the entries
+    /// left out among each one's functions) and in the lift's whole key, not in the other units' keys: their IR is the
+    /// same.
+    pub fp_nan_mid: Option<BTreeSet<u64>>,
     /// Which functions are split into pieces for the compiler, and how ([`passes::split`]).
     pub split: passes::SplitOptions,
     /// How big units are.
@@ -117,6 +125,7 @@ impl LiftOptions {
             codegen: llvm::Options::default(),
             mark_each: false,
             no_simplify: false,
+            fp_nan_mid: Some(BTreeSet::new()),
             split: passes::SplitOptions::default(),
             sizing: Sizing::default(),
             jobs: build_core::jobs::default_jobs(),
@@ -193,6 +202,14 @@ fn codegen_text(o: &LiftOptions) -> String {
     format!("{:?} mark_each={} no_simplify={} split={:?}", o.codegen, o.mark_each, o.no_simplify, o.split)
 }
 
+/// What of [`LiftOptions::fp_nan_mid`] a hot unit of `functions` is made with: on, and which of its functions are
+/// left out (None: off, or every one of them left out: the unit's text and key as without the option).
+fn fp_nan_mid_text(o: &LiftOptions, functions: &[u64]) -> Option<String> {
+    let skip = o.fp_nan_mid.as_ref()?;
+    let left_out: Vec<u64> = functions.iter().copied().filter(|e| skip.contains(e)).collect();
+    (left_out.len() < functions.len()).then(|| format!("fp_nan_mid=1 left_out={left_out:x?}"))
+}
+
 /// The key of everything a lift's output is made of, read before anything is lifted.
 fn whole_key(o: &LiftOptions, image: &image::Image, host: &Host, base: &str) -> Result<String> {
     let mut k = Key::new();
@@ -210,6 +227,11 @@ fn whole_key(o: &LiftOptions, image: &image::Image, host: &Host, base: &str) -> 
         None => k.text("npdm", "none"),
     };
     k.text("edits", EDITS);
+    // (the middle path is in the hot units' keys alone; here too, whole, so that a lift of another setting is never
+    // taken for this one: off adds nothing)
+    if let Some(skip) = &o.fp_nan_mid {
+        k.text("fp_nan_mid", &format!("{skip:x?}"));
+    }
     // (the hot units made for hot-cold splitting: only when on, so that off the key is what it was. Each hot function's
     // own key holds it too, so that a change of it lifts the hot units alone: Session::new)
     if let Some(skip) = &o.hot_split {
@@ -407,6 +429,10 @@ pub struct Session {
     planned: Vec<Unit>,
     /// The whole lift's key.
     key: String,
+    /// What [`sem::nan_mid`] did in the units made so far, in the functions given it (the hot units', but those left
+    /// out; the others have no middle path), and the units made (cached ones are not; one made again, for a retry of
+    /// its compile, counts once).
+    fp_nan_mid: Mutex<(sem::NanMidStats, BTreeSet<String>)>,
 }
 
 impl Session {
@@ -451,7 +477,18 @@ impl Session {
             }
             _ => (None, BTreeSet::new()),
         };
-        let mut s = Session { o: o.clone(), image, plan, edits, build, profile, hashes, planned: Vec::new(), key };
+        let mut s = Session {
+            o: o.clone(),
+            image,
+            plan,
+            edits,
+            build,
+            profile,
+            hashes,
+            planned: Vec::new(),
+            key,
+            fp_nan_mid: Mutex::new(Default::default()),
+        };
         let program = s.program();
         let key_of = |entry: u64| -> String {
             let r = s.runs(entry);
@@ -476,7 +513,9 @@ impl Session {
                 .collect();
             parts.into_iter().flat_map(|h| h.join().expect("a key worker panicked")).collect()
         });
-        let planned = units::plan(&list, &hot, &cold, o.sizing, &base, &|e| keys[&e].clone());
+        let planned = units::plan_with(&list, &hot, &cold, o.sizing, &base, &|e| keys[&e].clone(), &|functions| {
+            fp_nan_mid_text(o, functions)
+        });
         s.planned = planned;
         Ok(s)
     }
@@ -505,6 +544,26 @@ impl Session {
         matches!(self.o.profiling, Profiling::Generate)
     }
 
+    /// What [`sem::nan_mid`] did in the units made so far, as the log says it (None: it is off; with every function
+    /// left out, 0 of 0).
+    fn fp_nan_mid_note(&self) -> Option<String> {
+        let skip = self.o.fp_nan_mid.as_ref()?;
+        let (s, units) = {
+            let sums = self.fp_nan_mid.lock().unwrap_or_else(|p| p.into_inner());
+            (sums.0, sums.1.len())
+        };
+        Some(format!(
+            "lift: LONGSHOT_FP_NAN_MID, in the {} units made now (not those kept from before): {} of the {} float fast \
+             paths of the functions given it (the hot units', but those of the {} entries on the skip list) with a middle \
+             path ({:.1} %)",
+            units,
+            s.mid,
+            s.checks,
+            skip.len(),
+            100.0 * s.mid as f64 / s.checks.max(1) as f64
+        ))
+    }
+
     /// One unit's text.
     fn make(&self, unit: &Unit) -> Result<Made> {
         let program = self.program();
@@ -525,7 +584,10 @@ impl Session {
         let (mut marks, mut simplified) = (passes::MarkStats::default(), passes::SimplifyStats::default());
         let (mut split, mut pieces) = (0usize, 0usize);
         let mut unsupported: BTreeMap<&'static str, usize> = BTreeMap::new();
+        let mut nan_mid = sem::NanMidStats::default();
+        let hot = unit.name.starts_with("lifted_hot_");
         for &entry in &unit.functions {
+            let mid = hot && self.o.fp_nan_mid.as_ref().is_some_and(|skip| !skip.contains(&entry));
             let mut lifted = match program.lift(entry) {
                 Ok(l) => l,
                 Err(Skip::NoFunction) => unreachable!("a discovered function"),
@@ -545,6 +607,9 @@ impl Session {
                 }
                 if !self.o.no_simplify {
                     simplified += passes::simplify(f);
+                }
+                if mid {
+                    nan_mid += sem::nan_mid(f);
                 }
                 f.verify().map_err(|e| Error::format(format!("the IR of {}", f.name()), e.to_string()))?;
             }
@@ -570,6 +635,12 @@ impl Session {
                 m.add(w, llvm::Runs { hash: runs.hash, ..llvm::Runs::default() });
             }
             sizes.push((m.size() - before) as u64);
+        }
+        if self.o.fp_nan_mid.is_some() {
+            let mut sums = self.fp_nan_mid.lock().unwrap_or_else(|p| p.into_inner());
+            if sums.1.insert(unit.name.clone()) {
+                sums.0 += nan_mid;
+            }
         }
         let counted = m.counted().to_vec();
         let functions = m.len();
@@ -641,6 +712,12 @@ impl Texts {
         let (text, listed) = s.unit_text(name)?;
         self.made.lock().unwrap_or_else(|p| p.into_inner()).insert(listed.name.clone(), listed);
         Ok(text)
+    }
+
+    /// What [`sem::nan_mid`] did in the units whose texts were made, for the build's log (None: it is off, or no unit
+    /// was made).
+    pub fn fp_nan_mid_note(&self) -> Option<String> {
+        self.session.get()?.as_ref().ok()?.fp_nan_mid_note()
     }
 
     /// `units.txt` with the units made since noted: their content keys, sizes and costs (nothing when none were made).
@@ -914,6 +991,11 @@ pub fn run_with(o: &LiftOptions, r: &Reporter) -> Result<(LiftOutcome, Option<Ar
             simplified.dead_writes,
             simplified.dead_values
         ));
+    }
+    if units_lifted > 0
+        && let Some(note) = s.fp_nan_mid_note()
+    {
+        r.log(note);
     }
     let edited = s.edits.functions.len();
     let functions = s.plan.functions.len();

@@ -17,7 +17,8 @@
 //! **Fast paths.** A computation that is cheap in the common case and long in the rare one (a float operation: the
 //! host's IEEE op, unless a NaN or a flushed subnormal is involved) is an [`Op::Checked`]: its fast value, computed
 //! inline, and a condition under which the value is instead a [`Helper`]'s, a pure function of its arguments written
-//! once per module out of line. The writer branches around the helper's call, so the function's own IR stays short.
+//! once per module out of line. The writer branches around the helper's call, so the function's own IR stays short. A
+//! helper may have a middle path ([`Mid`]): a test and a shorter computation the slow path takes first.
 
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
@@ -566,6 +567,23 @@ pub struct Helper {
     pub body: Function,
     /// The value it returns, of its body's block.
     pub result: Value,
+    /// Its middle path, if it has one: a shorter computation that gives its value where a test says it may.
+    pub mid: Option<Box<Mid>>,
+}
+
+/// A [`Helper`]'s middle path: where `test` is false, `value` computes what the helper does, more briefly. The writer
+/// calls `test` on the slow path first, then `value` where it is false and the helper where it is true; both are
+/// written inline there.
+///
+/// `test` takes the helper's parameters but the last (FPCR, of a float operation's), then the fast value; it returns
+/// an `i1`. `value` takes the helper's parameters and returns its type. Both are helpers of their own (pure, one
+/// block) without a middle path; their names are of the middle path's own (`lifter.fp.mid.*`), never a helper's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Mid {
+    /// Whether the helper's value is needed (true) or `value`'s equals it (false).
+    pub test: Helper,
+    /// The helper's value wherever `test` is false.
+    pub value: Helper,
 }
 
 impl Helper {
@@ -1291,6 +1309,11 @@ impl Function {
         &self.helpers[id.0 as usize]
     }
 
+    /// The helper `id`, to change (a pass giving it a middle path).
+    pub fn helper_mut(&mut self, id: HelperId) -> &mut Helper {
+        &mut self.helpers[id.0 as usize]
+    }
+
     /// The helper of this name, if the function has it.
     pub fn helper_named(&self, name: &str) -> Option<HelperId> {
         self.helpers.iter().position(|h| h.name == name).map(|i| HelperId(i as u32))
@@ -1553,6 +1576,12 @@ impl Display for Function {
             let params: Vec<String> = h.params.iter().map(Type::to_string).collect();
             writeln!(f, "h{} {} ({}) -> {}:", id.0, h.name, params.join(", "), h.result)?;
             h.body.fmt_blocks(f)?;
+            if let Some(mid) = &h.mid {
+                for m in [&mid.test, &mid.value] {
+                    writeln!(f, "h{} middle path {} -> {}:", id.0, m.name, m.result)?;
+                    m.body.fmt_blocks(f)?;
+                }
+            }
         }
         Ok(())
     }
