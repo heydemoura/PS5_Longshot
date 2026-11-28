@@ -38,17 +38,38 @@
 // What make_profile and storage_binding_align read of the renderer (vk_internal.h's dev): a GPU with 32 lanes, no float add of
 // its own, NVIDIA's gather, 16-byte storage buffer offsets, f16 shaders; the nonuniform indexing features set per device below
 constexpr uint32_t VK_SHADER_STAGE_ALL = 0x7fffffff;
-constexpr uint32_t VK_DRIVER_ID_AMD_PROPRIETARY = 1;
+constexpr uint32_t VK_DRIVER_ID_AMD_PROPRIETARY = 1, VK_DRIVER_ID_MESA_RADV = 3;
+#define VK_MAKE_VERSION(major, minor, patch) ((((uint32_t)(major)) << 22U) | (((uint32_t)(minor)) << 12U) | ((uint32_t)(patch)))
+using VkBool32 = uint32_t;
+using VkShaderStageFlags = uint32_t;
+constexpr VkBool32 VK_FALSE = 0;
+constexpr uint32_t VK_SHADER_STAGE_VERTEX_BIT = 0x1, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT = 0x2,
+                   VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT = 0x4, VK_SHADER_STAGE_GEOMETRY_BIT = 0x8,
+                   VK_SHADER_STAGE_FRAGMENT_BIT = 0x10, VK_SHADER_STAGE_COMPUTE_BIT = 0x20, VK_SHADER_STAGE_TASK_BIT_EXT = 0x40,
+                   VK_SHADER_STAGE_MESH_BIT_EXT = 0x80;
+enum VkShaderFloatControlsIndependence { VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_32_BIT_ONLY = 0,
+                                         VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL = 1, VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE = 2 };
 struct {
     uint32_t subgroup_max = 32, driver_id = 0;
     bool float_atomic_add = false;
     struct {
         bool shaderFloat16 = true;
+        VkBool32 shaderBufferInt64Atomics = 1;
         bool shaderStorageImageArrayNonUniformIndexing = false, shaderUniformTexelBufferArrayNonUniformIndexing = false,
              shaderStorageTexelBufferArrayNonUniformIndexing = false;
     } vk12;
-    struct { struct { uint64_t minStorageBufferOffsetAlignment = 16; } limits; } props;
-    struct { bool gather_offset = false; } fixes;
+    // (driverVersion: make_profile's RADV mesh workaround, need_mesh_num_workgroups, reads it)
+    struct { uint32_t driverVersion = 0; struct { uint64_t minStorageBufferOffsetAlignment = 16; } limits; } props;
+    // (device_policy.h's fields make_profile reads: no long warp path, no fragment shuffle fallback, no gather offset)
+    struct { bool warp64 = false, frag_shuffle_fallback = false, gather_offset = false; } policy;
+    struct {
+        VkShaderFloatControlsIndependence denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL,
+                                          roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL;
+        VkBool32 shaderSignedZeroInfNanPreserveFloat16 = 1, shaderSignedZeroInfNanPreserveFloat32 = 1,
+                 shaderDenormPreserveFloat32 = 1, shaderDenormFlushToZeroFloat32 = 1;
+    } float_controls;
+    VkShaderStageFlags subgroup_stages = 0xff;
+    bool mesh_shader = true;   // (native task and mesh shaders: translator_stamp counts their subgroup stages)
 } dev;
 
 #include "nonuniform_profile.inc"   // (storage_binding_align, make_profile, profile(), stamp_section and STAMP_SECTION)
@@ -213,7 +234,7 @@ int main(int argc, char** argv) {
         {"img-atomic-3", {{Kind::ImageAtomic, 3}}},
         {"mixed", {{Kind::TextureBuffer, 2}, {Kind::ImageBuffer, 2}, {Kind::Texture, 2}, {Kind::Image, 3}}},
     }};
-    Backend::SPIRV::fetch_bounds = Backend::SPIRV::fetch_bounds_buffers = false;   // (NVIDIA's: vk_vendor.h)
+    Backend::SPIRV::fetch_bounds = Backend::SPIRV::fetch_bounds_buffers = false;   // (NVIDIA's: device_policy.h)
     for (const Device& device : devices) {
         dev.vk12.shaderStorageImageArrayNonUniformIndexing = device.storage_image;
         dev.vk12.shaderUniformTexelBufferArrayNonUniformIndexing = device.uniform_texel_buffer;

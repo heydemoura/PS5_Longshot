@@ -39,7 +39,10 @@ __pycache__/
 build-linux/
 *.so
 
-# ---- NVIDIA's DLSS SDK (scripts/ngx_sdk.py): NVIDIA's files, never committed ----
+# ---- a checkout's own development builds on Windows (scripts/dev.py) ----
+build-windows/
+
+# ---- NVIDIA's DLSS SDK (scripts/fetch.py dlss): NVIDIA's files, never committed ----
 ngx-sdk/
 test-results/
 _deps/
@@ -49,3 +52,11 @@ dist/
 .local/
 # ---- a link to <build>/compile_commands.json (nx2/build.py write_compdb), for clangd and clang-tidy ----
 /compile_commands.json
+
+# ---- Visual Studio IDE files ----
+.vs/
+.vscode/
+CppProperties.json
+
+# .NET build output
+**/obj/
