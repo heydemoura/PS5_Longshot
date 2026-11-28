@@ -1091,9 +1091,13 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     static std::string told_display;
     if (!opts.hdr) told = -1;
     if (opts.hdr) {
+        // (A2B10G10R10 when it is listed, in any order: gamescope's WSI layer lists A2R10G10B10 too, but makes a swapchain
+        // only in a format the driver has, and NVIDIA's has A2B10G10R10 alone, so A2R10G10B10 was refused (#1682). The HDR
+        // picture is blitted in (present_image_with_trial), so either one shows the same colours)
         for (const auto& f : formats)
-            if ((f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || f.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32) &&
-                f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT)
+            if (f.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT &&
+                (f.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 ||
+                 (f.format == VK_FORMAT_A2R10G10B10_UNORM_PACK32 && !(dev.hdr && fmt.format == VK_FORMAT_A2B10G10R10_UNORM_PACK32))))
                 fmt = f, dev.hdr = true;
         std::string display;   // (the display Windows was asked about, named in the line: a PC can have several)
         if (!dev.hdr) {

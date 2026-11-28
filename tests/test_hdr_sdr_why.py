@@ -9,7 +9,9 @@ and the HDR row's hint (hn_hdr) with stubs and check each case, that the line na
 is said again only when the reason or the display changes, or the menu's HDR was turned off in between. On Windows, also
 compile system_hdr_on, the real one: it answers "not known" with no window, names the desktop's display, and its own
 copy of Windows 11 24H2's structure has the Windows SDK's layout and numbers (where the SDK has it). Its time a call is
-printed, since create_swapchain asks at each swapchain. No game or GPU is needed.
+printed, since create_swapchain asks at each swapchain. Also: with both 10-bit HDR10 formats listed, A2B10G10R10 is
+the one taken, in either order (#1682: gamescope's WSI layer lists A2R10G10B10 too, but on NVIDIA refuses a swapchain in
+it, the driver having only A2B10G10R10), and A2R10G10B10 alone still is. No game or GPU is needed.
 """
 import argparse
 import os
@@ -41,6 +43,7 @@ FIXTURE = r"""
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL %d: %s (last line: %s)\n", __LINE__, #x, said.c_str()); return 1; } } while (0)
 enum VkFormat { VK_FORMAT_B8G8R8A8_UNORM = 44, VK_FORMAT_A2R10G10B10_UNORM_PACK32 = 58, VK_FORMAT_A2B10G10R10_UNORM_PACK32 = 64 };
@@ -79,6 +82,19 @@ int main() {
     CHECK(pick(hdr) == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && dev.hdr && dev.hdr_sdr_why == hdr_sdr_none);
     CHECK(lines == 1 && std::strstr(said.c_str(), "an HDR10 surface (format 64)"));
     CHECK(hn_hdr(1, -1) == nullptr);
+    // (both 10-bit HDR10 formats listed, as gamescope's WSI layer does: A2B10G10R10, in either order. On NVIDIA gamescope
+    // refuses a swapchain in A2R10G10B10, which its driver doesn't have: the picture froze or the game ended (#1682))
+    std::vector<VkSurfaceFormatKHR> both = hdr;
+    both.push_back({VK_FORMAT_A2R10G10B10_UNORM_PACK32, VK_COLOR_SPACE_HDR10_ST2084_EXT});
+    CHECK(pick(both) == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && dev.hdr && dev.hdr_sdr_why == hdr_sdr_none);
+    std::swap(both[1], both[2]);
+    CHECK(pick(both) == VK_FORMAT_A2B10G10R10_UNORM_PACK32 && dev.hdr && dev.hdr_sdr_why == hdr_sdr_none);
+    // (A2R10G10B10 alone: still an HDR10 surface; A2B10G10R10 in another colour space: not one)
+    std::vector<VkSurfaceFormatKHR> argb = sdr;
+    argb.push_back({VK_FORMAT_A2R10G10B10_UNORM_PACK32, VK_COLOR_SPACE_HDR10_ST2084_EXT});
+    argb.push_back({VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR});
+    CHECK(pick(argb) == VK_FORMAT_A2R10G10B10_UNORM_PACK32 && dev.hdr && dev.hdr_sdr_why == hdr_sdr_none);
+    CHECK(lines == 1);   // (an HDR10 surface all along: not said again)
     // (Windows has HDR on, the driver lists none: the driver is named, not the setting)
     windows_says = 1;
     CHECK(pick(sdr) == VK_FORMAT_B8G8R8A8_UNORM && !dev.hdr && dev.hdr_sdr_why == hdr_sdr_driver);
