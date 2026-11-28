@@ -37,6 +37,7 @@
 #include "shader_recompiler/ir_opt/fragment_output_guard.h"
 #include "shader_recompiler/ir_opt/sim_turf_pool_pass.h"
 #include "shader_recompiler/ir_opt/scene_tonemap_pass.h"
+#include "shader_recompiler/ir_opt/lens_eye_pass.h"
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/environment.h"
@@ -770,6 +771,7 @@ constexpr size_t kSparePoolBytes = 8u << 20;
 struct Translation {
     std::unique_ptr<Pools> pools;
     Shader::IR::Program program;
+    bool lens_eye = false;   // (longshot: the Lens of Truth's eye, lens_eye_pass.h: its vertex program's ring follows)
     Translation() {
         auto& spare = spare_pools();
         if (spare.empty()) {
@@ -798,6 +800,8 @@ std::unique_ptr<Translation> translate(Env& env, bool graphics, bool one_exit = 
                                    env.StartAddress() + (graphics ? static_cast<u32>(sizeof(Shader::ProgramHeader)) : 0u),
                                    one_exit};
     t->program = Shader::Maxwell::TranslateProgram(t->pools->insts, t->pools->blocks, env, cfg, host_info());
+    // (longshot) the Lens of Truth's eye at the picture's shape (lens_eye_pass.h): its fragment program, whichever pipeline draws it
+    if (graphics && t->program.stage == Shader::Stage::Fragment && !Shader::Optimization::LensEyePass(t->program)) t->lens_eye = true;
     return t;
 }
 
@@ -1698,6 +1702,15 @@ void translate_into(Program& p, const NvnState& s, const Code* vsc, const Code* 
                 Env fs_env{s, *fsc, Shader::Stage::Fragment};
                 fs = translate(fs_env, true);
                 questions += fs_env.texture_questions;
+            }
+            if (fs && fs->lens_eye) {   // (the eye's ring narrowed with it: lens_eye_pass.h)
+                const char* swirl = nullptr;
+                const char* why = Shader::Optimization::LensEyeVertexPass(vs->program, &swirl);
+                static std::atomic<int> told{0};
+                if (told++ < 4)
+                    logf("vk: program %016llx: the Lens of Truth's eye at the picture's shape%s%s%s%s", (unsigned long long)p.key,
+                         why ? ", its ring left as the game's: " : ", its ring with it", why ? why : "",
+                         why ? "" : swirl ? ", its swirl left as the game's: " : ", its swirl too", why || !swirl ? "" : swirl);
             }
             Shader::RuntimeInfo vrt{};
             Shader::RuntimeInfo frt{};
