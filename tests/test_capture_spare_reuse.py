@@ -95,6 +95,7 @@ int main() {
     # sample arrives. The release path and worker accounting are the production ones.
     worker = r"""
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>

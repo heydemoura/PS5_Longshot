@@ -306,6 +306,19 @@ is in. On Linux, the guest memory behind `imports` is shared memory, so it is no
 | `captures`, `capture spares`, `capture staging spares`, `capture table` | Submit-time copies of guest pages, plus spares kept for reuse |
 | `imports`, `retired imports`, `retired records` | Guest memory the driver has pinned for the GPU |
 
+Capture spares are bounded by twelve buffers and their existing byte allowance
+(at most 768 MB, 32 MB while Linux is reclaiming memory). A completed capture
+that fits the allowance replaces spares of the most represented size first,
+oldest-returned on a tie. The incoming buffer counts as a representative too,
+so it can replace its own class without flushing the only spare of another
+class. This lets the cached size mix follow a new area's submissions while
+retaining rare large loading spares through repeated small returns. Otherwise a pool
+of unsuitable sizes can reject every return of the new size and allocate it
+again on every submission. Prewarm workers' byte and slot reservations remain
+protected; a speculative prewarm never displaces a returned spare. Displaced
+buffers are destroyed outside the spare-pool mutex, using the usual asynchronous
+release path unless `RX_VK_CAP_FREE_ASYNC=0` is set.
+
 `unaccounted` is the driver's count less the VRAM sum. It is the memory the renderer did not allocate itself: the
 swapchain, the driver's pipelines and its own objects, memory the upscaler libraries allocate internally, two small
 buffers made outside the allocator, plus a few tens of MB of timing noise. It reads `n/a` without
