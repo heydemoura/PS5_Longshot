@@ -79,6 +79,7 @@ void env_release(const int*) {}   // (the environment's hold on a row: none here
 /* (stand-ins for the rest of set_row, which the Vibration strength row never reaches: the Upscaler's rows, the restart offer) */
 bool row_fixed(const int*) { return false; }
 int upscaler() { return 0; }
+int upscaler_row() { return upscaler(); }   // (no Streamline here: nothing waits for the restart)
 namespace ur {
 int step_upscaler(int, int, bool) { return 0; }
 int step(int, int v, int dir) { return v + dir; }

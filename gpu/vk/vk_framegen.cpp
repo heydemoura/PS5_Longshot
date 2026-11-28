@@ -28,6 +28,7 @@
 #include "vk_antilag.h"   // (AMD Anti-Lag 2: which game frame a set shows, antilag_frame / antilag_present_frame)
 #include "vk_dlss.h"   // (NVIDIA DLSS Frame Generation through NGX: dlss_fg_frames)
 #include "vk_reflex.h"   // (NVIDIA Reflex: which game frame a set shows, reflex_frame / reflex_present_frame)
+#include "vk_dlssg.h"   // (NVIDIA DLSS Frame Generation through Streamline: this file's frame generation is off while it runs)
 #include "vk_fsr3_inputs.h"   // (AMD FSR 3.1 frame interpolation's depth and motion)
 #include "vk_fsr3fi.h"
 #include "vk_menu.h"
@@ -1178,9 +1179,16 @@ bool fsr_given = false;
 int framegen_capped(int framegen, int dlss_most) {
     return framegen >= 2 && dlss_most > 0 ? std::min(framegen, dlss_most + 1) : framegen;
 }
-int framegen_now() { return framegen_capped(opts.framegen, dlss_fg_most()); }
+int framegen_now() {
+    if (dlssg_active()) return 0;   // (NVIDIA Streamline makes the frames and shows them, vk_dlssg.cpp: none are this file's)
+    return framegen_capped(opts.framegen, dlss_fg_most());
+}
 
 FgMaker framegen_maker() {
+    if (dlssg_active()) {   // (NVIDIA Streamline's DLSS-G, vk_dlssg.cpp: its own word on whether it makes them now)
+        const int making = dlssg_making();
+        return making == 1 ? FgMaker::Dlss : making == 2 ? FgMaker::DlssPaused : FgMaker::None;
+    }
     // (none recorded for half a second: Frame generation off, or the window's presents without it)
     if (now_ns() - maker_at.load(std::memory_order_relaxed) > 500000000) return FgMaker::None;
     const int b = maker_count[(int)FgMaker::BuiltIn].load(std::memory_order_relaxed);
@@ -1201,7 +1209,8 @@ bool framegen_wanted(int menu_value, int allow) {
 
 bool framegen_on() {
     static const int allow = !getenv("RX_VK_FRAMEGEN") || atoi(getenv("RX_VK_FRAMEGEN")) != 0;
-    return framegen_wanted(opts.framegen, allow) && !dev.offscreen && !fg.failed;
+    // (longshot: off while NVIDIA Streamline makes DLSS FG's frames, vk_dlssg.cpp)
+    return framegen_wanted(opts.framegen, allow) && !dev.offscreen && !fg.failed && !dlssg_active();
 }
 
 void framegen_idle(bool recorded) {

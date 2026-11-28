@@ -87,8 +87,13 @@ int dlss_fg_skip(unsigned* most) {
     if (most) *most = 1;
     return skip_now;
 }
+bool streamline = false;   // (vk_dlssg.cpp dlssg_active: NVIDIA Streamline makes DLSS FG's frames in this "run")
+bool restart_needed = false;   // (dlssg_restart_needed: the rows as they are start or stop it at the next run)
+bool dlssg_active() { return streamline; }
+int dlssg_restart_needed() { return restart_needed; }
 /* ENV */
 /* POSSIBLE */
+/* CHOSEN */
 /* ASKED */
 /* HOLDS */
 /* TABS */
@@ -116,7 +121,10 @@ void load(const char* text) {   // (one line of longshot_options.ini, through th
 int failures = 0;
 #define CHECK(x, why) do { if (!(x)) { ++failures; std::fprintf(stderr, "FAIL %d: %s (%s)\n", __LINE__, why, #x); } } while (0)
 bool starts(const char* s, const char* with) { return s && !std::strncmp(s, with, std::strlen(with)); }
-void reset_run() { unavailable = FG_SKIP_NONE, why_dlss = DLSS_OK, forced = false, maker = FgMaker::None, skip_now = FG_SKIP_NONE; }
+void reset_run() {
+    unavailable = FG_SKIP_NONE, why_dlss = DLSS_OK, forced = false, maker = FgMaker::None, skip_now = FG_SKIP_NONE;
+    streamline = false, restart_needed = false;
+}
 int main() {
     const Row& r = rows[0];
     CHECK(std::strcmp(ini_key(r), "frame_generation_by") == 0, "the row's key in longshot_options.ini changed");
@@ -185,6 +193,25 @@ int main() {
     opts.framegen = 1, skip_now = FG_SKIP_NONE;   // (Frame generation's Auto: the renderer's own always)
     CHECK(starts(line(0), "Not DLSS FG now: DLSS Frame Generation makes a fixed 2x"), "Frame generation's Auto not said");
     opts.framegen = 3;
+    // (NVIDIA Streamline, loaded before Vulkan: a choice that starts or stops it says so, before every other line; NGX's
+    // DLSS-G is not asked for while it makes the frames)
+    reset_run();
+    maker = FgMaker::Dlss;
+    for (int v = r.lo; v <= r.hi; v++) {
+        opts.framegen_by = v;
+        restart_needed = true, streamline = false;
+        CHECK(starts(line(v), "After a restart NVIDIA Streamline makes DLSS FG's frames"), "Streamline starting at the next "
+              "run is not said");
+        CHECK(fg_asked() == (v == 0), "NGX's DLSS-G is not asked for at DLSS FG while Streamline has not started");
+        streamline = true;
+        CHECK(starts(line(v), "NVIDIA Streamline makes DLSS FG's frames in this run"), "Streamline stopping at the next run "
+              "is not said");
+        CHECK(!fg_asked(), "NGX's DLSS-G is asked for while Streamline makes DLSS FG's frames");
+        restart_needed = false;   // (Streamline running, the rows as it started with: the choice's own line)
+        CHECK(starts(line(v), v == 0 ? "NVIDIA DLSS Frame Generation (RTX 40" : v == 1 ? "The renderer's own" : "AMD FSR 3.1"),
+              "Streamline making the frames: not the choice's own line");
+    }
+    opts.framegen_by = 0;
     // (RX_VK_DLSS_FG=1: DLSS FG for the run, whatever the row says)
     reset_run();
     forced = true;
@@ -251,8 +278,11 @@ def main():
 
     rowline = found(r'    \{TAB_GRAPHICS, "Frame generation by", &opts\.framegen_by, [^}]*\},', menu,
                     "no Frame generation by row on the Graphics tab")
-    found(r"&opts\.framegen_by, 0, 2, 1, tx_framegen_by,.*hn_framegen_by, false, true\}", rowline,
-          "the row is not DLSS FG, Built-in FG and FSR 3.1 FG (0 to 2), at once, outside the Quality preset")
+    # (a restart row for NVIDIA Streamline alone, vk_dlssg.h dlssg_restart_needed: its restart value is 0, the change at
+    # once, wherever Streamline's start does not change; tests/test_dlssg.py checks that hook)
+    found(r"&opts\.framegen_by, 0, 2, 1, tx_framegen_by,.*hn_framegen_by, true, true\}", rowline,
+          "the row is not DLSS FG, Built-in FG and FSR 3.1 FG (0 to 2), outside the Quality preset, with the restart "
+          "NVIDIA Streamline's start takes")
     # (with nothing to choose: no arrows, the saved value left alone)
     found(r"value == &opts\.framegen_by && framegen_by_fixed\(\)", block(menu, "bool row_fixed(const int* value) {"),
           "row_fixed: the row is not fixed where RX_VK_DLSS_FG=1 chooses")
@@ -291,6 +321,7 @@ def main():
         "/* FGMAKER */": found(r"enum class FgMaker \{[^}]*\};", framegen_h, "no enum class FgMaker"),
         "/* ENV */": block(dlss, "int env_switch(const char* name) {"),
         "/* POSSIBLE */": block(dlss, "bool fg_possible() {"),
+        "/* CHOSEN */": block(dlss, "bool fg_chosen() {"),
         "/* ASKED */": block(dlss, "bool fg_asked() {"),
         "/* HOLDS */": block(dlss, "bool dlss_fg_holds() {\n"),
         "/* TABS */": found(r"enum MenuTab \{.*?\};", menu, "no enum MenuTab"),

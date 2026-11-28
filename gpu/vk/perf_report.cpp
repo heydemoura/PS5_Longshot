@@ -27,6 +27,7 @@
 #include "vk_menu.h"
 #include "vk_paths.h"
 #include "vk_shader.h"
+#include "vk_temporal.h"   // (temporal_row: the Upscaler as it runs)
 #include "vk_texture.h"
 #include "upscaler_rows.h"
 
@@ -155,7 +156,7 @@ void read_machine(const char* version) {
 
 /// The settings a summary says: read at each one (the player may change them in play)
 void read_settings() {
-    machine.upscaler = upscaler_name(opts.dlss);
+    machine.upscaler = upscaler_name(temporal_row());   // (as it runs: under Streamline a change can wait for the restart)
     machine.preset = preset_name(opts.preset);
     machine.fps_cap = menu_fps_cap();
     // (version 2 labels: the report's finding that nothing said how a frame was presented)

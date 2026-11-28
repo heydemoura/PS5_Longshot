@@ -46,6 +46,7 @@
 #include "perf_report.h"
 #include "shaders/dlss_nr_hdr_proxy_comp_spv.h"
 #include "upscaler_rows.h"
+#include "vk_dlssg.h"   // (DLSS Frame Generation through NVIDIA Streamline: NGX's own DLSS-G is not asked then)
 #include "vk_fps.h"
 #include "vk_internal.h"
 #include "vk_menu.h"
@@ -811,14 +812,23 @@ bool ngx_init_locked() {
                     loadable |= dlss_checks::ascii(fs::canonical(f.path(), real).native()) && !real;
 #endif
                 }
+        // (0xbad00004, NVSDK_NGX_Result_FAIL_FeatureNotFound, while NVIDIA Streamline runs (DLSS FG, vk_dlssg.cpp): NGX
+        // did not find the runtime, though one is there. NGX keeps the folders of its first start in the process, which is
+        // Streamline's then, and vk_dlssg.cpp names these folders to it too: a folder NGX was not told of, not the GPU)
+        const bool not_found = (unsigned)init == (unsigned)NVSDK_NGX_Result_FAIL_FeatureNotFound && dlssg_loaded();
         if (needs_driver) logf("vk: NVIDIA DLSS: needs NVIDIA's driver %u.%u or newer", major, minor);
         else if (!runtime) logf("vk: NVIDIA DLSS: not available: no %s in %s (scripts/fetch.py dlss fetches it)", kRuntime, where.c_str());
         else if (!loadable)
             logf("vk: NVIDIA DLSS: not available: %s is only in folders whose path is not all ASCII (%s), and NVIDIA's NGX on "
                  "Linux loads it only from one that is: put it in $XDG_DATA_HOME/longshot/ngx, or RX_VK_DLSS_DIR=<an ASCII folder>",
                  kRuntime, where.c_str());
+        else if (not_found)
+            logf("vk: NVIDIA DLSS: not available: NGX did not find %s (%#x, feature not found), though it is in %s: NVIDIA "
+                 "Streamline (DLSS FG) started NGX first, and NGX looks only in the folders that start named",
+                 kRuntime, (unsigned)init, where.c_str());
         else logf("vk: NVIDIA DLSS: not available on this GPU (%#x): DLSS needs an NVIDIA RTX GPU", (unsigned)init);
-        g_why = needs_driver ? DLSS_NEEDS_DRIVER : !runtime ? DLSS_NO_RUNTIME : !loadable ? DLSS_RUNTIME_NOT_ASCII : DLSS_NEEDS_RTX;
+        g_why = needs_driver ? DLSS_NEEDS_DRIVER : !runtime ? DLSS_NO_RUNTIME : !loadable ? DLSS_RUNTIME_NOT_ASCII
+              : not_found ? DLSS_NO_RUNTIME : DLSS_NEEDS_RTX;
         return false;
     }
     if (NVSDK_NGX_FAILED(NVSDK_NGX_VULKAN_AllocateParameters(&s.params)) || !s.params) return false;
@@ -1723,12 +1733,15 @@ bool fg_possible() {
     static const bool yes = env_switch("RX_VK_DLSS_FG") != 0 && env_switch("RX_VK_DLSS") != 0;
     return yes;
 }
-/// Whether it is asked for now: RX_VK_DLSS_FG=1 for the run, else the Frame generation by row (read each time: it changes
-/// while the game runs)
-bool fg_asked() {
+/// Whether DLSS FG is chosen now: RX_VK_DLSS_FG=1 for the run, else the Frame generation by row (read each time: it
+/// changes while the game runs)
+bool fg_chosen() {
     static const bool forced = env_switch("RX_VK_DLSS_FG") > 0;
     return fg_possible() && (forced || opts.framegen_by == 0);
 }
+/// Whether NGX's DLSS-G is asked for now: chosen, and not while NVIDIA Streamline makes DLSS FG's frames (vk_dlssg.cpp),
+/// where this file's feature is never made
+bool fg_asked() { return fg_chosen() && !dlssg_active(); }
 
 /// A 4x4 inverse in doubles (a float one of a projection with a far plane in the thousands loses what reprojection needs)
 bool fg_inverse(const float* m, float* out) {
@@ -1930,6 +1943,7 @@ int dlss_fg_skip(unsigned* most) {
 bool dlss_fg_wanted() { return fg_asked(); }
 
 int dlss_fg_unavailable() {
+    if (dlssg_active()) return FG_SKIP_NONE;   // (NVIDIA Streamline makes its frames in this run, vk_dlssg.cpp: NGX is not asked)
     if (dlss_why() != DLSS_OK) return FG_SKIP_DEVICE;   // (RX_VK_DLSS=0 too: dlss_why's DLSS_ENV_OFF)
     if (!fg_possible()) return FG_SKIP_OFF;
     const Fg& g = fgs();
@@ -1953,8 +1967,9 @@ bool dlss_fg_holds() {
 }
 
 void dlss_fg_probe() {
-    // (DLSS's own answer first: dlss_probe, on the same thread. Where DLSS does not run, the row knows without NGX)
-    if (!fg_possible() || dlss_why() != DLSS_OK || !dev.device) return;
+    // (DLSS's own answer first: dlss_probe, on the same thread. Where DLSS does not run, the row knows without NGX; nor
+    // while NVIDIA Streamline makes DLSS FG's frames, its own answer at the start)
+    if (!fg_possible() || dlssg_active() || dlss_why() != DLSS_OK || !dev.device) return;
     Fg& g = fgs();
     if (g.answered.load(std::memory_order_acquire)) return;
     std::lock_guard lk(g.mu);   // (as dlss_fg_frames: then ngx_init's own lock)
@@ -1976,6 +1991,8 @@ bool dlss_fg_runs(int frames) {
 // (temporal_wanted) the renderer's own or FSR 3.1 makes every set, at the row's multiplier, as when NGX said no or its
 // feature was given up)
 int dlss_fg_most() {
+    // (through NVIDIA Streamline, vk_dlssg.cpp: what its DLSS-G makes at most, known once the device is made)
+    if (dlssg_active()) return fg_chosen() && temporal_wanted() ? dlssg_frames_most() : 0;
     if (!fg_asked() || dlss_why() != DLSS_OK || !temporal_wanted()) return 0;
     const Fg& g = fgs();
     // (most_known is 0 until NGX's answer, at the start-up screen (dlss_fg_probe) or the first present with a fixed

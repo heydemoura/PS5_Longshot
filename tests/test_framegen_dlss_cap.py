@@ -112,8 +112,10 @@ def check_sources(framegen, main_cpp, dlss, menu, replay):
         "present_image: the swapchain is made again when the multiplier as it runs changes past 4x"
     most = [b for b in dlss.split("int dlss_fg_most() {")[1:]]
     assert len(most) == 2, "vk_dlss.cpp: dlss_fg_most with NVIDIA's SDK and without it"
-    real = block(dlss, "int dlss_fg_most() {\n    if (!fg_asked()", where="gpu/vk/vk_dlss.cpp")
-    for part in ("fg_asked()", "dlss_why() != DLSS_OK", "!temporal_wanted()", "start_failed", "most_known"):
+    real = block(dlss, "int dlss_fg_most() {\n    //", where="gpu/vk/vk_dlss.cpp")
+    # (through NVIDIA Streamline, vk_dlssg.cpp: its DLSS-G's most, which the multiplier's row stops at as at NGX's)
+    for part in ("if (dlssg_active()) return fg_chosen() && temporal_wanted() ? dlssg_frames_most() : 0;",
+                 "fg_asked()", "dlss_why() != DLSS_OK", "!temporal_wanted()", "start_failed", "most_known"):
         assert part in real, "dlss_fg_most: " + part
     assert "int dlss_fg_most() { return 0; }" in dlss, "vk_dlss.cpp: 0 in a build without NVIDIA's SDK"
     frames = block(dlss, "int dlss_fg_frames(VkCommandBuffer cmd,", where="gpu/vk/vk_dlss.cpp")

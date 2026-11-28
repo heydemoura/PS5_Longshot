@@ -136,8 +136,15 @@ pub fn compile_options(p: &Places, upscalers: &[Upscaler], ngx: Option<&Path>) -
     // (a player's build: no console window, the shaders prepared before the title)
     c.settings.release = true;
     c.settings.fsr = upscalers.contains(&Upscaler::Fsr4);
+    asked_sdks(&mut c.settings, upscalers)?;
+    Ok(c)
+}
+
+/// The NVIDIA SDKs the compile takes: DLSS's, which a build with DLSS must have, and a developer's Streamline SDK
+/// (`LONGSHOT_SL_SDK`, DLSS Frame Generation through Streamline) beside it; neither for a build without DLSS.
+fn asked_sdks(s: &mut build_compile::Settings, upscalers: &[Upscaler]) -> Result<()> {
     if upscalers.contains(&Upscaler::Dlss) {
-        if c.settings.ngx_sdk.is_none() {
+        if s.ngx_sdk.is_none() {
             return Err(Error::player(
                 "dlss_sdk_missing",
                 "NVIDIA DLSS needs NVIDIA's DLSS SDK: download it under NVIDIA's license and name its folder in \
@@ -145,10 +152,11 @@ pub fn compile_options(p: &Places, upscalers: &[Upscaler], ngx: Option<&Path>) -
             ));
         }
     } else {
-        // (a DLSS SDK the PC has set is not taken for a build that did not ask for DLSS)
-        c.settings.ngx_sdk = None;
+        // (a DLSS or Streamline SDK the PC has set is not taken for a build that did not ask for DLSS)
+        s.ngx_sdk = None;
+        s.sl_sdk = None;
     }
-    Ok(c)
+    Ok(())
 }
 
 /// The places of a one-stage command (`longshot-builder image | lift | compile`, `longshot-packager compile`): the tree
@@ -990,6 +998,24 @@ pub fn compile_only(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_nvidia_sdks_set_on_the_pc_are_taken_only_by_a_build_with_dlss() {
+        let vars = |ngx: bool| {
+            move |n: &str| match n {
+                "LONGSHOT_NGX_SDK" if ngx => Some("ngx".to_string()),
+                "LONGSHOT_SL_SDK" => Some("sl".to_string()),
+                _ => None,
+            }
+        };
+        let mut s = build_compile::Settings::from_lookup(vars(true));
+        asked_sdks(&mut s, &[Upscaler::Dlss, Upscaler::Fsr4]).unwrap();
+        assert_eq!((s.ngx_sdk.as_deref(), s.sl_sdk.as_deref()), (Some(Path::new("ngx")), Some(Path::new("sl"))));
+        asked_sdks(&mut s, &[Upscaler::Fsr4]).unwrap();
+        assert_eq!((s.ngx_sdk, s.sl_sdk), (None, None));
+        let mut s = build_compile::Settings::from_lookup(vars(false));
+        assert!(matches!(asked_sdks(&mut s, &[Upscaler::Dlss]), Err(Error::Player { code: "dlss_sdk_missing", .. })));
+    }
 
     #[test]
     fn a_link_forgets_the_objects_only_when_they_are_what_failed() {

@@ -27,6 +27,12 @@ is accepted (its flag, or a typed yes when asked; nothing is downloaded without 
         (default sdk/xess in the development folder), from the commit third_party/xess's headers come from
         (third_party/xess/PROVENANCE.md), with LICENSE-INTEL-XESS-SDK.txt and THIRD-PARTY-INTEL-XESS-SDK.txt. Windows only:
         Intel publishes no XeSS library for Linux
+    python -I scripts/fetch.py streamline [--accept-nvidia-license] [--game <game folder>] [--build-only] [<sdk folder>]
+        NVIDIA Streamline's SDK (2.14.16), for a Windows build with NVIDIA DLSS Frame Generation through Streamline
+        (LONGSHOT_SL_SDK, gpu/vk/vk_dlssg.cpp), into <sdk folder> (default sdk/sl in the development folder): the licenses,
+        the headers and the runtime the game loads from beside longshot.exe. Its binaries are only in its release's zip,
+        not in its repository: scripts/sl_sdk.py, which this runs, has the release, its tables and the options' detail.
+        Then build with LONGSHOT_SL_SDK=<sdk folder>.
     fsr and xess --game: the files copied into <game folder> too, where the game looks after RX_VK_FSR_DIR / RX_VK_XESS_DIR
         and beside the executable (longshot-builder's --upscaler fsr4 / xess do the same for the folder they build). A
         player's own DLL there that is not the pinned one is left alone.
@@ -324,7 +330,19 @@ def say(line, err=False):
     print(line, file=sys.stderr if err else sys.stdout, flush=True)
 
 
+def streamline(argv):
+    """`fetch.py streamline`: scripts/sl_sdk.py's main (a release's zip, not a commit's files: its own tables and download),
+    with this file's default folder"""
+    spec = importlib.util.spec_from_file_location("sl_sdk", os.path.join(ROOT, "scripts", "sl_sdk.py"))
+    sl = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sl)
+    return sl.main(argv, default=dev_sdk("sl"))
+
+
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv[:1] == ["streamline"]:
+        return streamline(argv[1:])
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="sdk", required=True)
     for name, sdk in SDKS.items():

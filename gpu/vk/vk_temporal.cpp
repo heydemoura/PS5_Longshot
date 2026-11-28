@@ -74,6 +74,7 @@
 #include "temporal_jitter.h"
 #include "upscaler_rows.h"
 #include "vk_dlss.h"
+#include "vk_dlssg.h"   // (NVIDIA DLSS Frame Generation: the chain's depth and motion are its inputs; the Upscaler row as it runs)
 #include "vk_draw.h"
 #include "fsr3_math.h"   // (longshot: FSR 3.1's depth constants from the projection)
 #include "vk_fsr3.h"   // (fsr3_wanted: AMD FSR 3.1 upscales with inputs of its own; fsr3_engine: on this chain)
@@ -120,9 +121,11 @@ bool temporal_env_chosen() {
     return env_xess() > 0 && xess_why() == XESS_OK;
 }
 
+int temporal_row() { return dlssg_upscaler(opts.dlss); }
+
 int temporal_mode() {
     const int dlss = env_dlss(), fsr4 = env_fsr4(), xess = env_xess();
-    int v = opts.dlss;
+    int v = temporal_row();
     if (dlss > 0) v = dlss >= 2 ? ur::DLAA : ur::DLSS;   // (2 and up: DLAA, as RX_VK_DLSS was clamped before)
     else if (fsr4 > 0) v = fsr4 >= 2 ? ur::FSR4_AA : ur::FSR4;
     else if (xess > 0) v = xess >= 2 ? ur::XESS_AA : ur::XESS;
@@ -140,7 +143,7 @@ int temporal_mode() {
     return v;
 }
 bool temporal_wanted() { return temporal_mode() != ur::GAME; }
-bool temporal_off() { return opts.dlss == ur::OFF && temporal_mode() == ur::GAME; }
+bool temporal_off() { return temporal_row() == ur::OFF && temporal_mode() == ur::GAME; }
 bool temporal_full_scale() { return ur::full_scale(temporal_mode()); }
 
 namespace {
@@ -1705,7 +1708,9 @@ bool draw_engine(VkCommandBuffer cmd, State& s, int mode, const Camera& cam, uin
     // of its own. A frame that moves it from one to the other starts a new one: the engine's, not the motion's. The
     // camera and the actors' poses are the same either side of the bloom: moved keeps the engine's frame before for the
     // motion: that frame's motion vectors are the camera's and the actors', not zeros. NGX's frame generation still
-    // starts a new one with the engine's (vk_dlss.cpp dlss_fg_inputs: f.reset)
+    // starts a new one with the engine's (vk_dlss.cpp dlss_fg_inputs: f.reset); DLSS Frame Generation through Streamline
+    // keeps its own (vk_dlssg.cpp dlssg_inputs: told to reset, it makes no frame, and the game's frame presented alone
+    // upsets the driver's pacing of the frames after it)
     uint64_t moved = 0;
     const bool placed = s.pre_last != pre;   // (for the log: place_told)
     if (s.pre_last != pre) s.pre_last = pre, s.last_frame = 0, moved = drawn;
@@ -1869,6 +1874,8 @@ bool draw_engine(VkCommandBuffer cmd, State& s, int mode, const Camera& cam, uin
     const bool fsr_wanted = fsr3fi::frames_wanted();
     const bool fsr_took = motion && fsr_wanted && fsr3_inputs::take_motion(cmd, f.motion.image, rw, rh);
     if (placed) place_told(name_of(mode), pre, now, ready == 2, moved, motion, actors, fsr_wanted, fsr_took);
+    // (longshot) and NVIDIA DLSS Frame Generation through Streamline (vk_dlssg.cpp): the same inputs. Nothing without it
+    dlssg_inputs(cmd, f, cam.projection, cam.current, cam.jitter, motion);
     s.last_frame = now;
     s.drawn_mode = draw_mode;
     s.last_jitter[0] = cam.jitter[0], s.last_jitter[1] = cam.jitter[1];

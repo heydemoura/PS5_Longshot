@@ -200,7 +200,8 @@ def main():
         raise SystemExit("upscalers_available does not offer Off (no upscaler) everywhere")
     if "temporal_off()" not in function(menu, "int upscaler() {"):
         raise SystemExit("upscaler(): the row does not show Off while it runs")
-    if "bool temporal_off() { return opts.dlss == ur::OFF && temporal_mode() == ur::GAME; }" not in temporal:
+    # (the row as it runs, temporal_row: under Streamline a change to Off waits for the restart)
+    if "bool temporal_off() { return temporal_row() == ur::OFF && temporal_mode() == ur::GAME; }" not in temporal:
         raise SystemExit("temporal_off: Off is not the row's Off with no engine over it (RX_VK_DLSS, RX_VK_FSR4, FSR 3.1)")
     upscale = function(temporal, "bool temporal_upscale(")
     if "temporal_off() && stretch(" not in upscale:

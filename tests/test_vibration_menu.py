@@ -83,6 +83,7 @@ int framegen_capped(int v, int) { return v; }
 void sync_transition_autosave() {}
 bool row_fixed(const int*) { return false; }
 int upscaler() { return 0; }
+int upscaler_row() { return upscaler(); }   // (no Streamline here: nothing waits for the restart)
 namespace ur {
 int step_upscaler(int, int, bool) { return 0; }
 int step(int, int v, int dir) { return v + dir; }

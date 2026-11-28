@@ -685,6 +685,7 @@ test's override: the launcher sets none of them.
 | `LONGSHOT_THIRD_PARTY_OBJECTS=<dir>\|0` | The prebuilt third-party objects. Default: the tools' `third_party_objects/`; `0`: compile them. With `compile --third-party-objects` (the release's set) only a folder named here is read: the objects it holds by their keys are taken into the new set as they are (the release's: the last release's set, `longshot-packager release last-objects`) |
 | `LONGSHOT_TRACY=1`, `LONGSHOT_TRACY_FIBERS=1` | A Tracy build ([profiling](profiling.md#tracy)); the game's fibers told to Tracy |
 | `--ngx-sdk <dir>` (`LONGSHOT_NGX_SDK`, for one release) | NVIDIA's NGX SDK for `--upscaler dlss`, in place of the one the builder downloads; ignored by a build that did not ask for DLSS |
+| `LONGSHOT_SL_SDK=<dir>` | A developer's NVIDIA Streamline SDK (`scripts/fetch.py streamline`), for a Windows build with `--upscaler dlss`: the renderer with DLSS Frame Generation through Streamline (`-DLONGSHOT_SL` for `vk_dlssg.cpp` and `vk_dlssg_layer.cpp` alone); its runtime goes beside `longshot.exe` by `scripts/fetch.py streamline --game`, not by the builder. Unset, without `include/sl.h`, or a build without DLSS: built without it ([upscalers](upscalers.md#dlss-fg-through-streamline)) |
 | `LONGSHOT_VERSION=<name>` | The release's name. Default: a `VERSION` or `version.txt` file at the root, else `git describe` of the version tags |
 
 **The tools**
@@ -979,7 +980,7 @@ part; `dev.py paths <part>` prints one, for scripts.
 | `config/` | `dev_build.json`, `job_queue.json` | |
 | `builder-cache/` | `longshot-builder`'s per-user cache for every dev build (runtimes, sources, tools): `dev.py` sets it, so a dev build never fills the player's `~/.cache/longshot-builder` | `LONGSHOT_CACHE` |
 | `work/` | `mise run build`'s work folders, one per checkout (`work/<checkout>-<hash>`; `work-windows/`: `RX_TARGET=windows`), for a build, an update, a lift or a compile | `--work` |
-| `sdk/` | `scripts/fetch.py`'s SDKs: `ngx-linux/`, `ngx-windows/`, `ffx/`, `xess/` | `LONGSHOT_NGX_SDK` |
+| `sdk/` | `scripts/fetch.py`'s SDKs: `ngx-linux/`, `ngx-windows/`, `ffx/`, `xess/`, `sl/` | `LONGSHOT_NGX_SDK` |
 | `runs/` | Game runs: `control/` (`longshot_ctl.py`), `memtour-*`, `cover-*` | `--root`, `--out` |
 | `update/` | `dev.py update`'s worktree `tree/`, `work/`, the game folder's `backups/`, `history.md` | |
 | `tools/` | glslang (`mise run setup`) and Tracy's capture tools (`mise run tracy-tools`) | |

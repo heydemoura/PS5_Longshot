@@ -187,7 +187,7 @@ These override a menu row for the run only (kind `player`).
 | `RX_VK_DLSS=0/1/2`, `RX_VK_FSR4=0/1/2`, `RX_VK_XESS=0/1/2`, `RX_VK_FSR=0/1` | Upscaler: `0` never, `1` the upscaler, `2` its native AA |
 | `RX_VK_FSR4_MODEL=auto\|lite` | The FSR 4 network for one run: Auto lets AMD pick, Lite forces the INT8 Lite provider |
 | `RX_VK_FSR4_STANDIN=0` | No FSR 4 on a GPU AMD's library lists no FSR 4 model for (by default the INT8 Lite provider stands in there) |
-| `RX_VK_FRAMEGEN=0`, `RX_VK_FRAMEGEN_MULT=2..8`, `RX_VK_DLSS_FG=0/1`, `RX_VK_FSR_FG=0/1` | Frame generation (`RX_VK_FRAMEGEN=0` keeps it off whatever the menu says) |
+| `RX_VK_FRAMEGEN=0`, `RX_VK_FRAMEGEN_MULT=2..8`, `RX_VK_DLSS_FG=0/1`, `RX_VK_FSR_FG=0/1`, `RX_VK_DLSSG=0` | Frame generation (`RX_VK_FRAMEGEN=0` keeps it off whatever the menu says; `RX_VK_DLSSG=0` keeps DLSS FG on NGX in a build with NVIDIA Streamline: [upscalers](upscalers.md#dlss-fg-through-streamline)) |
 | `RX_VK_ASYNC=0/1`, `RX_VK_RECORDER=sync\|defer\|thread` | Threaded rendering: the render thread, the recorder (the parallel replay is gone: [threads.md](threads.md)) |
 | `RX_VK_COMPILE_SHADERS=most\|all` | Compile shaders |
 | `RX_VK_NO_INTEL_SERIAL=1/0` | Intel shader compiles: Side by side, One at a time ([below](#intels-compiler-on-windows)) |

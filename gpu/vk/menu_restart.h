@@ -7,7 +7,8 @@
 
 namespace mkwvk::menu_restart {
 
-constexpr int kMax = 16;   // (rows that take a restart: the menu has ten; a row past kMax would have no slot)
+constexpr int kMax = 24;   // (rows that take a restart, and the Mods tab's: 17 now; a row past kMax would have no slot.
+                           // pending's mask: 32 at most. tests/test_menu_restart_slots.py counts them)
 
 struct State {
     int n = 0;

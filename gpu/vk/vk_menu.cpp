@@ -198,6 +198,11 @@ unsigned upscalers_available() {
 }
 /// (FSR 3.1 has inputs of its own; DLSS, FSR 4 and XeSS run on the frame chain they share, temporal_mode; Off is neither)
 int upscaler() { return fsr3_wanted() ? (int)ur::FSR3 : temporal_off() ? (int)ur::OFF : temporal_mode(); }
+/// (longshot) Under NVIDIA Streamline a change of the Upscaler to another than DLSS or DLAA waits for the restart (vk_temporal.h
+/// temporal_row): the row says After restart, and shows and steps from the value chosen, while what runs (upscaler) and the
+/// rows that follow it stay as they are until then
+bool upscaler_waits() { return temporal_row() != opts.dlss; }
+int upscaler_row() { return upscaler_waits() ? opts.dlss : upscaler(); }
 bool dlss5_offered() { return dlss_nr_offered(); }   // (vk_dlss.cpp: its DLL looked for once a run)
 bool dlss5_model_offered() { return dlss_nr_model_offered(); }   // (vk_dlss.cpp: an RTX 50 with both of DLSS 5's files)
 namespace {   // (#1633: the anonymous namespace again, after what the modules ask)
@@ -1287,7 +1292,7 @@ void set_row(Row& r, int v, int dir, bool keep = true) {
     if (r.setting && r.setting->step_fn && dir && v == *r.value + dir * r.step) v = r.setting->step_fn(*r.value, dir);
     // (the scaling rows: only what can run here; the Render resolution row through the Upscaler's own ascending fixed stops)
     // (the Upscaler by engine; the Render resolution's Native is the engine's full-size form: upscaler_rows.h)
-    if (r.value == &opts.dlss) v = ur::step_engine(upscaler(), dir, upscalers_available());
+    if (r.value == &opts.dlss) v = ur::step_engine(upscaler_row(), dir, upscalers_available());
     if (r.value == &opts.resolution) {
         int up = upscaler(), res = *r.value;
         if (dir) {

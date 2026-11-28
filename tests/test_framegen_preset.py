@@ -75,6 +75,7 @@ namespace fgr = mkwvk::framegen_rows;
 int fg_last_fixed = 2;
 int fg_mult_ui = 2;
 int upscaler() { return opts.dlss; }
+int upscaler_row() { return upscaler(); }   // (no Streamline here: nothing waits for the restart)
 unsigned upscalers_available() { return ur::bit(ur::GAME) | ur::dlss_bits(true); }
 namespace mr { constexpr int kMax = 8; }
 /* (the Game language row's hook in set_row: language.txt, not written here) */

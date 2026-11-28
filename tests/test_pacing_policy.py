@@ -81,6 +81,7 @@ bool dlss_fg_wanted() { return true; }  // allow the requested-but-rejected path
 int dlss_why() { return DLSS_OK; }
 int ngx_most = 0;
 int dlss_fg_most() { return ngx_most; }
+bool dlssg_active() { return false; }   // (NVIDIA Streamline making DLSS FG's frames, vk_dlssg.cpp: not in these rows)
 void logf(const char*, ...) {}
 struct VkSwapchainCreateInfoKHR {
     int type;

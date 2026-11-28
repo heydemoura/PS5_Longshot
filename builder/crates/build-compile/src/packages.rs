@@ -195,6 +195,21 @@ pub fn ngx_sdk(s: &Settings) -> (Option<PathBuf>, Option<String>) {
     (None, Some(why))
 }
 
+/// `LONGSHOT_SL_SDK` as the build takes it: the folder when it has Streamline's headers (`include/sl.h`) and the build
+/// is Windows'; else none, and why. Streamline's DLLs are not linked: the game loads them at run time from beside
+/// `longshot.exe` (`scripts/fetch.py streamline --game` puts them there).
+pub fn sl_sdk(s: &Settings) -> (Option<PathBuf>, Option<String>) {
+    let Some(sdk) = &s.sl_sdk else { return (None, None) };
+    let why = if !s.windows {
+        "LONGSHOT_SL_SDK is for the Windows game only (NVIDIA Streamline has no Linux runtime)".to_string()
+    } else if !sdk.join("include").join("sl.h").is_file() {
+        format!("LONGSHOT_SL_SDK={} has no include/sl.h (scripts/fetch.py streamline fetches it)", sdk.display())
+    } else {
+        return (Some(sdk.clone()), None);
+    };
+    (None, Some(format!("{why}: built without NVIDIA DLSS Frame Generation through Streamline")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

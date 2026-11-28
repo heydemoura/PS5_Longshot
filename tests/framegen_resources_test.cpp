@@ -32,6 +32,7 @@ constexpr uint32_t CRT_DOWNSAMPLE_COMP_SPV[] = {0}, CRT_LOTTES_COMP_SPV[] = {0},
 #define BUILTIN_SPV_ARGS(words) words, sizeof words
 /* ACTUAL_STRUCTS */
 int multiplier() { return opts.framegen; }
+bool dlssg_active() { return false; }   // (vk_dlssg.cpp: NVIDIA DLSS Frame Generation not running)
 int display_refresh_mhz() { return 60000; }
 void logf(const char*, ...) {}
 struct Object { char kind; uint64_t parent; };

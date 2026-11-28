@@ -334,6 +334,9 @@ void checkpoints_report();
 /// The device is lost: that report once, then the process ends (vk_replay.cpp). why: the FATAL line, when it is not that the
 /// driver returned VK_ERROR_DEVICE_LOST (a hang it never reported: gpu_hang_watch_start)
 [[noreturn]] void device_lost(const char* why = nullptr);
+/// The renderer cannot go on for a reason that is not the device's (vk_main.cpp: a C++ exception out of it): the FATAL
+/// line why, the log written out and the process ended with exit code 3, as vk_replay.cpp's replay_fatal, which this is
+[[noreturn]] void fatal_end(const char* why);
 /// VK_AMD_buffer_marker's buffer, for RX_VK_CHECKPOINTS on a device without the NV checkpoints (vk_draw.cpp)
 void buffer_markers_init();
 void coopmat_init();   // vk_coopmat.cpp (once the device is made)

@@ -117,7 +117,9 @@ def main():
     need(first == "if (!swapchain_made_ready()) return false;",
          "create_swapchain does not answer not-made while a present is in the making on the presenter thread")
     on = block(replay, "bool present_thread_on() {")
-    need("getenv" not in on and "return true;" in on, "the presenter thread is not on on every PC")
+    # (but under NVIDIA Streamline's loader, vk_dlssg.cpp: its present hook and its Reflex markers are the render thread's)
+    need("getenv" not in on and "static const bool on = !dlssg_loaded();" in on and "return on;" in on,
+         "the presenter thread is not on on every PC (but where NVIDIA Streamline's loader is the renderer's)")
     dev_make = block(main_cpp, "bool create_device() {")
     need("presenter_queue_pick" not in dev_make and "presenter_family" not in main_cpp,
          "a second queue is made for the presenter (it time-shared the GPU with the replay)")

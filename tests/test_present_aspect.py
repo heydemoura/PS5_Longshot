@@ -66,6 +66,13 @@ bool hdr_ready = true;
 uint32_t hdr_w, hdr_h;
 uint32_t scale_w, scale_h;
 PresentRect drawn;
+// (NVIDIA DLSS Frame Generation through Streamline, vk_dlssg.cpp: told where the game's picture is in the swapchain image)
+PresentRect told;
+uint32_t told_w, told_h;
+int tells;
+void dlssg_backbuffer(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t image_w, uint32_t image_h) {
+    ++tells; told = {x, y, w, h}; told_w = image_w; told_h = image_h;
+}
 const int* drawn_crop;
 VkImage drawn_source;
 void vkCmdClearColorImage(int, VkImage, int, const VkClearColorValue* color, int count,
@@ -105,8 +112,10 @@ void expect(VkImage src, uint32_t sw, uint32_t sh, const int* crop, uint32_t dw,
     Host h{with_callback ? aspect_callback : nullptr}; host = with_host ? &h : nullptr;
     logical_aspect = aspect; filtered = filter;
     dev.swap_extent = {dw, dh};
-    clears = blits = scales = barriers = hdr_calls = hdr_barriers = 0;
+    clears = blits = scales = barriers = hdr_calls = hdr_barriers = tells = 0;
     actual_present(src, sw, sh, crop, 7);
+    // (the fitted rectangle, bars or not, in the whole image: once a game frame)
+    CHECK(tells == 1 && told.x == want.x && told.y == want.y && told.w == want.w && told.h == want.h && told_w == dw && told_h == dh);
     const bool hdr_attempted = dev.hdr;   // (Native too: read through its view by the HDR pass, never blitted)
     const bool hdr_emitted = hdr_attempted && hdr_ready;
     // (Native without the HDR pass: its scaled picture (10 bits), else black; never its image blitted in the image's format)
@@ -154,9 +163,9 @@ int main() {
     CHECK(logs == 1);
     // Startup has no game image: one full clear, then the window-sized overlay.
     Host h{aspect_callback}; host = &h; logical_aspect = wide;
-    dev.swap_extent = {1600, 1000}; clears = blits = scales = barriers = 0;
+    dev.swap_extent = {1600, 1000}; clears = blits = scales = barriers = tells = 0;
     actual_present(0, 1600, 1000, nullptr, 0);
-    CHECK(clears == 1 && blits == 0 && scales == 0 && barriers == 0);
+    CHECK(clears == 1 && blits == 0 && scales == 0 && barriers == 0 && tells == 0);
     std::puts("PASS: host aspect, crop, normal/generated frames, filter targets, bars and restore");
 }
 '''

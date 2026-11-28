@@ -40,6 +40,8 @@ bool crt_native_pq();   // (the game presents Native HDR (PQ): the CRT filters a
 const char* motion_gyro_text(int v);   // (the Motion controls row: On or Off, and whether the controller has a gyroscope)
 void menu_row_top(const int* value, int hi);   // (the row of this value ends at hi now: a list counted again)
 int upscaler();   // (the upscaler that runs now, upscaler_rows.h's: what the Upscaler row shows)
+bool upscaler_waits();   // (the Upscaler row's value waits for the restart: vk_temporal.h temporal_row runs another)
+int upscaler_row();   // (what the Upscaler row shows and steps from: upscaler(), or the value that waits for the restart)
 unsigned upscalers_available();   // (one bit per upscaler that runs here: upscaler_rows.h bit)
 bool dlss5_offered();   // (DLSS 5 can run here: NVIDIA's nvngx_dlssnr.dll found, an NVIDIA GPU, a build with DLSS)
 bool dlss5_model_offered();   // (the DLSS 5 model row shows: an RTX 50 with both files, NVIDIA's and the FP16 one)

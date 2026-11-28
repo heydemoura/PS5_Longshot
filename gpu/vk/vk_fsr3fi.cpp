@@ -19,6 +19,7 @@
 #include <utility>
 
 #include "vk_fsr3fi.h"
+#include "vk_dlssg.h"   // (dlssg_active: the renderer's own frame generation is off then)
 #include "vk_menu.h"    // (the Frame generation row)
 #include "vk_gprof.h"   // (RX_VK_PASS_TIMING: a span per pass, so the report names them)
 #include "vk_texture.h"
@@ -704,8 +705,9 @@ bool capable() {
 }
 
 uint32_t frames_wanted() {
-    // (the row first: a device is not asked anything, and nothing is logged, while frame generation is not at 2x)
-    return asked() && capable() ? 1u : 0u;
+    // (the row first: a device is not asked anything, and nothing is logged, while frame generation is not at 2x. None while
+    // NVIDIA DLSS Frame Generation runs, vk_dlssg.cpp: the renderer's own frame generation is off then)
+    return asked() && !dlssg_active() && capable() ? 1u : 0u;
 }
 
 /// The made frames' images, made[0..n): those not there yet are made (at the sizes prepare made the rest for) and left for

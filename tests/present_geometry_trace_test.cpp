@@ -62,6 +62,7 @@ void logf(const char* format, ...) {
 void vkCmdClearColorImage(int, VkImage, int, const VkClearColorValue*, int, const VkImageSubresourceRange*) { ++clears; }
 void image_barrier(int, VkImage, int, int) {}
 void full_barrier(int) {}
+void dlssg_backbuffer(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) {}   // (vk_dlssg.cpp: Streamline's, not traced)
 VkImageView framegen_scaled_view() { return 19; }
 VkImage framegen_hdr(int, VkImageView, uint32_t, uint32_t, const int*, uint32_t, uint32_t, bool, int mode = 0) {
     hdr_colour = mode;

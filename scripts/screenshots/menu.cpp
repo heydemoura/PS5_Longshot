@@ -53,6 +53,10 @@ dlss_nr::Issue dlss_nr_issue() { return dlss_nr::Issue::not_built; }
 void dlss_nr_retry() {}
 void dlss_nr_publish(const DlssNrControls&) {}
 dlss_nr::MetricsView dlss_nr_metrics() { return {}; }
+// No NVIDIA Streamline (the Frame generation by row's restart and its two restart lines): it makes no frames and no row
+// waits for a restart for it
+bool dlssg_active() { return false; }
+int dlssg_restart_needed() { return 0; }
 int framegen_capped(int framegen, int) { return framegen; }
 // No FSR 4 (the FSR 4 model row): no switch over it, no Lite, nothing to set
 int fsr4_model_env() { return -1; }
@@ -80,6 +84,7 @@ bool reflex_available() { return false; }
 bool antilag_available() { return false; }
 int temporal_mode() { return 0; }
 bool temporal_off() { return false; }
+int temporal_row() { return opts.dlss; }   // (no Streamline: the Upscaler row runs as set, nothing waits for the restart)
 FgMaker framegen_maker() { return static_cast<FgMaker>(0); }
 namespace bug_report {
 State state() { return kIdle; }

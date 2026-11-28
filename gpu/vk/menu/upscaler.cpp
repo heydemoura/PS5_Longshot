@@ -39,7 +39,8 @@ const char* tx_upscaler(int) {
     static const char* t[ur::kUpscalers] = {"Game's own", "NVIDIA DLSS", "NVIDIA DLAA", "AMD FSR 3.1", "AMD FSR 4",
                                             "AMD FSR 4 Native AA", "Off (no upscaling)", "Intel XeSS", "Intel XeSS Native AA"};
     // (by engine: DLAA and FSR 4's and XeSS's native AA are the Render resolution row's Native, upscaler_rows.h engine)
-    return t[std::clamp(ur::engine(upscaler()), 0, ur::kUpscalers - 1)];
+    // (the value chosen while it waits for the restart, under Streamline: upscaler_row)
+    return t[std::clamp(ur::engine(upscaler_row()), 0, ur::kUpscalers - 1)];
 }
 const char* tx_resolution(int v) {
     static char b[64];
@@ -143,7 +144,7 @@ const char* hn_upscaler(int v, int variant) {
     // (now: the value shown and what runs here, with every engine's reasons; every one: as said above)
     int d = 0, f = 0, x = 0;
     if (variant < 0) {
-        v = std::clamp(upscaler(), 0, ur::kUpscalers - 1), d = (int)dlss_why(), f = (int)fsr4_why(), x = (int)xess_why();
+        v = std::clamp(upscaler_row(), 0, ur::kUpscalers - 1), d = (int)dlss_why(), f = (int)fsr4_why(), x = (int)xess_why();
     } else if (v == ur::GAME) {
         if (variant < DLSS_WHY_COUNT) d = variant;
         else if (variant < DLSS_WHY_COUNT + FSR_WHY_COUNT - 1) f = variant - DLSS_WHY_COUNT + 1;
@@ -311,10 +312,14 @@ MENU_MODULE(upscaler) {
               .help = "What scales the 3D up to the Output resolution.",
               .value = &opts.dlss,
               .lo = 0, .hi = ur::kUpscalers - 1,
+              // (under NVIDIA Streamline, started with DLSS or DLAA, another Upscaler waits for the restart: After restart,
+              // DLSS going on until then, vk_temporal.h temporal_row. Any other change runs at once, as without it)
+              .restart = true,
               .shown = MENU_HOOK([] { return ur::upscaler_shown(upscalers_available()); }),
               .locked = MENU_HOOK([] { return fixed_by_line(ur::upscaler_fixed(upscalers_available()), hn_upscaler(opts.dlss, -1)); }),
               .text = MENU_HOOK([](int v) { return std::string(tx_upscaler(v)); }),
-              .hint = MENU_HOOK(hn_upscaler)}, menu::after("handheld_profile").order(10))
+              .hint = MENU_HOOK(hn_upscaler),
+              .restart_value = MENU_HOOK([](int) { return upscaler_waits() ? 1 : 0; })}, menu::after("handheld_profile").order(10))
         .row({.key = "dlss_model",
               .label = "DLSS model",
               .help = "Which of NVIDIA's DLSS networks draws the picture.",

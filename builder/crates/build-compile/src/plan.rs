@@ -151,6 +151,8 @@ pub struct Plan {
     pub dav1d: Option<PathBuf>,
     /// NVIDIA's NGX SDK, when DLSS is built.
     pub ngx: Option<PathBuf>,
+    /// NVIDIA Streamline's SDK, when DLSS Frame Generation through Streamline is built.
+    pub sl: Option<PathBuf>,
     /// Whether the game's executable is linked.
     pub link_game: bool,
     /// The log's lines about the plan.
@@ -653,6 +655,18 @@ fn plan_renderer(i: &Inputs, p: &mut Plan, tracy_flags: &[String], _dirs: &[Path
         }
         None => vec![],
     };
+    let sl = packages::sl_sdk(st);
+    if let Some(why) = sl.1 {
+        p.notes.push(why);
+    }
+    p.sl = sl.0.clone();
+    let sl_flags = sl_flags(p.sl.as_deref());
+    if let Some(sdk) = &p.sl {
+        p.notes.push(format!(
+            "the Vulkan back end: with NVIDIA Streamline's DLSS Frame Generation (NVIDIA Streamline's SDK in {})",
+            sdk.display()
+        ));
+    }
     let fsr_flags: Vec<String> = if st.fsr {
         p.notes.push("the Vulkan back end: with AMD FSR 4 (AMD's FSR API headers, third_party/fidelityfx)".into());
         vec!["-DLONGSHOT_FSR".into(), inc(&l.r("third_party/fidelityfx"))]
@@ -752,6 +766,7 @@ fn plan_renderer(i: &Inputs, p: &mut Plan, tracy_flags: &[String], _dirs: &[Path
             "vk_dlss.cpp" => f.extend(ngx_flags.iter().cloned()),
             "vk_fsr4.cpp" => f.extend(fsr_flags.iter().cloned()),
             "vk_xess.cpp" => f.extend(xess_flags.iter().cloned()),
+            b if SL_SOURCES.contains(&b) => f.extend(sl_flags.iter().cloned()),
             _ => {}
         }
         if imgui_users.contains(&base.as_str()) {
@@ -884,6 +899,15 @@ pub fn lifted_units(gen_dir: &Path) -> Result<Vec<(String, Listed)>> {
     Ok(out)
 }
 
+/// The renderer's files built with Streamline's headers ([`sl_flags`]); without them they are stubs that say the build
+/// has no Streamline.
+pub(crate) const SL_SOURCES: [&str; 2] = ["vk_dlssg.cpp", "vk_dlssg_layer.cpp"];
+
+/// [`SL_SOURCES`]' flags: `-DLONGSHOT_SL` and the SDK's `include/`, with Streamline's SDK; none without.
+pub(crate) fn sl_flags(sdk: Option<&Path>) -> Vec<String> {
+    sdk.map(|d| vec!["-DLONGSHOT_SL".into(), inc(&d.join("include"))]).unwrap_or_default()
+}
+
 /// The flags of a lifted IR unit: the target's and the CPU's, and the IR level. IR includes nothing and defines
 /// nothing, so only what reaches code generation; LoopRotate's header copies capped, and capture tracking past LLVM's
 /// 100 uses (the context parameter is noescape).
@@ -917,6 +941,28 @@ mod tests {
             assert_eq!(f[at - 1], "-mllvm", "{f:?}");
         }
         assert!(f.starts_with(&s(&["-march=x86-64-v3"])) && f.contains(&"-O1".to_string()));
+    }
+
+    #[test]
+    fn streamline_s_flags_go_to_its_two_files_only() {
+        // (the checkout's own: both are renderer sources, and nothing else of the renderer names LONGSHOT_SL)
+        let real = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../gpu");
+        let list = vk_sources(&real);
+        for f in SL_SOURCES {
+            assert!(list.iter().any(|p| p.ends_with(Path::new("vk").join(f))), "{f} is not a renderer source");
+        }
+        for src in list.iter().filter(|p| !SL_SOURCES.iter().any(|f| p.ends_with(f))) {
+            let text = std::fs::read_to_string(src).unwrap_or_default();
+            assert!(
+                !text.contains("LONGSHOT_SL"),
+                "{} reads LONGSHOT_SL, which only {SL_SOURCES:?} get",
+                src.display()
+            );
+        }
+        assert!(sl_flags(None).is_empty());
+        let f = sl_flags(Some(Path::new("sdk")));
+        assert_eq!(f[0], "-DLONGSHOT_SL");
+        assert_eq!(f[1], inc(&Path::new("sdk").join("include")));
     }
 
     #[test]

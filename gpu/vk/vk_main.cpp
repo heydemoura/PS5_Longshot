@@ -35,6 +35,8 @@
 #include "vk_bug_report.h"
 #include "auto_settings.h"
 #include "vk_dlss.h"
+#include "vk_dlssg.h"
+#include "vk_dlssg_layer.h"
 #include "vk_fsr4.h"
 #include "vk_xess.h"
 #include "vk_reflex.h"
@@ -69,9 +71,15 @@ VKX_DEVICE3(VKX_DEFINE)
 static PFN_vkGetInstanceProcAddr get_instance_proc;
 
 bool load_global() {
+    // (longshot: NVIDIA DLSS Frame Generation through Streamline, vk_dlssg.cpp) NVIDIA Streamline's loader in place of
+    // vulkan-1.dll's when the rows as saved ask DLSS FG for frames and it started: it hooks the instance, the device, the
+    // swapchain and the present, and gives vulkan-1.dll's own for the rest. Null in a build without it
+    get_instance_proc = mkwvk::dlssg_load();
 #ifdef _WIN32
     // Windows Vulkan shims can intercept the executable's imports but miss calls from this DLL.
-    if (mkwvk::host && mkwvk::host->vulkan_loader_proc) {
+    if (get_instance_proc) {
+        // (Streamline loads vulkan-1.dll itself)
+    } else if (mkwvk::host && mkwvk::host->vulkan_loader_proc) {
         get_instance_proc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(mkwvk::host->vulkan_loader_proc());
     } else {
         // Older hosts leave System32 loader resolution to the renderer. The loader chooses the drivers in use.
@@ -263,6 +271,11 @@ bool create_instance() {
     VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ci.pApplicationInfo = &app;
     std::vector<const char*> ext_list(exts, exts + n_exts);
+    std::vector<const char*> layers;
+    // (longshot) Longshot's own layer under NVIDIA Streamline, while that makes DLSS FG's frames (vk_dlssg_layer.h): the
+    // instance is made without it, and without what it asks, when the loader refuses it
+    const char* const dlssg_layer = dlssg_instance_layer();
+    size_t without_layer = 0;
     {   // (longshot) what NVIDIA DLSS needs (vk_dlss.cpp; nothing in a build without it)
         uint32_t n = 0;
         vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr);
@@ -274,13 +287,24 @@ bool create_instance() {
         // whenever the driver has it; the SDR choice in create_swapchain keeps to the sRGB surface)
         if (has_extension(all, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME))
             ext_list.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME), dev.swapchain_colorspace = true;
+        without_layer = ext_list.size();
+        if (dlssg_layer) dlssg_layer_instance_extensions(ext_list, all);
     }
-    ci.enabledExtensionCount = (uint32_t)ext_list.size();
     ci.ppEnabledExtensionNames = ext_list.data();
     // RX_VK_VALIDATION=1: the Khronos validation layer (when installed)
-    const char* layer = "VK_LAYER_KHRONOS_validation";
-    if (env_on("RX_VK_VALIDATION")) ci.enabledLayerCount = 1, ci.ppEnabledLayerNames = &layer;
-    if (vkCreateInstance(&ci, nullptr, &dev.instance) != VK_SUCCESS) {
+    if (env_on("RX_VK_VALIDATION")) layers.push_back("VK_LAYER_KHRONOS_validation");
+    VkResult made = VK_ERROR_INITIALIZATION_FAILED;
+    for (int with_layer = dlssg_layer ? 1 : 0; with_layer >= 0 && made != VK_SUCCESS; with_layer--) {
+        if (with_layer) layers.push_back(dlssg_layer);
+        ci.enabledExtensionCount = (uint32_t)(with_layer ? ext_list.size() : without_layer);
+        ci.enabledLayerCount = (uint32_t)layers.size();
+        ci.ppEnabledLayerNames = layers.empty() ? nullptr : layers.data();
+        made = vkCreateInstance(&ci, nullptr, &dev.instance);
+        if (with_layer) layers.pop_back();
+        if (with_layer && made != VK_SUCCESS)
+            logf("vk: the instance was not made with Longshot's layer under Streamline (VkResult %d): made without it", (int)made);
+    }
+    if (made != VK_SUCCESS) {
         logf("vk: vkCreateInstance failed");
         return false;
     }
@@ -389,6 +413,7 @@ static bool native_fadd_wanted(const char* env, VkDriverId driver, uint32_t devi
 }
 
 bool create_device() {
+    dlssg_device(dev.physical);   // (longshot: Streamline asked whether DLSS FG runs on the GPU chosen; no: it gives up, vk_dlssg.cpp)
     uint32_t n = 0;
     vkEnumerateDeviceExtensionProperties(dev.physical, nullptr, &n, nullptr);
     std::vector<VkExtensionProperties> exts(n);
@@ -507,6 +532,7 @@ bool create_device() {
     if (fsr4_wants_descriptor_buffer()) optional(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME, fsr_descriptor_buffer);
     xess_device_extensions(want, exts);   // (longshot: Intel XeSS's, when its library is there and the instance took its own)
     reflex_device_extensions(want, exts);   // (longshot: NVIDIA Reflex's, vk_reflex.cpp)
+    dlssg_layer_device_extensions(want, exts);   // (longshot: present timing for Longshot's layer under Streamline, vk_dlssg_layer.cpp)
     antilag_device_extensions(want, exts);   // (longshot: AMD Anti-Lag 2's, vk_antilag.cpp)
 
     // the queue: one family for graphics, compute and transfer
@@ -626,6 +652,7 @@ bool create_device() {
     VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptor_buffer{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT};
     if (fsr_descriptor_buffer) *tail = &descriptor_buffer, tail = &descriptor_buffer.pNext;
     reflex_device_features(tail);   // (present ids, when NVIDIA Reflex's extensions are there)
+    dlssg_layer_device_features(tail);   // (longshot: present timing's, when its extensions were added)
     VkPhysicalDevicePresentIdFeaturesKHR present_id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR};
     VkPhysicalDevicePresentWaitFeaturesKHR present_wait{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR};
     if (want_present_wait) {
@@ -906,6 +933,7 @@ bool create_device() {
     if (dev.buffer_marker) buffer_markers_init();
     coopmat_init();
     reflex_device_created();
+    dlssg_device_made();   // (longshot: Streamline's plugins are loaded now: their functions, vk_dlssg.cpp)
     antilag_device_created();
     // (longshot: on the Steam Deck the GPU held at amdgpu's peak power state while the game runs (RX_VK_GPU_CLOCK=0: not), gpu_clock.h;
     // the device's render node from VK_EXT_physical_device_drm, which needs no enabling to be asked)
@@ -1299,6 +1327,7 @@ bool create_swapchain(uint32_t width, uint32_t height) {
          vsync == 1 ? "On" : vsync == 2 ? "Off" : "Auto");
     swap_views_make(ci.imageUsage, mutable_view ? view_formats[1] : fmt.format);
     reflex_swapchain_created(sc);   // (NVIDIA Reflex: its sleep mode on the new swapchain)
+    dlssg_swapchain_made();   // (longshot: Streamline's DLSS FG, the toggle's hold from the screen's VRR floor, vk_dlssg.cpp)
     return true;
 }
 
@@ -2067,6 +2096,8 @@ bool prepare_compiler_busy() { return prepare_cpu_busy.load(std::memory_order_re
 // starts that crashed in a step are put back as this start found them (crash_markers.h): a quit is not a crash. Then, while the
 // shaders are prepared, their workers are stopped and what they made is kept (10 s at most: a driver can take longer on one
 // pipeline). Looked up by name, so an executable and a back end of different versions still close
+// (longshot) With NVIDIA Streamline's loader as the renderer's (vk_dlssg.cpp), Streamline is shut down instead of the
+// swapchain's retire below: it holds the presents and the queue until the process ends (dlssg_shutdown).
 extern "C"
 #ifdef _WIN32
 __declspec(dllexport)
@@ -2094,6 +2125,7 @@ void mkwvk_close_asked(void) {
         if (WaitForSingleObject(prep_ended, 10000) != WAIT_OBJECT_0) logf("vk: the preparation did not stop within 10 s: closing anyway");
     }
     dlss_fg_close();   // (NVIDIA DLSS Frame Generation through NGX: its feature let go before the process exits, vk_dlss.cpp)
+    if (dlssg_shutdown()) return;   // (Streamline: its own shutdown, which keeps the present and queue locks to the end)
     // (longshot) let go of the window's swapchain and everything it pins while the process is still here. The compositor
     // (gamescope on the Deck, any Wayland/X server) reprograms the display right as the window goes away, and on the Deck an
     // atomic commit there failed with ENOMEM after a long run had this process holding most of the system's memory: the
@@ -2173,13 +2205,7 @@ static const MkwVkRenderer* init_body(const MkwVkHost* h) {
     cxx_escape::g_hooks.out_of_memory = [](const char* what) {
         if (host && host->out_of_memory) host->out_of_memory(what);   // (does not return)
     };
-    cxx_escape::g_hooks.fatal = [](const char* why) {   // (as vk_replay.cpp's replay_fatal: the crash window reads its "vk: FATAL:")
-        logf("vk: FATAL: %s", why);
-        if (host && host->log_flush) host->log_flush();
-        std::fprintf(stderr, "vk: FATAL: %s\n", why);
-        std::fflush(stderr);
-        std::_Exit(3);
-    };
+    cxx_escape::g_hooks.fatal = fatal_end;   // (vk_replay.cpp's replay_fatal: the crash window reads its "vk: FATAL:")
     if (!load_global()) {
 #ifdef _WIN32
         logf("vk: load_global failed (Vulkan loader library or vkCreateInstance missing)");

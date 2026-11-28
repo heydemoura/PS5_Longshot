@@ -111,6 +111,8 @@ pub struct Settings {
     pub sdl_dir: Option<PathBuf>,
     /// `LONGSHOT_NGX_SDK`: NVIDIA's NGX SDK (DLSS).
     pub ngx_sdk: Option<PathBuf>,
+    /// `LONGSHOT_SL_SDK`: NVIDIA Streamline's SDK, a developer's (DLSS Frame Generation through Streamline, Windows).
+    pub sl_sdk: Option<PathBuf>,
     /// `LONGSHOT_FSR=1`: AMD FSR 4.
     pub fsr: bool,
     /// `LONGSHOT_TRACY=1`: a Tracy build (a developer's).
@@ -192,6 +194,7 @@ impl Settings {
             sdl2: path(get("LONGSHOT_SDL2")).map(|p| if p.is_dir() { p.join("libSDL2-2.0.so.0") } else { p }),
             sdl_dir: path(get("LONGSHOT_SDL_DIR")),
             ngx_sdk: path(get("LONGSHOT_NGX_SDK")),
+            sl_sdk: path(get("LONGSHOT_SL_SDK")),
             fsr: get("LONGSHOT_FSR").as_deref() == Some("1"),
             tracy: get("LONGSHOT_TRACY").as_deref() == Some("1"),
             tracy_fibers: get("LONGSHOT_TRACY_FIBERS").as_deref() == Some("1"),

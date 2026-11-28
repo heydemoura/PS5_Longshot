@@ -30,6 +30,7 @@
 #include <unordered_set>
 
 #include "vk_temporal.h"
+#include "vk_dlssg.h"   // (NVIDIA DLSS Frame Generation through Streamline)
 #include "vk_fsr3_inputs.h"   // (the camera jitter while AMD FSR 3.1 upscales)
 #include "status_line.h"
 #include "vk_reflex.h"
@@ -2415,13 +2416,24 @@ void early_split(VkCommandBuffer& cmd) {
 }
 
 /// The replay cannot go on: logged, the host's queued log written out (as hos_fatal does: a device lost's report is many
-/// lines, and the queue went with the process), written to stderr and the process ended (exit code 3)
+/// lines, and the queue went with the process), written to stderr and the process ended (exit code 3). Under NVIDIA
+/// Streamline's loader (vk_dlssg.h dlssg_loaded) ended before the DLLs' detach: there its DLSS-G plugin tears its frame
+/// generation down with its threads gone, and in the game an access violation was logged as a crash after the FATAL
+/// line and the process ended with a crash's exit code (dlssg_shutdown, the window's close, takes locks and waits: not
+/// for a fatal end, from any thread). The detach also ran this DLL's atexit, the performance summary's last
+/// (perf_report.cpp at_exit): written here first
 [[noreturn]] void replay_fatal(const char* why) {
     // The host's crash/freeze records read this prefix (host/hos_report_prefixes.h); keep it stable.
     logf("vk: FATAL: %s", why);
     if (host && host->log_flush) host->log_flush();
     std::fprintf(stderr, "vk: FATAL: %s\n", why);
     std::fflush(stderr);
+#ifdef _WIN32
+    if (dlssg_loaded()) {
+        perf_report_final(-1);
+        TerminateProcess(GetCurrentProcess(), 3);
+    }
+#endif
     std::_Exit(3);
 }
 /// A command buffer of the submission from h (its start, or where it stopped at a wait), recorded on this thread.
@@ -4549,6 +4561,8 @@ uint64_t vk_retirement_value() {
     replay_fatal(lost);
 }
 
+void fatal_end(const char* why) { replay_fatal(why); }
+
 /// (longshot) A GPU hang the driver never reports as a lost device. RTX 4070 Ti, NVIDIA 595.99.02, Linux, Hyrule Castle: the
 /// kernel's Xid 109 (CTX SWITCH TIMEOUT) ended the game's GPU context, the timeline stopped 4 short of what was sent, and
 /// from then on every wait came back VK_TIMEOUT or never came back, none VK_ERROR_DEVICE_LOST: device_lost() did not run,
@@ -5169,8 +5183,18 @@ void frame_info(int64_t* replayed, int64_t* draws, int* width, int* height) {
 }
 
 uint64_t present_value = 0;   // (the present job's value, handed out as it came; 0: the next one)
+// (longshot) The present job's times: when the game's thread presented the frame (bh_now's clock; 0: not known), and how
+// long that thread then waited for the renderer. Set before each do_present, on its thread, which takes them once: for
+// frame generation's timeline (framegen_record) and, through present_shown_at below, for the hold of DLSS Frame
+// Generation through Streamline (vk_dlssg.cpp dlssg_hold)
 int64_t present_game_at = 0;  // (the present job's game_at, frame generation's timeline; 0: not known)
 int64_t present_game_wait = 0;  // (its game_wait: how long the game's thread was held in that present)
+// (longshot) The present do_present makes on this thread, for the hold in present_image_with_trial: its job's time and
+// wait as do_present took them; 0 outside do_present, so a present made anywhere else (present_image) is never held
+thread_local int64_t present_shown_at = 0, present_shown_wait = 0;
+struct PresentShownScope {   // (do_present's: present_shown_* cleared on each of its returns)
+    ~PresentShownScope() { present_shown_at = present_shown_wait = 0; }
+};
 struct PendingShot {
     bool on = false;
     uint64_t value = 0;
@@ -5416,6 +5440,7 @@ void do_present(const nvn_tex* t, const int crop[4], uint64_t native_generation 
     OutputTrialSource trial;
     trial.native_generation = native_generation;
     trial.generation = output_trial_generation.load(std::memory_order_acquire);
+    const PresentShownScope shown_scope;   // (present_shown_*: this present's alone)
 #ifdef TRACY_ENABLE
     HT_SCOPE("do_present");
 #endif
@@ -5456,6 +5481,8 @@ void do_present(const nvn_tex* t, const int crop[4], uint64_t native_generation 
         present_game_at = 0;
         const int64_t game_wait = present_game_wait;
         present_game_wait = 0;
+        present_shown_at = game_at;
+        present_shown_wait = game_wait;
         rec_value_now = value;
         ub_first_of_recording = ub_updates.size();
         Recording& r = begin_recording(value);
@@ -5868,7 +5895,7 @@ void do_present(const nvn_tex* t, const int crop[4], uint64_t native_generation 
 
 bool output_preview_request(uint32_t width, uint32_t height) {
     std::lock_guard settings(menu_mu);
-    if (opts.hdr || opts.reflex || opts.dlss || framegen_on()) return false;
+    if (opts.hdr || opts.reflex || temporal_row() || framegen_on()) return false;
     if (!host->output_preview_request || !output_preview_path.load(std::memory_order_acquire)) return false;
     std::lock_guard lk(output_trial_mu);
     if (output_trial.request.generation || TrialClock::now() < output_preview_queued_until) return false;
@@ -6397,7 +6424,7 @@ void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int c
     {
         std::lock_guard lk(menu_mu);
         preview_path = async_on() && dev.swapchain && dev.present_wait && dev.swap_mode == VK_PRESENT_MODE_FIFO_KHR &&
-                       !dev.hdr && !opts.hdr && !opts.reflex && !opts.dlss && !framegen_on() && !present_defer_into;
+                       !dev.hdr && !opts.hdr && !opts.reflex && !temporal_row() && !framegen_on() && !present_defer_into;
         output_preview_path.store(preview_path, std::memory_order_release);
         {
             std::unique_ptr<OutputTrialBacking> released;
@@ -6551,6 +6578,8 @@ void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int c
     image_barrier(f.cmd, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     const PresentAspect aspect{src && host && host->aspect_ratio ? host->aspect_ratio() : 0.0f};
     const PresentRect rect = present_rect(sw, sh, crop, dev.swap_extent.width, dev.swap_extent.height, aspect);
+    // (longshot: where the game's picture is in the image, for DLSS Frame Generation through Streamline, vk_dlssg.cpp)
+    if (src) dlssg_backbuffer(rect.x, rect.y, rect.w, rect.h, dev.swap_extent.width, dev.swap_extent.height);
     [[maybe_unused]] uint32_t trace_route = 0; // direct; 1 scaled, 2 clear, 3 HDR conversion
     const bool has_bars = rect.x || rect.y || rect.w != dev.swap_extent.width || rect.h != dev.swap_extent.height;
     if (has_bars) {
@@ -6714,6 +6743,17 @@ void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int c
         present_defer_into->swapchain_generation = dev.swapchain_generation;
         return;
     }
+    // (longshot) DLSS Frame Generation through Streamline (vk_dlssg.cpp): a game frame's present held to an even time after
+    // the game's own, its copy submitted first and the queue's lock let go meanwhile (present_image_mu stays held, which
+    // dlssg_shutdown takes before the queue's); then frame generation on for this present or not. The time is do_present's
+    // (present_shown_at), and only on the render thread: without Threaded rendering the present is the game's own thread's,
+    // which the hold would put to sleep
+    if (async_on() && dlssg_active() && src && present_shown_at) {
+        qk.unlock();
+        dlssg_hold(present_shown_at, present_shown_wait);
+        qk.lock();
+    }
+    dlssg_before_present(src != VK_NULL_HANDLE);
     // (acquire ahead: the presenter thread asks for the next present's image right after it makes this one, a game frame's)
     present_acquire_ahead = src && acquire_ahead_wanted();
     present_copy_done = f.done;
@@ -7064,12 +7104,16 @@ bool present_thread_on() {
     // render thread from the present call wherever that call waits (NVIDIA's driver on Linux: ~4.5 ms for the copy) and costs
     // a thread's hand-off elsewhere. A second queue of its own would time-share the GPU with the replay: presents 2-4 ms
     // later; presenting on the presents' own queue after the copy's fence keeps that queue's lock for the call only)
+    // (longshot: not while Streamline's loader is the renderer's, vk_dlssg.cpp: its present hook and its latency markers
+    // are the render thread's, and its shutdown holds only the present and queue locks)
+    static const bool on = !dlssg_loaded();
     static bool told = false;
     if (!told) {
         told = true;
-        logf("vk: presenter thread: each present made on a thread of its own once its copy is done");
+        logf(on ? "vk: presenter thread: each present made on a thread of its own once its copy is done"
+                : "vk: presenter thread: off, Streamline's DLSS Frame Gen runs: each present made on the render thread");
     }
-    return true;
+    return on;
 }
 /// Waits, with presenter.mu held in lk, until the presenter has made the present it was handed (limit_ms: at most that long; false
 /// then). For the FPS counter's Breakdown, the wait is the GPU's until the presenter's wait for the copy ended, and the pacing's after it
@@ -7237,7 +7281,8 @@ struct Job {
     nvn_prog prog;
     std::chrono::steady_clock::time_point queued;
     uint64_t cap_seq = 0;       // (RX_VK_MEM_CHECK: the number of the capture made with it, for its take to match; 0: none)
-    int64_t game_at = 0;        // (a present: when the game's thread presented it, bh_now: frame generation's timeline)
+    int64_t game_at = 0;        // (a present: when the game's thread presented it, bh_now: frame generation's timeline,
+                                // vk_dlssg.cpp dlssg_hold)
     int64_t game_wait = 0;      // (and how long it was held there, until the job was in the queue: below its cap, long)
 };
 std::mutex q_mu;

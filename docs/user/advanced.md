@@ -30,9 +30,12 @@ whether each started, and why not.
 
 - **NVIDIA DLSS** (RTX cards): turn on **DLSS** in the launcher's build settings. It shows NVIDIA's license first; the
   build then downloads NVIDIA's SDK and puts DLSS's and DLSS Frame Generation's runtimes in the game folder's `ngx`
-  folder. An update keeps them. On Linux, NVIDIA's library loads them only from a folder whose whole path is plain
-  ASCII: for a game folder such as `~/Games/Longshot-Café`, the menu says so; copy `libnvidia-ngx-dlss*.so.*` from its
-  `ngx` folder into `~/.local/share/longshot/ngx`.
+  folder. An update keeps them. A Windows game built from source with NVIDIA Streamline's SDK
+  (`LONGSHOT_SL_SDK`, [setup](../dev/setup.md#upscaler-sdks-optional)), with Streamline's files put beside
+  `longshot.exe` by `scripts/fetch.py streamline --game`, shows DLSS Frame Generation's frames through it; `RX_VK_DLSSG=0` in `longshot_env.txt` leaves
+  Streamline out. The launcher's builds do not have it yet. On Linux, NVIDIA's library loads the `ngx` folder's
+  runtimes only from a folder whose whole path is plain ASCII: for a game folder such as `~/Games/Longshot-Café`, the
+  menu says so; copy `libnvidia-ngx-dlss*.so.*` from its `ngx` folder into `~/.local/share/longshot/ngx`.
 - **AMD FSR 4** (Windows): turn on **FSR 4** in the launcher's build settings. It shows AMD's license first, then
   fetches AMD's two DLLs into the game folder. On Linux, put a Vulkan FSR 4 library (`amd_fidelityfx_upscaler_vk.so`)
   beside the game yourself: AMD publishes none for Linux.

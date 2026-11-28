@@ -1,6 +1,5 @@
 """Compile actual Reflex consumers with deterministic swapchain-retirement interleavings. No GPU/SDK."""
 import argparse
-import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -71,6 +70,12 @@ struct Reflex {
 struct {int device=1;}dev;
 Reflex& rx(){return state;}
 bool framegen_on(){return fg;}
+// (NVIDIA Streamline making DLSS FG's frames, vk_dlssg.cpp: Reflex is its own then, and none of this file's calls is made)
+bool streamline=false;int sl_markers=0,sl_sleeps=0;
+enum DlssgMarker {DLSSG_SIM_START,DLSSG_SIM_END,DLSSG_SUBMIT_START,DLSSG_SUBMIT_END,DLSSG_PRESENT_START,DLSSG_PRESENT_END};
+bool dlssg_active(){return streamline;}
+void dlssg_marker(DlssgMarker){++sl_markers;}
+void dlssg_sleep(){++sl_sleeps;}
 int wanted_mode(){return wanted;}
 void apply_mode(uint32_t){if(!state.swapchain)invalid=true;++modes;}
 uint32_t fifo_min_interval_us(){return 0;}
@@ -147,9 +152,17 @@ int main(){
     t=static_cast<const Tag*>(reflex_submit_id(&next,4));if(t==(const void*)&next||t->presentID!=4)return 26;
     reset();wanted=0;if(reflex_submit_id(&next)!=&next)return 27;   // (Reflex off)
     reset();before_lock=retire_before_lock;if(reflex_submit_id(&next)!=&next||invalid||markers)return 28;   // (retired before its lock)
+    // NVIDIA Streamline making DLSS FG's frames: the markers and the sleep are its own, and nothing of this file's is called
+    reset();streamline=true;reflex_present_begins();reflex_submit_ends();
+    if(reflex_present_id(&next)!=&next)return 29;
+    reflex_presented();reflex_sleep();
+    if(invalid||markers||sleeps||modes||sl_markers!=5||sl_sleeps!=1)return 30;
+    if(reflex_submit_id(&next)!=&next)return 31;   // (no tag of the driver's Reflex on a submit)
+    streamline=false;
     std::puts("PASS: Reflex retirement before locks and across waits, reused handles, stable wait targets and recovery; "
               "with frame generation the game's frames paced, made frames without present ids, the game frame's own id; "
-              "queue submits tagged with their game frame, none for made frames, unmarked or shown frames, or Reflex off");
+              "queue submits tagged with their game frame, none for made frames, unmarked or shown frames, or Reflex off; "
+              "under Streamline its own Reflex takes the markers and the sleep");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='reflex-swapchain-') as tmp:

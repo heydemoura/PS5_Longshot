@@ -90,6 +90,8 @@ typedef PFN_vkVoidFunction (*PFN_vkGetInstanceProcAddr)(void*, const char*);
 typedef PFN_vkVoidFunction PFN_vkCreateInstance;
 #define VKX_GLOBAL(X) X(vkCreateInstance)
 static void fake_create_instance(void) {}
+// (NVIDIA Streamline's loader, vk_dlssg.cpp: not in this build, vulkan-1.dll is loaded as without it)
+namespace mkwvk { static PFN_vkGetInstanceProcAddr dlssg_load() { return nullptr; } }
 static PFN_vkVoidFunction fake_gipa(void*, const char* name) {
     return std::strcmp(name, "vkCreateInstance") ? nullptr : fake_create_instance;
 }

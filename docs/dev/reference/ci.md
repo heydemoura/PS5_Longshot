@@ -23,7 +23,7 @@ tools ([`longshot-tools.yml`](https://git.magicbean.dev/MagicBeanAdmin/Release/s
 | `pr-description.yml` | Pull request (opened, edited, pushed) | The title (a Conventional Commit) and the description against the template (`scripts/check_pr_description.py`), with main's script: no code of the pull request's runs. The title is here, not in `ci.yml`, because a title edit runs this file, and an edit's run of `ci.yml` would cancel the code's checks |
 | `third-party.yml` | Nightly, by hand | The third-party parts compared with their upstream archives (`check_third_party.py --upstream`); the per-change check is `ci.yml`'s `third-party` |
 | `tools-check.yml` | By hand (any branch) | Check tools: the build tools named made twice from their pins (`builder/tools/make.sh --check`) on a check runner, nothing uploaded ([bumping a tool](releases.md#bumping-a-tool)) |
-| `vulkan-dlss.yml` | By hand | The Windows Vulkan back end built with NVIDIA's DLSS SDK and AMD FSR 4 |
+| `vulkan-dlss.yml` | By hand | The Windows Vulkan back end built with NVIDIA's DLSS SDK, NVIDIA Streamline's SDK (DLSS Frame Generation) and AMD FSR 4 |
 | `vulkan-fixtures.yml` | By hand | The authored Vulkan fixtures on Mesa's software driver |
 
 ### Runners

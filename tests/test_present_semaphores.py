@@ -210,6 +210,7 @@ thread_local uint64_t antilag_present_frame = ~0ull;  // (vk_antilag.cpp: the sa
 PendingPresent* present_defer_into=nullptr;
 unsigned committed=0, after_acquire=0;
 bool present_out(uint32_t, std::unique_lock<std::mutex>&) {++committed; return true;}
+void dlssg_before_present(bool) {}   // (vk_dlssg.cpp: NVIDIA Streamline's own, nothing without it)
 ''' + commit + r'''
 void acquire_with_result(VkResult res) {
 ''' + acquire_loss + r'''

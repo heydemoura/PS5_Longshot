@@ -12,7 +12,9 @@ void fg_latency_swapchain_gone();
 /// multiplier), a fixed one at most NVIDIA DLSS Frame Generation's runtime's most made frames + 1 while DLSS-G is to make the
 /// frames (vk_dlss.h dlss_fg_most: 6x on an RTX 50's runtime, 2x on an RTX 40's; that most is 0 otherwise: no cap). Past it
 /// NGX was not asked for the sets, and the renderer's own or AMD FSR 3.1 made every frame with DLSS FG chosen. A saved value
-/// past it is kept (another engine runs it), and is shown and run as that top. Off and Auto are as they are
+/// past it is kept (another engine runs it), and is shown and run as that top. Off and Auto are as they are.
+/// framegen_now is 0 while NVIDIA Streamline makes DLSS FG's frames (vk_dlssg.h): it shows them itself, and none of the
+/// renderer's frame generation runs (its sets, its display thread, its swapchain images)
 int framegen_capped(int framegen, int dlss_most);
 int framegen_now();
 /// (longshot) Each present: frame generation off for 120 presents lets its images go (the built-in interpolation's two frames, its

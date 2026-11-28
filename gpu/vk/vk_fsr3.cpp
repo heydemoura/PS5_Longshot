@@ -790,9 +790,10 @@ bool fail(const char* why) {   // (the network runs: why, when it changes and ev
 bool fsr3_chosen() {
     static const int env = env_switch("RX_VK_FSR");
     if (env == 0) return false;
-    // (the Upscaler row's FSR 3.1, upscaler_rows.h, read each time: the row changes it while the game runs. RX_VK_DLSS=1 / 2
-    // or RX_VK_FSR4=1 / 2 goes over the row, its FSR 3.1 too: vk_temporal.cpp's chain draws then)
-    return (env > 0 || (opts.dlss == upscaler_rows::FSR3 && !temporal_env_chosen())) && fsr3::supported();
+    // (the Upscaler row's FSR 3.1, upscaler_rows.h, read each time as it runs: the row changes it while the game runs, and
+    // under Streamline that waits for the restart, vk_temporal.h temporal_row. RX_VK_DLSS=1 / 2 or RX_VK_FSR4=1 / 2 goes over
+    // the row, its FSR 3.1 too: vk_temporal.cpp's chain draws then)
+    return (env > 0 || (temporal_row() == upscaler_rows::FSR3 && !temporal_env_chosen())) && fsr3::supported();
 }
 
 bool fsr3_on_chain() {

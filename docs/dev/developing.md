@@ -111,7 +111,9 @@ python -I scripts/dev.py packs run [--tree <checkout>] -- <longshot-builder args
   (DLSS, from that SDK), `LONGSHOT_FSR=1` (FSR 4), `LONGSHOT_XESS_SDK` (XeSS). `LONGSHOT_FFX_SDK` beside `LONGSHOT_FSR=1`,
   and `LONGSHOT_XESS_SDK`, say the vendor's license was accepted when `scripts/fetch.py` fetched it: the base passes
   `--accept-licenses amd` or `intel`, and longshot-builder puts its own pinned copy of the runtime in the game folder;
-  `LONGSHOT_NGX_SDK` goes to it as `--ngx-sdk`. A base's packs build with the base's, so build a new base to change them.
+  `LONGSHOT_NGX_SDK` goes to it as `--ngx-sdk`. `LONGSHOT_SL_SDK` (NVIDIA Streamline, `scripts/fetch.py streamline`)
+  beside DLSS on Windows builds DLSS Frame Generation through Streamline ([upscalers](reference/upscalers.md#dlss-fg-through-streamline)).
+  A base's packs build with the base's, so build a new base to change them.
 - A pack makes a runtime prepare its shaders again when its build's `translator_stamp` (in the game folder's
   `longshot_version.txt`, written by longshot-builder) is not its base's.
 - `warm` plays a pack-less runtime and copies the caches it grew back into the base, so no runtime compiles pipelines
