@@ -151,6 +151,16 @@ VkResult submit_or_retry(const VkSubmitInfo2& si, VkFence fence) {
         if (told.fetch_add(1, std::memory_order_relaxed) < 16)
             logf("vk: the refused submit %s on try %d", res == VK_SUCCESS ? "was taken" : "was refused again, dropped", tries);
     }
+    // (longshot) Qualcomm's Adreno driver on Windows answers every submit after Windows has reset a hung GPU (a TDR) with
+    // VK_ERROR_INITIALIZATION_FAILED, a result vkQueueSubmit2 may not give, never VK_ERROR_DEVICE_LOST: device_lost() did not
+    // run, nothing finished on the GPU any more and none of it counted as sent, so the hang watch saw nothing owed, and the
+    // game froze with no report. Nothing sent after it runs: it is a lost device (the caller logs the failure first)
+    if (res == VK_ERROR_INITIALIZATION_FAILED) {
+        logf("vk: submit failed (%d): taken as a lost device (Qualcomm's driver answers so after Windows resets a hung GPU)",
+             (int)res);
+        device_lost("the GPU stopped and Windows reset it (a TDR): the driver refuses every submit since "
+                    "(VK_ERROR_INITIALIZATION_FAILED), and nothing sent to it runs any more");
+    }
     return res;
 }
 // ---- (longshot) recordings by number: a second timeline, signalled at the end of every recording with its number, and the
