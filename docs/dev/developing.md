@@ -197,7 +197,8 @@ override it). If its folder cannot be created, the job stops instead of using th
 
 - **Measure with `timing`, run everything else with `shared`.** Keep each GPU job short: a long batch holds the queue.
 - **A timed run says when the PC was busy.** While it measures, the queue samples every 2 s what the run's own processes
-  stalled on (CPU, memory and disk: its job's cgroup), the other CPUs' use, builds outside the queue and jobs beside it.
+  stalled on (CPU, memory and disk: its job's systemd scope, the whole PC's without one), the other CPUs' use, builds
+  outside the queue and jobs beside it.
   The PC swapping is recorded but no noise by itself: a game holding 18 GB swaps the rest of a 32 GB PC out. A run past any
   limit (`NOISY` in `scripts/devtools/jobqueue.py`) is marked NOISY in `dev.py queue history`, and `dev.py ab` adds a
   **Noisy:** line naming it, judged on its measured stretch only (`--noise FILE` gives a caller the samples). Run a noisy

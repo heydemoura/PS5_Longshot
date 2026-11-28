@@ -26,6 +26,9 @@ environment a job gets.
   process table on any OS (the Windows code, its process reads stood in for), and on Windows with real processes.
 - Windows: procs.proc_start sends no Ctrl+C, with common.WINDOWS patched off too, as Environment's test does (os.kill(pid,
   0) there is a Ctrl+C to the whole console: it ended run_all.py and the shell around it at once, without a word).
+- A timed run's noise is its own stalls once systemd has moved its command into the job's scope (systemd-run --scope
+  starts in the runner's cgroup), the PC's until then and without a scope: never the runner's cgroup's. Checked with a
+  made-up command and cgroups on any OS.
 
 python -I -B tests/test_job_queue.py
 """
@@ -165,6 +168,85 @@ class NoiseOfARun(unittest.TestCase):
             rec = n.record()
             self.assertEqual(rec["builds_outside"], 1)
             self.assertEqual(rec["beside"], ["b (build)"])
+
+    def run_timed(self, scoped, late=False):
+        """The noise samples of a timed run (q.run, timing-cpu) on any OS: its command made up (pid 999999), and its
+        cgroups, the runner's and the scope systemd-run asks for. systemd-run --scope starts in the runner's cgroup and
+        runs the command once systemd has moved it into the scope: here by the time run() waits for it, or late, after
+        the first sample (2 s)"""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        runner, noise = os.path.join(d, "user.slice", "session-2.scope"), os.path.join(d, "noise.jsonl")
+        os.makedirs(runner)
+        where, level, started = {999999: runner}, {runner: 2.0}, []   # (the command's cgroup; each cgroup's stalls)
+
+        def until(n):   # (n samples written)
+            end = time.time() + 20
+            while time.time() < end:
+                try:
+                    with open(noise, encoding="utf-8") as f:
+                        if f.read().count("\n") >= n:
+                            return
+                except OSError:
+                    pass
+                time.sleep(0.05)
+
+        class Child:
+            pid = 999999
+
+            def __init__(self, cmd, **_):
+                started.append(cmd)
+                self.scope = None
+                for a in cmd:
+                    if a.startswith("--unit="):
+                        self.scope = os.path.join(d, "app.slice", a[len("--unit="):] + ".scope")
+                        os.makedirs(self.scope)
+                        level[self.scope] = 3.0
+
+            def wait(self, timeout=None):
+                if self.scope and not late:
+                    where[self.pid] = self.scope
+                until(1)
+                if self.scope and late:
+                    where[self.pid] = self.scope
+                    until(2)
+                return 0
+
+            def poll(self):
+                return 0
+
+        s = dict(q.DEFAULTS, LONGSHOT_QUEUE_DIR=os.path.join(d, "q"), LONGSHOT_QUEUE_STATE=os.path.join(d, "s"),
+                 LONGSHOT_QUEUE_SCOPE="1" if scoped else "0")
+        stalls = lambda kind="memory", line="full", cgroup=None: level.get(cgroup, 1.0)   # (no cgroup: the PC's)
+        with contextlib.ExitStack() as st:
+            for target, attr, value in (
+                    (common, "WINDOWS", False), (q.subprocess, "Popen", Child), (q, "scope_ok", lambda: True),
+                    (q, "cgroup_of", where.get), (q, "pressure", stalls),
+                    (q, "job_here", lambda *a: None),   # (in a queue's job, as the suite may be, run() runs it directly)
+                    (q, "user_playing", lambda s: False), (q, "slots_now", lambda s: SLOTS),
+                    (q, "heavy_procs", lambda *a: []), (q, "memory_short", lambda s: None),
+                    (q, "cpu_sets", lambda s: (None, None)), (q, "job_env", lambda environ, *a, **k: dict(environ)),
+                    (q, "say", lambda text: None)):
+                st.enter_context(mock.patch.object(target, attr, value))
+            self.assertEqual(q.run("noise-x", "timing-cpu", ["game"], environ={}, s=s, noise_file=noise), 0)
+        self.assertEqual(started[0][0] == "systemd-run", scoped)
+        with open(noise, encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def test_a_runs_own_stalls_are_its_scopes(self):
+        x = self.run_timed(scoped=True)[0]
+        self.assertTrue(x["own"])
+        self.assertEqual((x["cpu"], x["memory"], x["io"]), (3.0, 3.0, 3.0), "its scope's, not the runner's (2.0)")
+
+    def test_the_pcs_stalls_until_systemd_has_moved_it(self):
+        first, then = self.run_timed(scoped=True, late=True)[:2]
+        self.assertEqual((first["own"], first["memory"]), (False, 1.0), "the PC's, not the runner's (2.0)")
+        self.assertEqual((then["own"], then["memory"]), (True, 3.0), "its scope's, once it is there")
+
+    def test_without_a_scope_the_pcs_stalls(self):
+        x = self.run_timed(scoped=False)[0]
+        self.assertFalse(x["own"])
+        self.assertEqual((x["cpu"], x["memory"], x["io"]), (1.0, 1.0, 1.0), "the PC's, not the runner's (2.0)")
 
 
 class Environment(unittest.TestCase):

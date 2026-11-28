@@ -28,7 +28,7 @@ build's and the game's switches: a variable naming the job would change what eve
 system; for every mode its own NVIDIA shader cache folder (LONGSHOT_QUEUE_NV_CACHE); on Linux its own systemd scope (the
 OOM killer stops that job, not your terminal) and CPU affinity while a timed run measures. Every job also waits for memory
 (LONGSHOT_QUEUE_MIN_FREE_GB, _MAX_PRESSURE, _MAX_SWAP_GB), and a timed run for builds outside the queue. While a timed run
-measures, the queue samples every 2 s what its processes stalled on (Noise: CPU, memory and disk, its job's cgroup's PSI),
+measures, the queue samples every 2 s what its processes stalled on (Noise: CPU, memory and disk, its job's scope's PSI),
 the swapping, the other CPUs' use, builds outside the queue, jobs beside it); `--noise FILE` writes the samples as JSON lines, and the
 history keeps their summary and says to run it again when it was noisy (NOISY).
 
@@ -296,7 +296,7 @@ def _scope(t, sig):
         return
     try:
         subprocess.run(["systemctl", "--user", "kill", "--signal=%s" % sig,
-                        "longshot-job-%s-%d.scope" % (safe(t.get("name") or ""), t["pid"])],
+                        job_unit(t.get("name") or "", t["pid"]) + ".scope"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
     except (OSError, subprocess.TimeoutExpired):
         pass
@@ -523,6 +523,11 @@ def safe(name):
     return "".join(c if c.isalnum() or c in "-_" else "-" for c in name)[:48] or "job"
 
 
+def job_unit(name, pid):
+    """The systemd unit of job name whose runner is pid: run()'s systemd-run --scope --unit, the scope <it>.scope"""
+    return "longshot-job-%s-%d" % (safe(name), pid)
+
+
 def job_env(environ, name, mode, s, me_pid, desc=None):
     """The environment a job runs with (the module's notes): never a new OOT_, RX_ or A64_ variable. A game run (a mode
     with a GPU share) is named on screen: LONGSHOT_BUILD_NAME, under the version in the menu and on the start-up screen,
@@ -629,15 +634,27 @@ class Noise:
     io "full" avg10, the load, the swap counter, the other CPUs' use, builds outside the queue moved off its CPUs, jobs of
     the queue beside it). The history keeps their summary (noise_summary) so a noisy measurement shows; path: the samples
     as JSON lines too, for a caller that judges only its own measured stretch (dev.py ab). cgroup: the job's own, whose
-    stalls are sampled instead of the PC's"""
+    stalls are sampled instead of the PC's (follow: its systemd scope's)"""
 
     def __init__(self, other_cpus=None, path=None, cgroup=None):
         self.other_cpus, self.path, self.cgroup = other_cpus, path, cgroup
+        self.pid = self.scope = None
         self.samples = []
         self.strays = set()
         self.last = cpu_times(other_cpus) if other_cpus else None
 
+    def follow(self, pid, scope):
+        """The job's cgroup: its command pid's once that is the job's systemd scope (scope: the unit's name), read
+        again at each sample until then. systemd-run --scope starts in the runner's cgroup and runs the command once
+        systemd has moved it there: read at once, it was the runner's (its terminal's, and whatever else runs in it).
+        Until then, the PC's"""
+        self.pid, self.scope = pid, scope
+
     def sample(self, strays=(), beside=()):
+        if self.pid and not self.cgroup:
+            g = cgroup_of(self.pid)
+            if g and os.path.basename(g) == self.scope:
+                self.cgroup = g
         g = self.cgroup if self.cgroup and os.path.isdir(self.cgroup) else None
         x = {"t": round(time.time(), 2), "cpu": pressure("cpu", "some", g), "memory": pressure("memory", "full", g),
              "io": pressure("io", "full", g), "own": bool(g), "swap_pages": swap_pages(), "strays": len(strays),
@@ -863,7 +880,7 @@ def run(name, mode, cmd, environ=None, s=None, cwd=None, desc=None, noise_file=N
         if s["LONGSHOT_QUEUE_SCOPE"] != "0" and scope_ok():
             props = ["-p", "MemorySwapMax=0"] if cpu == "quiet" and s["LONGSHOT_QUEUE_NO_SWAP"] != "0" else []
             run_cmd = ["systemd-run", "--user", "--scope", "--quiet", "--collect",
-                       "--unit=longshot-job-%s-%d" % (safe(name), me["pid"])] + props + ["--"] + run_cmd
+                       "--unit=" + job_unit(name, me["pid"])] + props + ["--"] + run_cmd
             scoped = True
         stop = threading.Event()
         if common.WINDOWS:
@@ -872,8 +889,8 @@ def run(name, mode, cmd, environ=None, s=None, cwd=None, desc=None, noise_file=N
         else:
             child = subprocess.Popen(run_cmd, cwd=cwd, env=env, preexec_fn=pre)
         me.update(child=child.pid, child_start=procs.proc_start(child.pid))
-        if cpu == "quiet" and not common.WINDOWS:
-            noise.cgroup = cgroup_of(child.pid)
+        if cpu == "quiet" and scoped:   # (without a scope, the PC's stalls: the runner's cgroup is not the job's)
+            noise.follow(child.pid, job_unit(name, me["pid"]) + ".scope")
         with common.Lock(lock):
             write_ticket(qdir, me)
         if (timing_cpus or cpu == "quiet") and not common.WINDOWS:
