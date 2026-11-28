@@ -1,6 +1,7 @@
 //! `longshot-builder dev`: the lifter's commands, for developers (docs/dev/reference/builder.md, "The parts").
 //!
 //! - `discover`: the image's functions, their counts and the time they take (discover.rs);
+//! - `console-lists`: the two shader lists a console title folder carries (console_lists.rs);
 //! - `sites`: the build's hook sites, read, resolved and placed over the image's own discovery (sites_cmd.rs);
 //! - `lift`: the whole lift, from the image to gen/ (lift_cmd.rs, the `lift` crate's `whole`);
 //! - `profile`: a run's counts as a guest profile (profile_cmd.rs);
@@ -13,6 +14,7 @@
 
 use std::process::ExitCode;
 
+mod console_lists;
 mod discover;
 mod lift_cmd;
 mod profile_cmd;
@@ -22,6 +24,8 @@ mod words;
 
 const USAGE: &str = "usage: longshot-builder dev discover --image <dir>
        longshot-builder dev sites --image <dir> --tables <game>
+       longshot-builder dev console-lists (--index <folder> | --romfs <folder>) --repo <dir> --out <folder>
+                                          [--leave-out <name>,...] [--jobs N]
        longshot-builder dev lift (--work <dir> | --image <dir> --gen <dir>) [--repo <dir> | --host <dir> --tables <dir>]
                                  [--exefs <dir> | --npdm <file>] [--entries <file>] [--devirt <file>]
                                  [--profile-generate | --profile <file> [--hot-share F] [--hot-max N]]
@@ -65,6 +69,7 @@ pub fn run(args: &[String]) -> ExitCode {
         }
     }
     match args.first().map(String::as_str) {
+        Some("console-lists") => console_lists::run(&args[1..]),
         Some("discover") => discover::run(&args[1..]),
         Some("sites") => sites_cmd::run(&args[1..]),
         Some("site-hooks") => site_hooks::run(&args[1..]),
