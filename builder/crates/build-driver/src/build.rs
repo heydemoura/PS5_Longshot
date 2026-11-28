@@ -943,6 +943,10 @@ pub fn compile_only(
     let mut c = compile_options(p, upscalers, None)?;
     c.settings.release = env("RX_RELEASE").as_deref() == Some("1");
     c.mode = mode.unwrap_or(build_compile::Mode::Game);
+    // (a compile of the lift's units: the switch as the lift was made with it)
+    if matches!(c.mode, build_compile::Mode::Game | build_compile::Mode::GameOnly) {
+        stages::check_hot_split(&p.work.gen_dir)?;
+    }
     // (the units' texts the lift did not write, made again as the compile needs them)
     let texts = stages::lift_texts(&alone_ask(&p.root, &p.work, &p.stores, p.jobs), None);
     c.ir_text = texts.clone().map(|t| build_compile::IrSource(t as std::sync::Arc<dyn build_compile::IrText>));

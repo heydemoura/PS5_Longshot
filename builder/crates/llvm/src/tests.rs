@@ -170,7 +170,7 @@ pub(crate) fn clang() -> Option<&'static str> {
     found
 }
 
-fn compiles(text: &str) {
+pub(crate) fn compiles(text: &str) {
     let Some(clang) = clang() else { return };
     // (a folder of each call's own: tests run at once)
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

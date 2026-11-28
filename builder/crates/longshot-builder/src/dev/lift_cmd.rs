@@ -9,7 +9,9 @@
 //! - the guest profile: `--profile-generate`, or `--profile <file>` [`--hot-share F`] [`--hot-max N`];
 //! - the IR: `--no-polls`, `--no-mark-bitmap`, `--sync-all-at-calls`, `--mark-each`, `--no-simplify`; `--split-over
 //!   N` (a function of more mid IR instructions is split into pieces for the compiler; 0: none) and `--split-piece N`
-//!   (about how many a piece holds);
+//!   (about how many a piece holds); the hot units made for LLVM's hot-cold splitting as the build makes them, by
+//!   `LONGSHOT_HOT_SPLIT` (on unless `0`) and `LONGSHOT_HOT_SPLIT_SKIP`, or `--hot-split` (on), `--no-hot-split` (off)
+//!   and `--hot-split-skip <list>` over them;
 //! - `--unit-cost N` (a unit's budget, `--hot-unit-cost N` a hot one's, `--cold-unit-cost N` a cold one's, 0: no cold
 //!   units), `--jobs N`, `--store <dir>`, `--force`;
 //! - `--output json|text`: the events as JSON Lines, or text (the default).
@@ -31,6 +33,8 @@ fn parse(args: &[String]) -> Result<Args, String> {
     let (mut work, mut repo, mut exefs) = (None::<PathBuf>, None::<PathBuf>, None::<PathBuf>);
     let (mut share, mut max, mut profile, mut generate) = (0.95, 4000, None::<PathBuf>, false);
     let mut json = false;
+    // (unset: the environment's, as the build reads it)
+    let (mut hot_split, mut hot_split_skip) = (None::<&str>, None::<String>);
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         let mut value = |what: &str| it.next().cloned().ok_or(format!("{arg} needs {what}"));
@@ -69,6 +73,9 @@ fn parse(args: &[String]) -> Result<Args, String> {
             "--jobs" => o.jobs = number(value("a number")?)?.max(1) as usize,
             "--store" => o.store = Some(value("a folder")?.into()),
             "--force" => o.force = true,
+            "--hot-split" => hot_split = Some("1"),
+            "--no-hot-split" => hot_split = Some("0"),
+            "--hot-split-skip" => hot_split_skip = Some(value("a list of entries")?),
             "--output" => {
                 let v = it.next().ok_or_else(|| "--output needs a value".to_string())?;
                 json = match crate::output::Output::parse(v)? {
@@ -98,6 +105,10 @@ fn parse(args: &[String]) -> Result<Args, String> {
     if o.image.as_os_str().is_empty() || o.gen_dir.as_os_str().is_empty() {
         return Err("--work, or --image and --gen, are needed".into());
     }
+    let on = hot_split.map(str::to_string).or_else(|| build_driver::env("LONGSHOT_HOT_SPLIT"));
+    let skip = hot_split_skip.or_else(|| build_driver::env("LONGSHOT_HOT_SPLIT_SKIP"));
+    o.hot_split = build_driver::stages::hot_split(on.as_deref(), skip.as_deref())
+        .map_err(|w| format!("--hot-split-skip (or LONGSHOT_HOT_SPLIT_SKIP): {w:?} is not a function's entry (hex)"))?;
     o.profiling = match (generate, profile) {
         (true, Some(_)) => return Err("--profile-generate and --profile: one or the other".into()),
         (true, None) => Profiling::Generate,

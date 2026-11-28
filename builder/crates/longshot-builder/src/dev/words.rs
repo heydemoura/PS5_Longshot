@@ -1,10 +1,13 @@
-//! `longshot-builder dev words --in <file> --pc <hex> --out <file.ll> --list <file> [--seq <file>] [--count-checks]`: each
-//! instruction word
-//! of `--in` (hex, one a line) that falls through and has semantics, as a function of its own (`f_<pc + 4 i>` for the
-//! i-th word: the instruction at that address, then a return), for tests/test_lifter_semantics.py to run beside an
-//! emulator. `--seq`: a line per sequence, `<pc> <word> <word> ...` (hex), each as one function more (`f_<pc>`: the
-//! words at `pc`, `pc + 4`, ..., then a return), so that the check also runs them one after another, each the next
-//! one's input; every word of a sequence must lift (the check takes them from the listing). `--count-checks`: the fast paths count their runs and their slow ones ([`llvm::Options::count_checks`]).
+//! `longshot-builder dev words --in <file> --pc <hex> --out <file.ll> --list <file> [--seq <file>] [--count-checks]`:
+//! each instruction word of `--in` (hex, one a line) that falls through and has semantics, as a function of its own
+//! (`f_<pc + 4 i>` for the i-th word: the instruction at that address, then a return), for
+//! tests/test_lifter_semantics.py to run beside an emulator. `--seq`: a line per sequence, `<pc> <word> <word> ...`
+//! (hex), each as one function more (`f_<pc>`: the words at `pc`, `pc + 4`, ..., then a return), so that the check also
+//! runs them one after another, each the next one's input; every word of a sequence must lift (the check takes them
+//! from the listing). `--count-checks`: the fast paths count their runs and their slow ones
+//! ([`llvm::Options::count_checks`]). `--hot-split`: the module made as the build makes a hot unit
+//! (`LONGSHOT_HOT_SPLIT` on, the default; [`llvm::Module::split_cold`]), for a compile with LLVM's hot-cold splitting
+//! (tests/test_lifter_semantics.py `--hot-split`).
 //!
 //! `--list` gets a line per word written: `<index> <word> <kind> <base> <index register> <bytes> <text>`, where kind is
 //! `alu`, `mem` (it reads or writes memory: the check points its base register at a page of its own, and its index
@@ -83,7 +86,7 @@ pub fn run(args: &[String]) -> ExitCode {
 
 fn words(args: &[String]) -> Result<usize, String> {
     let (mut input, mut out, mut list, mut pc, mut seq) = (None, None, None, None, None);
-    let mut count_checks = false;
+    let (mut count_checks, mut hot_split) = (false, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut value = || it.next().cloned().ok_or(format!("{a} needs a value"));
@@ -93,6 +96,7 @@ fn words(args: &[String]) -> Result<usize, String> {
             "--list" => list = Some(PathBuf::from(value()?)),
             "--seq" => seq = Some(PathBuf::from(value()?)),
             "--count-checks" => count_checks = true,
+            "--hot-split" => hot_split = true,
             "--pc" => pc = Some(u64::from_str_radix(value()?.trim_start_matches("0x"), 16).map_err(|e| e.to_string())?),
             other => return Err(format!("unknown argument {other:?}")),
         }
@@ -103,6 +107,10 @@ fn words(args: &[String]) -> Result<usize, String> {
     let text = std::fs::read_to_string(&input).map_err(|e| format!("{}: {e}", input.display()))?;
     let mut module =
         llvm::Module::new(llvm::Options { polls: false, mark_bitmap: false, count_checks, ..llvm::Options::default() });
+    // (before the functions are added: the writer reads it as it writes each one)
+    if hot_split {
+        module.split_cold(std::collections::BTreeSet::new());
+    }
     let mut listing = String::new();
     for (i, line) in text.lines().enumerate() {
         let word = u32::from_str_radix(line.trim(), 16)

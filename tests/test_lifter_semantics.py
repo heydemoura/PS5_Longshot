@@ -21,8 +21,20 @@ The float operations have a fast path (the host's IEEE operation) and a slow one
 builder/crates/sem/src/fpfast.rs). The functions count how often each ran (`words --count-checks`), and the check fails
 unless both did: the NaN-rich and subnormal-rich lanes, with FZ at random, send many runs down the slow path.
 
+`--hot-flags` compiles the words as a hot unit is compiled with the hot split on (the default; LONGSHOT_HOT_SPLIT=0
+turns it off): at the hot units' -O2 with the build's -ffp-contract=off and the hot units' flags
+(builder/crates/build-compile/src/hotsplit.rs), plus a splitting threshold of HOT_SPLIT_THRESHOLD so that every region
+LLVM takes for cold moves out, however small: a float's slow path
+(its helper is `cold`) is then a call of an outlined cold function and back. The check fails unless the module has
+outlined functions. `--hot-split` (with `--hot-flags`) also lifts them as the switch makes a hot unit (`words
+--hot-split`), so that `--hot-flags` alone and `--hot-split` compare the writer's two modes at the same compile. (A
+word's function has no branch with profile counts, so the writer's weights are not reached here: the lifted code with
+them is run in builder/crates/longshot-builder/tests/hot_split.rs.) `--march` compiles for that CPU level (x86-64-v2,
+x86-64-v3), as a player's build is.
+
     python -I tests/test_lifter_semantics.py --cargo <cargo> --cxx <clang++> [--words N] [--trials N]
-                                             [--sequences N] [--seed N]
+                                             [--sequences N] [--seed N] [--hot-flags [--hot-split]]
+                                             [--march LEVEL]
 
 Not compared, because there the lifter follows the host model rather than the architecture (or Unicorn models what the
 Switch does not): pointer authentication and its hints (the identity here: PAC*, AUT*, XPAC*, LDRAA, LDRAB, HINT), the
@@ -50,6 +62,7 @@ import collections
 import ctypes
 import os
 import random
+import re
 import struct
 import subprocess
 import sys
@@ -68,6 +81,7 @@ PAGE = 0x20000000          # (the memory the accesses use, mapped in both)
 PAGE_SIZE = 0x40000
 BASE_AT = PAGE + 0x10000   # (where a base register points: offsets reach -0x1000 .. +0x10000 from it)
 CTX_SIZE = 864
+HOT_SPLIT_THRESHOLD = -100   # (--hot-flags: LLVM's -hotcoldsplit-threshold, its default 2: here every cold region moves)
 NZCV_AT = 264
 VREG_AT = 272
 TPIDR_AT = 784
@@ -326,6 +340,26 @@ def sequences(rng, rows, count):
     return [[rng.choice(pool) for _ in range(rng.randint(2, SEQ_MAX))] for _ in range(count)]
 
 
+def hot_split_flags():
+    """The hot units' flags with the hot split on, the default (build_compile::hotsplit::flags)"""
+    path = os.path.join(ROOT, "builder", "crates", "build-compile", "src", "hotsplit.rs")
+    with open(path, encoding="utf-8") as f:
+        m = re.search(r"^    \[(\"-mllvm\"[^\]]*)\]\s*\.map\(String::from\)", f.read(), re.M)
+    if not m:
+        raise SystemExit("test_lifter_semantics: %s has no flags' array before .map(String::from)" % path)
+    return re.findall(r'"([^"]+)"', m.group(1))
+
+
+def compile_flags(a):
+    """How the module is compiled: -O1 (the lifted units' level), or as a hot unit with --hot-flags (its level, the
+    build's -ffp-contract=off, the hot split's flags)"""
+    flags = ["-O1"]
+    if a.hot_flags:
+        flags = ["-O2", "-ffp-contract=off"] + hot_split_flags()
+        flags += ["-mllvm", "-hotcoldsplit-threshold=%d" % HOT_SPLIT_THRESHOLD]
+    return flags + (["-march=" + a.march] if a.march else [])
+
+
 def build(a, tmp, word_list, seq_words):
     lifter = os.path.join(ROOT, "builder")
     subprocess.run([a.cargo, "build", "--locked", "--release", "-q", "-p", "longshot-builder"], cwd=lifter, check=True)
@@ -337,11 +371,19 @@ def build(a, tmp, word_list, seq_words):
         f.write("".join("%x %s\n" % (SEQ_CODE + SEQ_STRIDE * k, " ".join("%08x" % w for w in ws))
                         for k, ws in enumerate(seq_words)))
     subprocess.run([exe, "dev", "words", "--in", words_in, "--pc", "%x" % CODE, "--out", ll, "--list", listing,
-                    "--seq", seq_in, "--count-checks"], check=True)
-    so = os.path.join(tmp, "words.so")
+                    "--seq", seq_in, "--count-checks"] + (["--hot-split"] if a.hot_split else []), check=True)
+    so, obj = os.path.join(tmp, "words.so"), os.path.join(tmp, "words.o")
     rt = os.path.join(ROOT, "tests", "lifter_semantics_rt.c")
-    subprocess.run([a.cxx, "-shared", "-fPIC", "-O1", "-mcx16", "-Wno-override-module", "-x", "ir", ll, "-x", "c", rt,
-                    "-o", so], check=True)
+    subprocess.run([a.cxx, "-c", "-fPIC", "-mcx16", "-Wno-override-module"] + compile_flags(a) + ["-x", "ir", ll,
+                    "-o", obj], check=True)
+    with open(obj, "rb") as f:
+        outlined = len(set(re.findall(rb"f_[0-9a-f]+\.cold\.[0-9]+", f.read())))
+    print("test_lifter_semantics: compiled %s: %d outlined cold functions" % (" ".join(compile_flags(a)), outlined))
+    if a.hot_flags and outlined == 0:
+        raise SystemExit("test_lifter_semantics: --hot-flags, but no region moved out: the check would prove nothing")
+    if not a.hot_flags and outlined:
+        raise SystemExit("test_lifter_semantics: cold functions outlined without --hot-flags")
+    subprocess.run([a.cxx, "-shared", "-fPIC", "-O1", "-mcx16", obj, "-x", "c", rt, "-o", so], check=True)
     return ctypes.CDLL(so)
 
 
@@ -501,7 +543,14 @@ def main():
     ap.add_argument("--trials", type=int, default=3, help="random states per word (3)")
     ap.add_argument("--sequences", type=int, default=4000, help="random sequences of words (4000)")
     ap.add_argument("--seed", type=int, default=20261122)
+    ap.add_argument("--hot-flags", action="store_true",
+                    help="compile as the build compiles a hot unit (the hot split on), every cold region outlined")
+    ap.add_argument("--hot-split", action="store_true",
+                    help="with --hot-flags: lift as the build makes a hot unit (the hot split on) too")
+    ap.add_argument("--march", help="compile for this CPU level (x86-64-v2, x86-64-v3)")
     a = ap.parse_args()
+    if a.hot_split and not a.hot_flags:
+        ap.error("--hot-split compares with --hot-flags at the same compile: give both")
     if "clang" not in os.path.basename(a.cxx):
         print("test_lifter_semantics: skipped, %s is no clang (the lifted code is LLVM IR)" % a.cxx)
         return 0

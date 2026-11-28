@@ -96,6 +96,10 @@ pub struct LiftOptions {
     /// developer reading or diffing them, an instrumented lift (its profile map is made as they are written). Off, the
     /// lift lists each unit with its key and the compile has its text made as it needs it ([`Texts`]).
     pub keep_text: bool,
+    /// The hot units made for LLVM's hot-cold splitting ([`llvm::Module::split_cold`]): None, off; Some(skip), on,
+    /// except for the functions at these entries (and the edited ones), which get no new zero weights. None here; the
+    /// build sets it from `LONGSHOT_HOT_SPLIT`, on unless `0` (build_driver::stages::lift_options), as `dev lift` does.
+    pub hot_split: Option<BTreeSet<u64>>,
 }
 
 impl LiftOptions {
@@ -119,6 +123,7 @@ impl LiftOptions {
             store: None,
             force: false,
             keep_text: true,
+            hot_split: None,
         }
     }
 
@@ -205,6 +210,11 @@ fn whole_key(o: &LiftOptions, image: &image::Image, host: &Host, base: &str) -> 
         None => k.text("npdm", "none"),
     };
     k.text("edits", EDITS);
+    // (the hot units made for hot-cold splitting: only when on, so that off the key is what it was. Each hot function's
+    // own key holds it too, so that a change of it lifts the hot units alone: Session::new)
+    if let Some(skip) = &o.hot_split {
+        k.text("hot_split", &format!("{skip:x?}"));
+    }
     match &o.profiling {
         Profiling::Off => k.text("profile", "off"),
         Profiling::Generate => k.text("profile", "generate"),
@@ -224,6 +234,24 @@ fn base_key(o: &LiftOptions) -> String {
     // (an instrumented unit counts into `@lsp.counts`: a plain lift into this gen/ keeps neither it nor its object)
     k.text("instrumented", if matches!(o.profiling, Profiling::Generate) { "yes" } else { "no" });
     k.hex()
+}
+
+/// The line of the key file a lift with [`LiftOptions::hot_split`] on writes, its skip list after it.
+const HOT_SPLIT_LINE: &str = "hot_split skip";
+
+fn hot_split_words(skip: &BTreeSet<u64>) -> String {
+    skip.iter().map(|e| format!(" {e:x}")).collect()
+}
+
+/// What the lift in `gen_dir` was made with of [`LiftOptions::hot_split`], by its key file: None, no lift there;
+/// Some(None), off; Some(Some(skip)), on, these functions left out.
+pub fn hot_split_of(gen_dir: &Path) -> Option<Option<BTreeSet<u64>>> {
+    let text = std::fs::read_to_string(gen_dir.join(KEY_FILE)).ok()?;
+    Some(
+        text.lines()
+            .find_map(|l| l.strip_prefix(HOT_SPLIT_LINE))
+            .map(|rest| rest.split_whitespace().filter_map(|w| u64::from_str_radix(w, 16).ok()).collect()),
+    )
 }
 
 /// The gen/ files a lift writes besides the units.
@@ -427,7 +455,12 @@ impl Session {
         let program = s.program();
         let key_of = |entry: u64| -> String {
             let r = s.runs(entry);
-            let text = format!("{}\n{}\n{} {:?}", program.inputs(entry), s.edits.key(entry), r.cold, r.counts);
+            let mut text = format!("{}\n{}\n{} {:?}", program.inputs(entry), s.edits.key(entry), r.cold, r.counts);
+            // (a hot function's unit is made for hot-cold splitting with the switch: its key says so, and whether the
+            // skip list names it; the other units' texts, and so their keys, are the same either way)
+            if let Some(skip) = s.o.hot_split.as_ref().filter(|_| hot.contains(&entry)) {
+                text.push_str(if skip.contains(&entry) { "\nhot_split left out" } else { "\nhot_split" });
+            }
             build_core::key::sha1_hex(text.as_bytes())
         };
         let list: Vec<(u64, u64)> = s.plan.functions.iter().map(|(&e, f)| (e, f.len() as u64)).collect();
@@ -482,6 +515,12 @@ impl Session {
         };
         // (its file's name inside: an object's file symbol is the same whether clang read the file or the text)
         m.set_source_filename(&format!("{}.ll", unit.name));
+        if let Some(skip) = self.o.hot_split.as_ref().filter(|_| unit.name.starts_with("lifted_hot_")) {
+            // (left out: the skip list's functions and those the edits change: hook sites, patches, entry hooks)
+            let left =
+                unit.functions.iter().copied().filter(|e| skip.contains(e) || self.edits.functions.contains_key(e));
+            m.split_cold(left.collect());
+        }
         let mut sizes = Vec::new();
         let (mut marks, mut simplified) = (passes::MarkStats::default(), passes::SimplifyStats::default());
         let (mut split, mut pieces) = (0usize, 0usize);
@@ -878,7 +917,11 @@ pub fn run_with(o: &LiftOptions, r: &Reporter) -> Result<(LiftOutcome, Option<Ar
     }
     let edited = s.edits.functions.len();
     let functions = s.plan.functions.len();
-    let key_text = format!("{key}\nfunctions {functions}\nedited {edited}\nunits {}\n", all.len());
+    let mut key_text = format!("{key}\nfunctions {functions}\nedited {edited}\nunits {}\n", all.len());
+    // (with the hot units made for hot-cold splitting: a compile on its own checks its switch against it, hot_split_of)
+    if let Some(skip) = &o.hot_split {
+        key_text.push_str(&format!("{HOT_SPLIT_LINE}{}\n", hot_split_words(skip)));
+    }
     fsx::write_atomic(&o.gen_dir.join(KEY_FILE), key_text.as_bytes())?;
     if let Some(store) = &o.store {
         store::save(store, &key, &o.gen_dir)?;

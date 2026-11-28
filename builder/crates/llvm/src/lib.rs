@@ -20,6 +20,8 @@ use mir::{
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
+#[cfg(test)]
+mod hotsplit_tests;
 mod sync;
 
 /// The context's layout (builder/rt/a64.h's `GuestContext`, which asserts it): byte offsets of its fields.
@@ -110,6 +112,8 @@ pub struct Module {
     host_globals: BTreeMap<String, String>,
     /// The module's `source_filename`, when given.
     source_filename: Option<String>,
+    /// A hot unit made for hot-cold splitting, and the functions it leaves out ([`Module::split_cold`]).
+    split: Option<BTreeSet<u64>>,
 }
 
 /// What the writer knows of a function's runs: its code's hash (the profile's key), its counts from a profile, and
@@ -170,7 +174,23 @@ impl Module {
             host_functions: BTreeMap::new(),
             host_globals: BTreeMap::new(),
             source_filename: None,
+            split: None,
         }
+    }
+
+    /// The module made for LLVM's hot-cold splitting (a hot unit's, unless `LONGSHOT_HOT_SPLIT=0`; the compile's
+    /// `-hot-cold-split`): a
+    /// branch whose block ran but that the profile never saw taken is weighted 0 to its block's count (else it has no
+    /// weights), so that LLVM moves the region behind it, which never ran, out of the hot code; one into a block that ran
+    /// through another edge (a join) is weighted 1, so that the join is not taken for cold. The functions at the entries
+    /// of `skip` get no new zero weights; in every function a side that ran is kept from a probability LLVM takes for
+    /// cold, and the first branch of a split function's later piece (that block is made at the function's entry address,
+    /// so the counts there are not its own) has no weights. A function that calls the host's setjmp
+    /// (`Op::SetjmpCall`) is written noinline, which hot-cold splitting leaves whole: an outlined region must never
+    /// hold the setjmp, whose frame would be gone when a longjmp comes back to it (LLVM never inlines such a function
+    /// anyway: it calls a returns_twice function).
+    pub fn split_cold(&mut self, skip: BTreeSet<u64>) {
+        self.split = Some(skip);
     }
 
     /// The module's `source_filename` (the object's file symbol): its file's name, so the object is the same whether
@@ -572,7 +592,18 @@ impl<'m, 'f> FnWriter<'m, 'f> {
 
     fn write(mut self) -> String {
         let name = self.f.name();
-        let attrs = if self.runs.cold { "#1" } else { "#0" };
+        // (made for hot-cold splitting, a setjmp owner noinline: split_cold)
+        let setjmp = self.m.split.is_some()
+            && self
+                .f
+                .blocks()
+                .any(|(_, b)| b.insts.iter().any(|&v| matches!(self.f.inst(v).op, Op::SetjmpCall { .. })));
+        let attrs = match (self.runs.cold, setjmp) {
+            (true, false) => "#1",
+            (true, true) => "#1 #4",
+            (false, false) => "#0",
+            (false, true) => "#0 #4",
+        };
         let prof = match self.runs.counts {
             Some(c) => format!(" !prof {}", self.m.node(format!("!{{!\"function_entry_count\", i64 {}}}", c.entries))),
             None => String::new(),
@@ -718,18 +749,62 @@ impl<'m, 'f> FnWriter<'m, 'f> {
         self.line(format!("store i64 {new}, ptr {p}, align 8"));
     }
 
-    /// A conditional branch's weights from the profile (its block's entries, its taken count), as `, !prof !N`.
-    fn weights(&mut self, pc: u64) -> String {
+    /// A conditional branch's weights from the profile (its block's entries, its taken count), as `, !prof !N`; `then`
+    /// is the taken edge.
+    fn weights(&mut self, pc: u64, then: Edge, otherwise: Edge) -> String {
         let Some(c) = self.runs.counts else { return String::new() };
-        let (Some(&n), Some(&t)) = (c.blocks.get(&pc), c.taken.get(&pc)) else { return String::new() };
+        let Some(&n) = c.blocks.get(&pc) else { return String::new() };
+        // (made for hot-cold splitting ([`Module::split_cold`]): `guard`, the weights kept from marking a block that ran
+        // cold, in every function of the module; `split`, the new zero weights too, unless the function is left out)
+        let guard = self.m.split.is_some();
+        let split = self.m.split.as_ref().is_some_and(|skip| !skip.contains(&self.f.entry));
+        // (the first block of a split function's piece: passes::split makes it at the function's entry address, so the
+        // profile's counts there are the entry block's, not its own. Made for hot-cold splitting, its branch has no
+        // weights at all: any of them could be 0 for a side that ran)
+        if guard && self.piece_start(BlockId(self.cur as u32)) {
+            return String::new();
+        }
+        // (a branch never taken has no taken count in a profile; made for hot-cold splitting it is weighted 0 to n)
+        let t = match c.taken.get(&pc) {
+            Some(&t) => t,
+            None if split && n > 0 => 0,
+            None => return String::new(),
+        };
         // (taken at most the block's entries, as a profile read says, profile::Function::clamp_taken: a profile made in
         // code may not be)
         let t = t.min(n);
         let not = n - t;
         // (LLVM's weights are 32 bits: both scaled alike to fit, their sum, n, too)
         let scale = (n.max(1) >> 31) + 1;
-        let node = self.m.node(format!("!{{!\"branch_weights\", i32 {}, i32 {}}}", t / scale, not / scale));
+        let (mut tw, mut nw) = (t / scale, not / scale);
+        if guard {
+            // (hot-cold splitting takes the block behind an edge of probability 2^-31 or less for cold
+            // (build_compile::hotsplit). That is only right where the block never ran: a side that was taken, or that
+            // goes to a block that ran through another edge (a join), is weighted at least 1, and the other side kept to
+            // 2^30 times it, so that its probability stays above the cutoff after LLVM's rounding. In a function left
+            // out too: its weights without the switch can be (n, 0) into a join)
+            // (a piece's first block: its counts are not its own, so it is taken to have run)
+            let ran = |e: Edge| match e.to {
+                Dest::Block(b) => self.piece_start(b) || c.blocks.get(&self.f.block(b).pc).is_some_and(|&k| k > 0),
+                _ => false,
+            };
+            if t > 0 || ran(then) {
+                tw = tw.max(1);
+                nw = nw.min(tw << 30);
+            }
+            if not > 0 || ran(otherwise) {
+                nw = nw.max(1);
+                tw = tw.min(nw << 30);
+            }
+        }
+        let node = self.m.node(format!("!{{!\"branch_weights\", i32 {tw}, i32 {nw}}}"));
         format!(", !prof {node}")
+    }
+
+    /// Whether `b` is the first block of a split function's piece, which passes::split makes at the function's entry
+    /// address whatever block it holds (a piece's first block is the entry's only in the piece that holds the entry).
+    fn piece_start(&self, b: BlockId) -> bool {
+        self.f.pieces.as_ref().is_some_and(|p| p.index > 0) && b == self.f.start
     }
 
     fn call_guest(&mut self, target: u64) {
@@ -1424,7 +1499,7 @@ impl<'m, 'f> FnWriter<'m, 'f> {
                     self.count(profile::Counter::Taken(pc), Some(&c));
                 }
                 let (t, f) = (self.edge_label(*then), self.edge_label(*otherwise));
-                let weights = if guest { self.weights(pc) } else { String::new() };
+                let weights = if guest { self.weights(pc, *then, *otherwise) } else { String::new() };
                 self.line(format!("br i1 {c}, label {t}, label {f}{weights}"));
             }
             Term::Switch { value, cases } => {

@@ -262,6 +262,10 @@ pub fn plan(i: &Inputs) -> Result<Plan> {
             p.units.push(u);
         }
     }
+    // (the hot units with hot-cold splitting, the default; LONGSHOT_HOT_SPLIT=0, no flag)
+    for u in p.units.iter_mut().filter(|u| u.kind == Kind::LiftedHotIr) {
+        u.flags.extend(crate::hotsplit::flags(st.hot_split));
+    }
     if with_lift {
         for rel in LIFT_C {
             let src = gen_dir.join(rel);

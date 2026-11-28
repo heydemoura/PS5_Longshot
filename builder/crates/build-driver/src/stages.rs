@@ -273,7 +273,65 @@ pub fn lift_options(ask: &LiftAsk) -> lift::whole::LiftOptions {
     // (the units' texts, 5.7 GB on the game, are made as the compile needs them and not kept; LONGSHOT_KEEP_IR=1 keeps
     // them in gen/ to read or compare)
     o.keep_text = crate::env("LONGSHOT_KEEP_IR").is_some_and(|v| v == "1");
+    // (a bad skip list stops the lift first: lift())
+    o.hot_split =
+        hot_split(crate::env("LONGSHOT_HOT_SPLIT").as_deref(), crate::env("LONGSHOT_HOT_SPLIT_SKIP").as_deref())
+            .ok()
+            .flatten();
     o
+}
+
+/// The hot units made for LLVM's hot-cold splitting (lift::whole::LiftOptions::hot_split) as `LONGSHOT_HOT_SPLIT` (`on`)
+/// and `LONGSHOT_HOT_SPLIT_SKIP` (`skip`) say: on by default, off when the switch is `0` (or another off word:
+/// build_compile::hotsplit::on, which the compile's half, `-hot-cold-split` for the hot units, reads it with too); the
+/// skip list, the entries of functions left out (hex, `f_` or `0x` allowed, separated by commas or spaces). Err: the
+/// word of the list that is no entry.
+pub fn hot_split(on: Option<&str>, skip: Option<&str>) -> std::result::Result<Option<BTreeSet<u64>>, String> {
+    if !build_compile::hotsplit::on(on) {
+        return Ok(None);
+    }
+    let mut out = BTreeSet::new();
+    for word in skip.unwrap_or("").split([',', ' ']).map(str::trim).filter(|w| !w.is_empty()) {
+        let hex = word.strip_prefix("f_").or_else(|| word.strip_prefix("0x")).unwrap_or(word);
+        out.insert(u64::from_str_radix(hex, 16).map_err(|_| word.to_string())?);
+    }
+    Ok(Some(out))
+}
+
+/// A compile on its own (`longshot-builder compile`) of the lift in `gen_dir`: refused when `LONGSHOT_HOT_SPLIT` and
+/// `LONGSHOT_HOT_SPLIT_SKIP` are not what that lift was made with, or the list is bad. Its units' texts on disk
+/// (`LONGSHOT_KEEP_IR=1`) are not made again, so without this an off lift would compile with the hot flags (or the
+/// other way round), and a setjmp owner the lift did not write noinline could have a region outlined.
+pub fn check_hot_split(gen_dir: &Path) -> Result<()> {
+    check_hot_split_as(
+        gen_dir,
+        crate::env("LONGSHOT_HOT_SPLIT").as_deref(),
+        crate::env("LONGSHOT_HOT_SPLIT_SKIP").as_deref(),
+    )
+}
+
+/// [`check_hot_split`] with the switch `on` and the list `skip` as given (unset: None).
+pub fn check_hot_split_as(gen_dir: &Path, on: Option<&str>, skip: Option<&str>) -> Result<()> {
+    let now = hot_split(on, skip)
+        .map_err(|w| Error::format("LONGSHOT_HOT_SPLIT_SKIP", format!("{w:?} is not a function's entry (hex)")))?;
+    match lift::whole::hot_split_of(gen_dir) {
+        // (no complete lift: a lift that stopped, or failed at the link, deletes its key file and can leave its texts)
+        None if now.is_some() => Err(Error::format(
+            "LONGSHOT_HOT_SPLIT",
+            "gen/ holds no complete lift (no lift.key) to compile with the switch on: lift again",
+        )),
+        Some(made) if made != now => {
+            let say = |s: &Option<BTreeSet<u64>>| match s {
+                None => "off".to_string(),
+                Some(k) => format!("on, {} functions left out", k.len()),
+            };
+            Err(Error::format(
+                "LONGSHOT_HOT_SPLIT",
+                format!("the lift in gen/ was made with it {}, the compile asks {}: lift again", say(&made), say(&now)),
+            ))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// The texts of the lift `ask` asks for, made when the compile needs one (`session`: the lift's, when it ran now).
@@ -284,6 +342,17 @@ pub fn lift_texts(ask: &LiftAsk, session: Option<Arc<lift::whole::Session>>) -> 
 
 /// The lift (`lift::whole::run`): the one place the driver calls it.
 pub fn lift(ask: &LiftAsk, r: &Reporter) -> Result<Lifted> {
+    match hot_split(crate::env("LONGSHOT_HOT_SPLIT").as_deref(), crate::env("LONGSHOT_HOT_SPLIT_SKIP").as_deref()) {
+        Err(word) => {
+            return Err(Error::format("LONGSHOT_HOT_SPLIT_SKIP", format!("{word:?} is not a function's entry (hex)")));
+        }
+        Ok(Some(skip)) => r.log(format!(
+            "LONGSHOT_HOT_SPLIT: the hot units are made for LLVM's hot-cold splitting ({} functions left out by \
+             LONGSHOT_HOT_SPLIT_SKIP, and those the edits change)",
+            skip.len()
+        )),
+        Ok(None) => {}
+    }
     let (out, session) = lift::whole::run_with(&lift_options(ask), r)?;
     let reused = !matches!(out.how, lift::whole::How::Lifted);
     Ok(Lifted {

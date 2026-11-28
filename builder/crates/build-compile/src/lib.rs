@@ -19,6 +19,7 @@
 
 pub mod compile;
 pub mod generated;
+pub mod hotsplit;
 pub mod key;
 pub mod link;
 pub mod options;

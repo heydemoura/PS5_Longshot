@@ -426,3 +426,76 @@ fn a_host_store_on_the_gpu_bitmap_marks_when_its_last_page_is_the_gpu_s() {
     assert!(Command::new(&exe).status().unwrap().success(), "both pages marked, and only those");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn the_hot_split_is_in_the_key_only_when_on() {
+    let dir = scratch("hot-split");
+    let mut o = options(&dir);
+    // (the options' own value: off. The build's switch is on by default and sets it,
+    // build_driver::stages::lift_options; longshot-builder's tests/hot_split.rs checks that default)
+    assert_eq!(o.hot_split, None, "LiftOptions::new: off until the build sets it");
+    // (off, the options' text is a lift's without the option, so no unit's key moves)
+    assert_eq!(
+        codegen_text(&o),
+        format!("{:?} mark_each={} no_simplify={} split={:?}", o.codegen, o.mark_each, o.no_simplify, o.split)
+    );
+    // (a profile of the made-up build: f0 ran most and is hot, f1 ran once; their words as image_dir has them)
+    let hash = profile::code_hash([0x9400_0004, 0x9100_0400, 0xd65f_03c0]);
+    let f1_hash = profile::code_hash([0x9100_0400, 0x9400_0003, 0xd65f_03c0]);
+    let profile = dir.join("guest.profile");
+    let text = format!(
+        "{} 1 build {BUILD}\nf {F0:x} {hash:016x} 1000\nb {F0:x} 1000\nf {F1:x} {f1_hash:016x} 1\nb {F1:x} 1\n",
+        profile::MAGIC
+    );
+    std::fs::write(&profile, text).unwrap();
+    o.profiling = Profiling::Use { path: profile, share: 0.5, max: 4000 };
+    let text = |o: &LiftOptions, name: &str| std::fs::read_to_string(o.gen_dir.join(format!("{name}.ll"))).unwrap();
+    let by_name =
+        |units: &[Listed]| -> BTreeMap<String, Listed> { units.iter().map(|u| (u.name.clone(), u.clone())).collect() };
+    let hot = format!("lifted_hot_{F0:08x}");
+    let off = run(&o, &quiet()).unwrap();
+    let off_units = by_name(&off.units);
+    assert!(off_units.contains_key(&hot), "f0 in a hot unit: {:?}", off_units.keys());
+    let off_texts: BTreeMap<String, String> = off_units.keys().map(|n| (n.clone(), text(&o, n))).collect();
+    let key_file = std::fs::read_to_string(o.gen_dir.join(KEY_FILE)).unwrap();
+    assert_eq!(hot_split_of(&o.gen_dir), Some(None), "off: no line in the key file: {key_file}");
+    assert_eq!(hot_split_of(&dir.join("nowhere")), None);
+    // (on: the lift's key moves, and among the units' keys the hot unit's alone: the others' texts are the same either
+    // way. These functions have no branch, so the hot unit's text is the same too: the switch adds weights to branches
+    // never taken alone, llvm's hotsplit_tests)
+    o.hot_split = Some(BTreeSet::new());
+    let on = run(&o, &quiet()).unwrap();
+    assert_ne!(on.key, off.key);
+    assert_eq!(on.units_lifted, 1, "the hot unit alone lifted again");
+    for u in &on.units {
+        if u.name == hot {
+            assert_ne!(u.key, off_units[&u.name].key, "{}", u.name);
+        } else {
+            assert_eq!(u.key, off_units[&u.name].key, "{}: not a hot unit, its key as off", u.name);
+        }
+        assert_eq!(text(&o, &u.name), off_texts[&u.name], "{}", u.name);
+    }
+    assert_eq!(hot_split_of(&o.gen_dir), Some(Some(BTreeSet::new())));
+    // (f0 left out: another key for the lift and for f0's hot unit; f1, no hot function, left out: the units' keys as
+    // on, the lift's not: it holds the whole list)
+    let on_units = by_name(&on.units);
+    o.hot_split = Some(BTreeSet::from([F1]));
+    let f1_left = run(&o, &quiet()).unwrap();
+    assert_ne!(f1_left.key, on.key);
+    for u in &f1_left.units {
+        assert_eq!(u.key, on_units[&u.name].key, "{}", u.name);
+    }
+    o.hot_split = Some(BTreeSet::from([F0]));
+    let left = run(&o, &quiet()).unwrap();
+    assert_ne!(left.key, on.key);
+    assert_ne!(by_name(&left.units)[&hot].key, on_units[&hot].key);
+    // (and not the off key either: a left-out unit's text is not off's, the guard's weights are in it)
+    assert_ne!(by_name(&left.units)[&hot].key, off_units[&hot].key);
+    assert_eq!(hot_split_of(&o.gen_dir), Some(Some(BTreeSet::from([F0]))));
+    // (and off again: the first lift's key and units)
+    o.hot_split = None;
+    let back = run(&o, &quiet()).unwrap();
+    assert_eq!(back.key, off.key);
+    assert_eq!(by_name(&back.units), off_units);
+    let _ = std::fs::remove_dir_all(&dir);
+}
