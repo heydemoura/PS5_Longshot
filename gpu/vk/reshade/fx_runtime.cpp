@@ -741,7 +741,8 @@ void render(VkCommandBuffer cmd, Program& p, VkImage image, VkImageView depth) {
         for (size_t i = 0; i < pass->bindings.size(); ++i) {
             const auto& b = pass->bindings[i];
             const auto& texture = b.image ? *b.image : input;
-            images[i] = {b.sampler, b.depth ? depth : b.srgb ? texture.srgb : texture.code, VK_IMAGE_LAYOUT_GENERAL};
+            images[i] = {b.sampler, b.depth ? depth : b.srgb ? texture.srgb : texture.code,
+                         b.depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL};
             auto& w = writes[i];
             w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
             w.dstBinding = b.binding;
@@ -888,7 +889,7 @@ bool record(VkCommandBuffer cmd, Texture* picture, uint32_t level, bool native_h
     }
     if (!s.active || s.active->scene != scene || preview_bypassed.load(std::memory_order_relaxed) ||
         (s.show_requested_only && s.active_revision != s.request.revision)) return false;
-    const auto depth = s.active->depth ? temporal_reshade_depth(scene.width, scene.height) : VK_NULL_HANDLE;
+    const auto depth = s.active->depth ? temporal_reshade_depth(cmd, scene.width, scene.height) : VK_NULL_HANDLE;
     if (s.active->depth && !depth) return false;
     render(cmd, *s.active, picture->image, depth);
     return true;

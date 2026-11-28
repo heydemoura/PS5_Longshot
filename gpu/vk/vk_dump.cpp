@@ -349,10 +349,13 @@ void dump_image(VkCommandBuffer cmd, Texture* tex, uint32_t level, uint32_t laye
                            it.buffer_alloc, &it.map))
             return;
         full_barrier(cmd);
+        const VkImageLayout src_layout =
+            !raw_9e5 && is_depth_texture(tex) ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+        if (!raw_9e5) texture_transition_layout(cmd, tex, src_layout);
         const VkBufferImageCopy c{0, 0, 0, {(VkImageAspectFlags)(raw_9e5 ? VK_IMAGE_ASPECT_COLOR_BIT : VK_IMAGE_ASPECT_DEPTH_BIT), level,
                                             std::min(layer, tex->layers - 1), 1}, {0, 0, 0},
                                   {it.w, it.h, 1}};
-        vkCmdCopyImageToBuffer(cmd, tex->image, VK_IMAGE_LAYOUT_GENERAL, it.buffer, 1, &c);
+        vkCmdCopyImageToBuffer(cmd, tex->image, src_layout, it.buffer, 1, &c);
         host_read_barrier(cmd);
         full_barrier(cmd);
         items.push_back(std::move(it));

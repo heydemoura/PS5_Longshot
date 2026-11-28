@@ -33,10 +33,17 @@ def main():
 struct Texture {
     VkImage image=(VkImage)1; VkImageType type=VK_IMAGE_TYPE_2D; VkFormat format=VK_FORMAT_R8G8B8A8_UNORM;
     VkImageAspectFlags aspect=VK_IMAGE_ASPECT_COLOR_BIT;
+    VkImageLayout layout=VK_IMAGE_LAYOUT_GENERAL;
     uint64_t gpu=0x1000;
     uint32_t width=64,height=32,depth=1,layers=4,levels=4,skip=0;
     int nvn_format=1; bool bc=false,astc=false,sparse=false,gpu_written=false,released=false,only_cleared=false;
 } tex;
+inline bool is_depth_texture(const Texture* t) {
+    return t && (t->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
+}
+void texture_transition_layout(VkCommandBuffer, Texture* t, VkImageLayout target, bool = false) {
+    if (is_depth_texture(t) && t->image) t->layout = target;
+}
 struct nvn_tex { uint64_t gpu=0x1000; };
 struct nvn_view { bool set_levels=false,set_layers=false; uint8_t base_level=0,nlevels=0; uint16_t min_layer=0,nlayers=0; };
 struct NVNcopyRegion { int32_t xoffset=0,yoffset=0,zoffset=0,width=0,height=0,depth=1; };

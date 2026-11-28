@@ -867,7 +867,7 @@ int actor_motion(VkCommandBuffer cmd, const Camera& cam, const float* before, ui
     vkCmdSetViewport(cmd, 0, 1, &viewport);
     vkCmdSetScissor(cmd, 0, 1, &scissor);
     const VkDescriptorBufferInfo bi{u.buffer, 0, dlss_actor::kHeadWords * 4};
-    const VkDescriptorImageInfo ii{s.point, dview, VK_IMAGE_LAYOUT_GENERAL};
+    const VkDescriptorImageInfo ii{s.point, dview, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
     VkWriteDescriptorSet w[2]{{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
     w[0].dstBinding = 0, w[0].descriptorCount = 1, w[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, w[0].pBufferInfo = &bi;
     w[1].dstBinding = 1, w[1].descriptorCount = 1, w[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -1241,7 +1241,7 @@ bool temporal_scene_depth_is(const Texture* depth) {
     return depth && s.cam.valid && s.cam.depth == depth && s.cam.frame == texture_frame_no();
 }
 
-VkImageView temporal_reshade_depth(uint32_t width, uint32_t height) {
+VkImageView temporal_reshade_depth(VkCommandBuffer cmd, uint32_t width, uint32_t height) {
     State& s = st();
     std::lock_guard lk(s.mu);
     const auto& scene = s.reshade_depth;
@@ -1265,6 +1265,7 @@ VkImageView temporal_reshade_depth(uint32_t width, uint32_t height) {
         return missing("depth does not cover the output");
     const auto view = depth_view(depth);
     if (!view) return missing("cannot make a depth-only view");
+    texture_transition_layout(cmd, depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
     depth->last_frame = texture_frame_no();
     depth->last_value = std::max(depth->last_value, vk_retirement_value());
     return view;
@@ -1472,9 +1473,10 @@ void fg_inputs(VkCommandBuffer cmd, bool known, Texture* in, VkImageView in_view
     // (without a frame before to move from the motion is zero and not handed over, FSR's own inputs this frame; the skinned
     // draws are drawn all the same, as their poses are the next frame's frame before)
     full_barrier(cmd);   // (the scene's colour and depth, written before)
+    texture_transition_layout(cmd, cam.depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
     {
         const VkDescriptorImageInfo info[5] = {{s.point, in_view, VK_IMAGE_LAYOUT_GENERAL},
-                                               {s.point, dview, VK_IMAGE_LAYOUT_GENERAL},
+                                               {s.point, dview, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL},
                                                {VK_NULL_HANDLE, s.color.view, VK_IMAGE_LAYOUT_GENERAL},
                                                {VK_NULL_HANDLE, s.depth.view, VK_IMAGE_LAYOUT_GENERAL},
                                                {VK_NULL_HANDLE, s.motion.view, VK_IMAGE_LAYOUT_GENERAL}};
@@ -1727,7 +1729,7 @@ bool draw_engine(VkCommandBuffer cmd, State& s, int mode, const Camera& cam, uin
 
     const auto prep = [&] {
         const VkDescriptorImageInfo info[5] = {{s.point, in_view, VK_IMAGE_LAYOUT_GENERAL},
-                                               {s.point, dview, VK_IMAGE_LAYOUT_GENERAL},
+                                               {s.point, dview, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL},
                                                {VK_NULL_HANDLE, s.color.view, VK_IMAGE_LAYOUT_GENERAL},
                                                {VK_NULL_HANDLE, s.depth.view, VK_IMAGE_LAYOUT_GENERAL},
                                                {VK_NULL_HANDLE, s.motion.view, VK_IMAGE_LAYOUT_GENERAL}};
@@ -1747,6 +1749,7 @@ bool draw_engine(VkCommandBuffer cmd, State& s, int mode, const Camera& cam, uin
                       VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                   VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT |
                       VK_ACCESS_2_TRANSFER_READ_BIT);   // (the scene's colour, depth, and actor buffers, written before)
+    texture_transition_layout(cmd, cam.depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
     prep();
     stage_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT,
                   VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |

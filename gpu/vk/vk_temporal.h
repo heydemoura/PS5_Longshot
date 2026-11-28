@@ -70,7 +70,7 @@ void temporal_note_skinned_draw(const SkinnedDraw& k);
 int temporal_hidden_mesh_mode();
 /// (longshot) Whether `depth` is the depth target of the scene the chain has taken in this frame (its camera's)
 bool temporal_scene_depth_is(const Texture* depth);
-VkImageView temporal_reshade_depth(uint32_t width, uint32_t height);
+VkImageView temporal_reshade_depth(VkCommandBuffer cmd, uint32_t width, uint32_t height);
 
 /// (longshot) NVIDIA DLAA before the game's bloom and tone map (pre_bloom.h has where and why): with DLAA and the
 /// Upscaler's DLAA before the bloom row on only (RX_VK_DLSS_PRE_BLOOM over it); off, DLAA stays at the gameplay upscale.

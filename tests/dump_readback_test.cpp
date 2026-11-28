@@ -24,11 +24,18 @@ using VmaAllocation=Allocation*;
 struct Texture {
     VkImage image{}; VkSampleCountFlagBits samples=VK_SAMPLE_COUNT_1_BIT;
     VkImageAspectFlags aspect=VK_IMAGE_ASPECT_COLOR_BIT;
+    VkImageLayout layout=VK_IMAGE_LAYOUT_GENERAL;
     VkFormat format=VK_FORMAT_R32G32B32A32_SFLOAT;
     uint64_t gpu=0; int id=1;
     uint32_t levels=1,width=2,height=1,layers=1,depth=1;
     VkImageType type=VK_IMAGE_TYPE_2D;
 };
+inline bool is_depth_texture(const Texture* t) {
+    return t && (t->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
+}
+void texture_transition_layout(VkCommandBuffer, Texture* tex, VkImageLayout target, bool = false) {
+    if (is_depth_texture(tex) && tex->image) tex->layout = target;
+}
 struct Device {VkPhysicalDevice physical{};} dev;
 std::vector<std::unique_ptr<Allocation>> allocations;
 std::vector<uint8_t> payload, png;

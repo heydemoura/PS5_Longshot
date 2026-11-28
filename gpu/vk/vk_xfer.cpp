@@ -268,10 +268,16 @@ void copy_b2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_bt& p, bool to
     gp.bytes = size;
     full_barrier(cmd);
     if (to_image) {
-        vkCmdCopyBufferToImage(cmd, span.buffer, s.tex->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+        const VkImageLayout layout =
+            is_depth_texture(s.tex) ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+        texture_transition_layout(cmd, s.tex, layout);
+        vkCmdCopyBufferToImage(cmd, span.buffer, s.tex->image, layout, 1, &c);
         texture_written(s.tex, "a buffer-to-texture copy");
     } else {
-        vkCmdCopyImageToBuffer(cmd, s.tex->image, VK_IMAGE_LAYOUT_GENERAL, span.buffer, 1, &c);
+        const VkImageLayout layout =
+            is_depth_texture(s.tex) ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+        texture_transition_layout(cmd, s.tex, layout);
+        vkCmdCopyImageToBuffer(cmd, s.tex->image, layout, span.buffer, 1, &c);
         const uint64_t guest = host->gpu_guest(p.buf);
         if (guest) memory_stamp_gpu(guest, size);   // (textures over that memory are uploaded again)
         texture_gpu_wrote(p.buf, size);           // (and once the copy is done: the stamp came before it ran)
@@ -338,12 +344,21 @@ void copy_t2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_tt& p) {
         if (done) texture_written(d.tex, "a copy into a BC texture");
         return;
     }
+    const bool same_depth = s.tex == d.tex && is_depth_texture(s.tex);
+    const VkImageLayout src_layout = same_depth ? VK_IMAGE_LAYOUT_GENERAL
+                                   : is_depth_texture(s.tex) ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                                                             : VK_IMAGE_LAYOUT_GENERAL;
+    const VkImageLayout dst_layout = same_depth ? VK_IMAGE_LAYOUT_GENERAL
+                                   : is_depth_texture(d.tex) ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+                                                             : VK_IMAGE_LAYOUT_GENERAL;
+    texture_transition_layout(cmd, s.tex, src_layout);
+    texture_transition_layout(cmd, d.tex, dst_layout);
     if (s.tex->samples != VK_SAMPLE_COUNT_1_BIT && d.tex->samples == VK_SAMPLE_COUNT_1_BIT && same_size) {
         VkImageResolve rs{layers(s), offset(s), layers(d), offset(d), extent(s)};
-        vkCmdResolveImage(cmd, s.tex->image, VK_IMAGE_LAYOUT_GENERAL, d.tex->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rs);
+        vkCmdResolveImage(cmd, s.tex->image, src_layout, d.tex->image, dst_layout, 1, &rs);
     } else if (same_size && size_compatible(s, d) && s.tex->samples == d.tex->samples) {
         VkImageCopy cp{layers(s), offset(s), layers(d), offset(d), extent(s)};
-        vkCmdCopyImage(cmd, s.tex->image, VK_IMAGE_LAYOUT_GENERAL, d.tex->image, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
+        vkCmdCopyImage(cmd, s.tex->image, src_layout, d.tex->image, dst_layout, 1, &cp);
     } else {   // scaled or converting: nearest, or linear when the game asked for it (colour only)
         // (what Vulkan allows a blit: BLIT_SRC/BLIT_DST, one format class on both sides, the same format for depth or
         // stencil, single-sampled images, and linear filtering only where the source format supports it; outside that
@@ -367,7 +382,7 @@ void copy_t2t(VkCommandBuffer cmd, NvnState& st, const nvn_p_copy_tt& p) {
         const bool linear = ((p.flags & NVN_COPY_FLAGS_LINEAR_FILTER_BIT) || d.down > s.down) && color &&
                             (tiling_features(s.tex->format) & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) &&
                             format_class(s.tex->format) == 0;
-        vkCmdBlitImage(cmd, s.tex->image, VK_IMAGE_LAYOUT_GENERAL, d.tex->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl,
+        vkCmdBlitImage(cmd, s.tex->image, src_layout, d.tex->image, dst_layout, 1, &bl,
                        linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
     }
     full_barrier(cmd);
@@ -401,10 +416,15 @@ void clear_tex(VkCommandBuffer cmd, NvnState& st, const nvn_p_clear_tex& p) {
             VkClearDepthStencilValue dv{};
             if (s.tex->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) dv.depth = p.c.f[0];
             if (s.tex->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) dv.stencil = (uint32_t)p.c.u[0];
-            vkCmdClearDepthStencilImage(cmd, s.tex->image, VK_IMAGE_LAYOUT_GENERAL, &dv, 1, &rng);
+            const bool whole_image = s.tex->levels == 1 && s.tex->layers == 1;
+            texture_transition_layout(cmd, s.tex, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, whole_image);
+            vkCmdClearDepthStencilImage(cmd, s.tex->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &dv, 1, &rng);
         }
     } else {   // (a region: a pass over that level and layer, and vkCmdClearAttachments)
         const nvn_view* v = p.has_view ? &p.view : nullptr;
+        const VkImageLayout att_layout =
+            is_depth_texture(s.tex) ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+        texture_transition_layout(cmd, s.tex, att_layout);
         const uint32_t slices = volume ? s.d : s.layers;
         for (uint32_t k = 0; k < slices; k++) {
             const uint32_t slice = (volume ? (uint32_t)s.z : s.layer) + k;
@@ -428,7 +448,7 @@ void clear_tex(VkCommandBuffer cmd, NvnState& st, const nvn_p_clear_tex& p) {
             }
             VkRenderingAttachmentInfo a{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
             a.imageView = attachment.view;
-            a.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            a.imageLayout = att_layout;
             a.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
             a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
