@@ -86,6 +86,12 @@ static int fake_frame_info(int64_t *replayed, int64_t *draws, int *w, int *h) {
     *replayed = fake_frame(), *draws = draws_total, *w = 1280, *h = 720;
     return 1;
 }
+static int picture_ready;
+static int fake_picture(HosControlPicture *out) {
+    if (!__atomic_load_n(&picture_ready, __ATOMIC_RELAXED)) return 0;
+    *out = (HosControlPicture){2560, 1440, 1920, 1080};
+    return 1;
+}
 typedef struct { char path[1100]; void (*done)(void *, int64_t, int); void *ctx; int64_t after; } Shot;
 static void *shot_thread(void *p) {
     Shot *s = (Shot *)p;
@@ -170,7 +176,7 @@ static int fake_save_root(char *out, size_t cap) {
 }
 /* (OoT) the map and the teleport: a teleport asked for is taken by the game's thread at its next frame, as the player's
    update takes it, unless teleport_held (not in play: nobody takes it). Link is the child: destination 2 has no child map,
-   so it is refused, as hos_main.c's oot_teleport refuses it */
+   so it is refused, as game/oot_tools.c's oot_teleport refuses it */
 static const char *const dest_child[3] = {"KokiriForest_Child", "HyruleField_Child", NULL};
 static const char *const dest_adult[3] = {"KokiriForest_Adult", "HyruleField_Adult", "GerudoFortress_Adult"};
 static char fake_map_now[80];
@@ -189,7 +195,7 @@ static int fake_destination(int i, const char **child, const char **adult) {
     return 1;
 }
 /* (the age switch: asked as a teleport is, with teleport_asked = AGE_ASKED + 1 for the adult, + 0 the child; taken, Link
-   that age already: nothing done (result 2), else his age flips and the map reloads in it, as hos_main.c does.
+   that age already: nothing done (result 2), else his age flips and the map reloads in it, as game/oot_tools.c does.
    stale_age: the state's sample of the age is the other one, as an old sample can be) */
 enum { AGE_ASKED = 100 };
 static volatile int fake_child = 1, stale_age;
@@ -248,8 +254,8 @@ static HosControlGame game = {
     .mem_write = fake_mem_write, .save_root = fake_save_root, .log = fake_log, .quit = fake_quit,
     .renderer = fake_renderer, .version = "test", .map = fake_map, .destination = fake_destination,
     .teleport = fake_teleport, .teleport_result = fake_teleport_result, .teleport_cancel = fake_teleport_cancel,
-    .age = fake_age, .oot_state = fake_state, .oot_sample_ask = fake_sample_ask,
-    .oot_sample_cancel = fake_sample_cancel, .oot_sample = fake_sample};
+    .age = fake_age, .game_state = fake_state, .game_sample_ask = fake_sample_ask,
+    .game_sample_cancel = fake_sample_cancel, .game_sample = fake_sample, .picture = fake_picture};
 
 static void *game_thread(void *unused) {
     (void)unused;
@@ -757,6 +763,11 @@ int main(int argc, char **argv) {
     ask(c, "{\"id\":1,\"cmd\":\"status\"}\n", "1", line, sizeof line, 2000);
     CHECK(strstr(line, "\"ok\":true") && strstr(line, "\"frame\":") && strstr(line, "\"version\":\"test\"") &&
           strstr(line, "\"renderer\":\"fake\"") && strstr(line, "\"window\":{\"width\":1280,\"height\":720}"));
+    CHECK(strstr(line, "\"game_picture\":null"));
+    __atomic_store_n(&picture_ready, 1, __ATOMIC_RELAXED);
+    ask(c, "{\"id\":\"picture\",\"cmd\":\"status\"}\n", "\"picture\"", line, sizeof line, 2000);
+    CHECK(strstr(line, "\"window\":{\"width\":1280,\"height\":720}") &&
+          strstr(line, "\"game_picture\":{\"texture_width\":2560,\"texture_height\":1440,\"width\":1920,\"height\":1080}"));
     puts("PASS: status");
 
     /* malformed requests: an error, and the connection goes on */

@@ -175,11 +175,8 @@ bool load_locked() {
     if (l.tried) return l.ok;
     l.tried = true;
     std::string exe_dir, game_dir;
-    char exe[MAX_PATH];
-    DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
-    if (n && n < MAX_PATH) exe_dir = std::string(exe, n).substr(0, std::string(exe, n).find_last_of("\\/"));
-    n = game_module_path(exe, MAX_PATH);
-    if (n && n < MAX_PATH) game_dir = std::string(exe, n).substr(0, std::string(exe, n).find_last_of("\\/"));
+    if (const std::string s = exe_module_string(); !s.empty()) exe_dir = s.substr(0, s.find_last_of("\\/"));
+    if (const std::string s = game_module_string(); !s.empty()) game_dir = s.substr(0, s.find_last_of("\\/"));
     std::string where;
     for (const std::string& dir : xess_rules::library_dirs(getenv("RX_VK_XESS_DIR"), exe_dir, game_dir)) {
         where += (where.empty() ? "" : ", ") + dir;
@@ -405,7 +402,7 @@ bool evaluate(VkCommandBuffer cmd, const TemporalFrame& f) {
         GprofSpan timed(cmd, "xess xessVKExecute (Intel's passes)");   // (RX_VK_PASS_TIMING=1: Intel's own GPU time, named)
         ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);   // (xessVKExecute records into cmd itself: what this thread recorded through vk_work.h reaches cmd first)
         r = l.execute(s.context->context, cmd, &p);
-        note_work();   // (Intel's dispatches: full_barrier must not take the next barrier for a repeat of the one before them)
+        note_other_work();   // (Intel's dispatches: full_barrier must not take the next barrier for a repeat of the one before them)
     }
 
     const VkImageMemoryBarrier2 out[4] = {barrier(f.color.image, VK_ACCESS_2_SHADER_READ_BIT, any, R, G),

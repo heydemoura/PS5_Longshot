@@ -1,4 +1,4 @@
-/* (longshot) The control bridge (host/control.c, docs/control.md): HOS_CONTROL=<socket path> lets a tool on the same PC
+/* (longshot) The control bridge (host/control.c, docs/dev/reference/control-bridge.md): HOS_CONTROL=<socket path> lets a tool on the same PC
    drive the running game over a local socket, one JSON request a line. Off unless that is set. */
 #pragma once
 
@@ -18,6 +18,20 @@ int hos_control_input(uint64_t *buttons, int32_t stick[4]);
 void hos_control_log(const char *line);
 extern volatile int hos_control_on;
 
+/* The source of the last native game present submitted to the renderer. */
+/* (longshot, issue 1113) an input recording now (host/input_movie.c): the status reply's "recorder" */
+typedef struct HosControlRecorder {
+    int mode;   /* 0 nothing, 1 recording, 2 playing */
+    int started, held, diverged;
+    uint32_t frame, end, link_apart, link_checked, syncs, anchors, anchors_wanted;
+    float largest;   /* metres: Link's largest correction */
+    char path[512];  /* the file recorded or played; with nothing, the last recording made */
+} HosControlRecorder;
+typedef struct HosControlPicture {
+    unsigned texture_width, texture_height;
+    unsigned width, height;   /* crop size, or the texture size when there is no crop */
+} HosControlPicture;
+
 /* One of the Insert menu's settings (gpu/vk/vk_api.h MkwVkSetting's fields) */
 typedef struct HosControlSetting {
     char key[32], name[48], text[64], tab[16];
@@ -27,19 +41,19 @@ typedef struct HosControlSetting {
 
 /* OoT samples are bounded JSON objects, made on Link's update, never from guest memory on the socket thread.
    Watches have separate bounded pending changes; the table baselines are shared. The slot is a connection slot. */
-#define HOS_CONTROL_OOT_JSON 32768
-#define HOS_CONTROL_OOT_CLIENTS 8
-#define HOS_CONTROL_OOT_FLAGS 64
-typedef struct HosControlOotWatch {
+#define HOS_CONTROL_GAME_JSON 32768
+#define HOS_CONTROL_GAME_CLIENTS 8
+#define HOS_CONTROL_GAME_FLAGS 64
+typedef struct HosControlGameWatch {
     int64_t every;
     int nflags, changes;
-    char flags[HOS_CONTROL_OOT_FLAGS][48];
-} HosControlOotWatch;
+    char flags[HOS_CONTROL_GAME_FLAGS][48];
+} HosControlGameWatch;
 
 /* The game as the bridge sees it: control.c's own for the game, a fake one in tests/control_test.c */
 typedef struct HosControlGame {
     int64_t (*frame)(void);   /* the game's presents so far */
-    /* the presents replayed, the draws recorded so far, the picture's size: 0 when there is no such renderer */
+    /* the presents replayed, the draws recorded so far, the swapchain size: 0 when there is no such renderer */
     int (*frame_info)(int64_t *replayed, int64_t *draws, int *width, int *height);
     /* a PNG of the first present after `after`; done(ctx, present, ok) from any thread. 0: not taken */
     int (*shot)(const char *path, int64_t after, void (*done)(void *ctx, int64_t present, int ok), void *ctx);
@@ -55,8 +69,9 @@ typedef struct HosControlGame {
     int (*mem_region)(uint64_t addr, uint64_t size);
     void (*mem_read)(uint64_t addr, void *dst, uint64_t size);
     void (*mem_write)(uint64_t addr, const void *src, uint64_t size);
-    /* the folder the game's saves are mounted from (<user>/save/<user id>): 0 before the game opened them */
+    /* Begin a save listing; on success save_end releases its read guard, if supplied. */
     int (*save_root)(char *out, size_t cap);
+    void (*save_end)(void);
     void (*log)(const char *line);
     void (*quit)(void);   /* does not return */
     const char *(*renderer)(void);   /* the renderer's description, or NULL */
@@ -80,21 +95,33 @@ typedef struct HosControlGame {
        teleport or age ask replaces one not taken yet. 0: not asked */
     int (*age)(int adult);
     /* (OoT) with the map: an event playing (a cutscene, a map change's), a map loading, Link the child. 0 before any */
-    int (*oot_state)(int *event, int *loading, int *child);
+    int (*game_state)(int *event, int *loading, int *child);
     /* (OoT) coalesced request for the next safe Link-update snapshot; cancel drops an unanswered request. */
-    uint64_t (*oot_sample_ask)(void);
-    void (*oot_sample_cancel)(uint64_t ticket);
+    uint64_t (*game_sample_ask)(void);
+    void (*game_sample_cancel)(uint64_t ticket);
     /* Copy a snapshot that satisfies ticket, or 0 while pending. Ticket 0 reads the last retained snapshot.
-       No guest reads here; frame/t still date retained samples. status falls back to oot_state for null
+       No guest reads here; frame/t still date retained samples. status falls back to game_state for null
        event/loading/age, so those fields keep their protocol-1 types inside a non-null game. */
-    int (*oot_sample)(uint64_t ticket, char *out, size_t cap);
+    int (*game_sample)(uint64_t ticket, char *out, size_t cap);
     /* Replace a connection's watch (NULL cancels and forgets pending changes); no guest reads here. */
-    void (*oot_watch)(int slot, const HosControlOotWatch *watch);
+    void (*game_watch)(int slot, const HosControlGameWatch *watch);
     /* Consume the latest pending sample for that connection, 0 when none. No guest reads or socket I/O. */
-    int (*oot_poll)(int slot, char *out, size_t cap);
+    int (*game_poll)(int slot, char *out, size_t cap);
     /* the game started again as the Insert menu's Restart now does it (host/hos_relaunch.c: the same command and the
        environment it started with, so the bridge comes back on the same socket); does not return. NULL: no restart here */
     void (*relaunch)(void);
+    /* Copies the last observed source dimensions. 0 before a native game present. */
+    int (*picture)(HosControlPicture *out);
+    /* (longshot, issue 1113) input recordings (host/input_movie.c). record_start: a recording from Link's next update to path
+       (NULL: the player's recordings folder; route: no guest words, for assets/routes/), 0 when something is recorded or
+       played already; play_start: path (NULL: the last recording made) from Link's next update, put back at every sync-th
+       update (0 never) while within sync_max metres; 1 started, 0 busy, -1 no such recording, -2 it starts on another map.
+       recorder: what is recorded or played now. NULL: no recordings here */
+    int (*record_start)(const char *path, int route);
+    void (*record_stop)(void);
+    int (*play_start)(const char *path, int sync, float sync_max);
+    void (*play_stop)(void);
+    void (*recorder)(HosControlRecorder *out);
 } HosControlGame;
 
 /* Listens on path and serves on a thread of its own. 0 when it could not (logged) */

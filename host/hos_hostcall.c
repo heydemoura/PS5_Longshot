@@ -109,7 +109,7 @@ int a64_call_miss(Ctx *c, uint64_t target) {
 
 /* HOS_HLE_STATS=1 (off by default): about every 5 s, how often each HLE function (hos.h's HLE) and each host call ran in
    the measured clock span, most called first: "hle: <total> calls of <n> functions in <elapsed> s", then "<count> <name>;"
-   (HLE functions by their full mangled name). scripts/cpu_report.py --calls reads them. HLE functions called from host
+   (HLE functions by their full mangled name). scripts/perf.py cpu --calls reads them. HLE functions called from host
    code (one HLE function calling another) count too; the sdk's NVN exports count as their host call (nvn2_dispatch). */
 int hos_hle_stats;
 static HleCount *volatile hos_hle_list;
@@ -177,17 +177,6 @@ void hos_hle_stats_start(void) {
     HANDLE thread = CreateThread(NULL, 0, hos_hle_thread, NULL, 0, NULL);
     if (!thread) { hos_hle_stats = 0; hos_log("hle: call counters could not start; counting stays off"); return; }
     CloseHandle(thread);
-}
-
-/* Call guest code from inside a host function (an HLE handler), with up to four arguments, on the current guest
-   stack. The guest callee keeps the AArch64 callee-saved registers; LR is restored here. Returns x0. */
-uint64_t hos_call_guest(Ctx *c, uint64_t fn, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
-    uint64_t lr = c->x[30];
-    c->x[0] = a0; c->x[1] = a1; c->x[2] = a2; c->x[3] = a3;
-    c->x[30] = 0;
-    a64_icall(c, fn);
-    c->x[30] = lr;
-    return c->x[0];
 }
 
 /* HOS_HOSTCALL_STATS=1: at exit, how often each host call ran (the NVN surface a game really uses). */

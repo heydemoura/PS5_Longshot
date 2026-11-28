@@ -23,10 +23,9 @@ import sys
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(ROOT, "nx2"))
-os.environ.setdefault("OOT_WORK", os.path.join(ROOT, "work", "lift"))
-import kit       # noqa: E402  (nx2: the lift's paths)
-import rtgen     # noqa: E402  (the 64-bit guest window's runtime header)
+sys.path.insert(0, os.path.join(ROOT, "ps5", "pylib"))
+# (the lift's work folder: longshot-builder image, then dev lift --memory-base 0x1000000000 --dirty-pages 16777216)
+WORK = os.environ.get("OOT_WORK", os.path.join(ROOT, "work", "lift"))
 import logo_rgba  # noqa: E402
 import ui_fonts   # noqa: E402  (the overlays' bundled fonts, compiled in)
 import version   # noqa: E402
@@ -40,7 +39,11 @@ VULKAN = os.environ.get("PS5_VULKAN", os.path.join(ROOT, "..", "PS5_Vulkan"))
 DEPS = os.path.join(ROOT, ".local", "ps5-deps")
 CPM = os.path.join(DEPS, "cpm")
 FFMPEG = os.path.join(DEPS, "ffmpeg")
-GEN = os.path.join(kit.WORK, "sa", "gen")
+GEN = os.path.join(WORK, "gen")
+RT = os.path.join(GEN, "rt")   # (the lift's runtime and its config, a64_config.h: the host is compiled against them)
+GAME = os.path.join(ROOT, "game")
+# (the game's Rust, longshot-rs, built apart for the console with emulated thread-local storage: ps5/tools/build-rust.sh)
+RUST_LIB = os.environ.get("PS5_RUST_LIB", os.path.join(ROOT, "work", "rust", "x86_64-unknown-freebsd", "game", "liblongshot_rs.a"))
 OUT = os.path.join(ROOT, "work", "ps5")
 HOST, POSIX, PS5 = (os.path.join(ROOT, "host", d) for d in ("", "posix", "ps5"))
 VK = os.path.join(ROOT, "gpu", "vk")
@@ -87,34 +90,105 @@ def tree_digest(*dirs, ext=(".h", ".hpp", ".inc")):
     return h.hexdigest()
 
 
-def jobs_for(rt64, gen_dir):
+HOT_OPT = "-" + (os.environ.get("RX_HOT_OPT", "").strip() or "O2")
+
+
+def uses_rtti(path):
+    """Whether a renderer source classifies a C++ exception by its type (gpu/vk/cxx_escape.h: dynamic_cast, typeid).
+    The console's compiler has RTTI off unless asked; the exception types' own type information is the C++ library's"""
+    text = open(path, encoding="utf-8", errors="replace").read()
+    return '"cxx_escape.h"' in text or '"renderer_guard.h"' in text
+
+
+# (the page marks' table for the console's 64 GiB guest window, HOS_GUEST_SPACE: 16 MB of static data instead of the
+# 512 GB window's 128, and the GPU pages' bitmap 2 MB instead of 16. The lifted game, its runtime and the host all take it)
+DIRTY_PAGES = []   # (the lift's now: dev lift --dirty-pages 16777216, gen/rt/a64_config.h)
+# (the lifted stores mark their page only where it is a GPU page, by the bitmap (host/mark_bitmap.c): nx2/build.py's
+# RX_MARK_BITMAP, on by default there. RX_MARK_BITMAP=0: every store marks, as before. From ProsperoHookshot 3ed454af,
+# where it measured ~1.2 ms less of the game's own time a frame in Hyrule Field on a PS5; HOS_MARK_BITMAP_ALL=1 at a
+# start is the control: every bit set)
+MARK_BITMAP = []   # (the lift's too: dev lift --no-mark-bitmap turns it off)
+
+# The console's lift, as ps5/builder/pipeline.py asks for it and as a developer's own (ps5/README.md): the guest window's
+# base and the page marks' table. gen/rt/a64_config.h says them to the host, which is compiled against it
+LIFT_OPTIONS = ["--memory-base", "0x1000000000", "--dirty-pages", "16777216"]
+# (what `dev lift` with LIFT_OPTIONS writes as gen/rt/a64_config.h, byte for byte: the kit's objects are compiled with no
+# game, so with no lift, against this copy; the builder checks a player's lift wrote the same, pipeline.py lift)
+KIT_CONFIG = (
+    "/* Written by longshot-builder: the choices this lift's IR was written with (builder/crates/llvm Options). The host\n"
+    "   is compiled against them through a64.h: do not define these on the command line. */\n"
+    "#ifndef A64_CONFIG_H\n"
+    "#define A64_CONFIG_H\n"
+    "#define A64_HOST_BASE 0x1000000000ULL   /* where guest address 0 is */\n"
+    "#define A64_DIRTY_PAGES 0x1000000ULL   /* the page marks' table: a byte per 4 KB page */\n"
+    "#define A64_WRITE_TRACK 1   /* (stores mark their pages: always) */\n"
+    "#define A64_MARK_BITMAP 1   /* only stores whose first or last byte is on a GPU page mark */\n"
+    "#define A64_POLLING 1   /* back edges poll for an interrupt */\n"
+    "#endif\n")
+# (the lifted units, LLVM IR: at -O1, the hot ones at RX_HOT_OPT, as longshot-builder compiles them; what the IR was
+# written with is the lift's, so no -D reaches it)
+IR_FLAGS = ["-march=znver2", "-fno-omit-frame-pointer", "-ffunction-sections", "-fdata-sections", "-g0", "-Wno-everything",
+            "-O1", "-x", "ir"]
+# (the lift's own C beside the units: gen/, and its runtime in gen/rt)
+GAME_FILES = ["table.c", "imports.c", "image.c", "rt/a64_rt.c", "rt/a64_fp.c"]
+
+
+def kit_dirs():
+    """--kit: no game, so no lift. GEN is a folder with the lift's runtime alone (builder/rt and KIT_CONFIG), which is all the
+    host reads of gen/"""
+    global GEN, RT
+    GEN = os.path.join(OUT, "kit-gen")
+    RT = os.path.join(GEN, "rt")
+    os.makedirs(RT, exist_ok=True)
+    for f in ("a64.h", "a64_rt.c", "a64_fp.c"):
+        shutil.copy(os.path.join(ROOT, "builder", "rt", f), os.path.join(RT, f))
+    with open(os.path.join(RT, "a64_config.h"), "w", newline="\n") as f:
+        f.write(KIT_CONFIG)
+
+
+def vk_sources():
+    """The Vulkan back end's sources, as the old builder's vk_sources listed them: Eden's shader recompiler (gpu/vk/eden),
+    sirit (gpu/vk/sirit/src), the back end (gpu/vk/*.cpp), the menu's modules (gpu/vk/menu) and the CPU texture decoders"""
+    out = []
+    for sub in ("eden", os.path.join("sirit", "src")):
+        for d, _, files in os.walk(os.path.join(VK, sub)):
+            out += [os.path.join(d, f) for f in files if f.endswith(".cpp")]
+    out += [os.path.join(VK, f) for f in os.listdir(VK) if f.endswith(".cpp")]
+    for sub in ("menu", "texdecode"):
+        d = os.path.join(VK, sub)
+        out += [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".cpp")] if os.path.isdir(d) else []
+    return sorted(out)
+
+
+def jobs_for(gen_dir):
     """(source, object, flags, header digest) of everything the title links"""
     out = []
-    game_digest = tree_digest(GEN, rt64, os.path.join(kit.KIT, "rt"), os.path.join(ROOT, "nx2", "rt"))
-    game_fl = COMMON + ["-I" + rt64, "-I" + GEN, "-I" + os.path.join(kit.KIT, "rt"), "-I" + os.path.join(ROOT, "nx2", "rt"),
-                        "-fno-strict-aliasing", "-mcx16", "-O1", "-mllvm", "-rotation-max-header-size=0", "-mllvm",
-                        "-capture-tracking-max-uses-to-explore=5000", "-DA64_POLLING", "-DA64_WRITE_TRACK"]
-    # (no lifted game: --kit's build, which compiles none of it)
-    chunks = sorted(f for f in os.listdir(GEN) if f.startswith("code_") and f.endswith(".c")) if os.path.isdir(GEN) else []
-    game = [os.path.join(GEN, c) for c in chunks] + \
-        [os.path.join(GEN, f) for f in ("a64_table.c", "a64_hooks.c", "a64_suyu.c", "a64_stubs.c", "hos_image.c", "nvn2_exports.c")] + \
-        [os.path.join(rt64, "a64_rt.c")]
-    out += [(s, os.path.join(OUT, "obj", "game_" + os.path.basename(s)[:-2] + ".o"), game_fl, game_digest) for s in game]
+    game_digest = tree_digest(RT)
+    ir_fl = IR_FLAGS
+    c_fl = COMMON + ["-I" + RT, "-I" + GEN, "-I" + HOST, "-I" + GAME, "-fno-strict-aliasing", "-mcx16", "-O2"]
+    units = sorted(f for f in os.listdir(GEN) if f.startswith("lifted_") and f.endswith(".ll")) if os.path.isdir(GEN) else []
+    for u in units:
+        fl = [HOT_OPT if f == "-O1" else f for f in ir_fl] if u.startswith("lifted_hot_") else ir_fl
+        out.append((os.path.join(GEN, u), os.path.join(OUT, "obj", "game_" + u[:-3] + ".o"), fl, ""))
+    for s in [os.path.join(GEN, *f.split("/")) for f in GAME_FILES]:
+        out.append((s, os.path.join(OUT, "obj", "game_" + os.path.basename(s)[:-2] + ".o"), c_fl, game_digest))
 
     # the runtime: host/ as Linux builds it, without SDL's loader (host/ps5/hos_sdl_ps5.c) and the Linux-only files
-    host_digest = tree_digest(HOST, rt64, GEN) + tree_digest(os.path.join(VK), ext=("vk_api.h", "dlss_math.h"))
-    host_fl = COMMON + [MKDIR, "-I" + POSIX, "-D_GNU_SOURCE", "-I" + HOST, "-I" + rt64, "-I" + GEN, "-O2", "-mcx16", "-DA64_POLLING",
-                        "-DA64_WRITE_TRACK", "-I" + os.path.join(OPUS, "include"), "-I" + os.path.join(FFMPEG, "include"),
+    host_digest = tree_digest(HOST, GAME, RT) + tree_digest(os.path.join(VK), ext=("vk_api.h", "dlss_math.h"))
+    host_fl = COMMON + DIRTY_PAGES + [MKDIR, "-I" + POSIX, "-D_GNU_SOURCE", "-I" + HOST, "-I" + GAME, "-I" + RT, "-I" + GEN, "-O2", "-mcx16",
+                        "-I" + os.path.join(OPUS, "include"), "-I" + os.path.join(FFMPEG, "include"),
                         "-I" + os.path.join(DEPS, "zstd", "include"),
                         "-I" + os.path.join(pkg("vulkanheaders", "v1.4.345"), "include"),
                         "-Werror=implicit-function-declaration"]
     skip = {"display.c", "mf_av1.c", "rx_nowgpu.c", "pgo_rt.c", "hos_sdl.c", "mingw_msvc_shims.c", "msvc_oldnames.c", "dav1d_av1.c"}
     host = [os.path.join(HOST, f) for f in sorted(os.listdir(HOST)) if f.endswith(".c") and f not in skip] + \
+        [os.path.join(GAME, f) for f in sorted(os.listdir(GAME)) if f.endswith(".c") and f not in skip] + \
+        [os.path.join(GAME, "menu", f) for f in sorted(os.listdir(os.path.join(GAME, "menu"))) if f.endswith(".c")] + \
         [os.path.join(POSIX, f) for f in ("win32_posix.c", "display_sdl.c", "linux_stubs.c")] + \
         [os.path.join(PS5, f) for f in sorted(os.listdir(PS5)) if f.endswith(".c")]
     stamp = version.define(ROOT)
     for s in host:
-        rel = os.path.relpath(s, HOST).replace(os.sep, "_")[:-2]
+        rel = os.path.relpath(s, ROOT).replace(os.sep, "_")[:-2]
         fl = host_fl + ([stamp] if os.path.basename(s) == "hos_main.c" else [])
         out.append((s, os.path.join(OUT, "obj", "host_" + rel + ".o"), fl, host_digest))
 
@@ -126,7 +200,6 @@ def jobs_for(rt64, gen_dir):
                     "opus-1.5.2"))
 
     # the Vulkan back end, Eden's recompiler and sirit, as nx2/build.py's vk_sources (C++20 with exceptions: Eden throws)
-    import build as upstream   # (nx2/build.py: the source list, kept in one place)
     spirv = pkg("spirv-headers", "vulkan-sdk-1.4.341.0")
     vfl = COMMON + [MKDIR, "-I" + POSIX, "-D_GNU_SOURCE", "-include", os.path.join(PS5, "win32_ps5.h"),
                     "-include", "algorithm", "-include", "cstdio", "-include", "cstdlib", "-include", "cstring",
@@ -163,19 +236,23 @@ def jobs_for(rt64, gen_dir):
     # (the start-up screen's logo, gen/longshot_logo.h, is in vk_imgui.cpp's key: a new picture compiles it again)
     logo_h = os.path.join(gen_dir, "longshot_logo.h")
     logo_digest = hashlib.sha1(open(logo_h, "rb").read()).hexdigest() if os.path.exists(logo_h) else ""
-    for s in upstream.vk_sources():
-        if os.path.basename(s) == "vk_ngx_msvc_rt.cpp":
+    # (the files that draw with Dear ImGui, as nx2/build.py's imgui_users; the crash window is not built here)
+    IMGUI_USERS = ("vk_imgui.cpp", "vk_menu.cpp", "reshade.cpp")
+    for s in vk_sources():
+        # (vk_crash_window.cpp: the crash helper's window on a PC, drawn through SDL; the console has no such window)
+        if os.path.basename(s) in ("vk_ngx_msvc_rt.cpp", "vk_crash_window.cpp"):
             continue
         rel = os.path.relpath(s, os.path.join(ROOT, "gpu")).replace(os.sep, "_")[:-4]
         lib = os.path.relpath(s, VK).split(os.sep)[0] in ("eden", "sirit")
         fl = vfl + ([shader_stamp] if os.path.basename(s) == "vk_shader.cpp" else []) + \
             ([stamp] if os.path.basename(s) == "vk_menu.cpp" else []) + \
             (lsfg_fl if os.path.basename(s) == "vk_framegen.cpp" else []) + \
-            (imgui_fl if os.path.basename(s) in ("vk_imgui.cpp", "vk_menu.cpp") else []) + \
+            (imgui_fl if os.path.basename(s) in IMGUI_USERS else []) + \
+            (["-frtti"] if uses_rtti(s) else []) + \
             (["-DHOOKSHOT_MIHAWKGEN", "-I" + os.path.join(MIHAWKGEN, "framegen", "include")]
              if HAS_MIHAWKGEN and os.path.basename(s) == "vk_framegen.cpp" else [])
         out.append((s, os.path.join(OUT, "obj", "vk_" + rel + ".o"), fl,
-                    lib_digest if lib else vk_digest + (imgui_digest if os.path.basename(s) in ("vk_imgui.cpp", "vk_menu.cpp") else "") +
+                    lib_digest if lib else vk_digest + (imgui_digest if os.path.basename(s) in IMGUI_USERS else "") +
                     (logo_digest if os.path.basename(s) == "vk_imgui.cpp" else "")))
     # (Lossless Scaling's frame generation from the player's own Lossless.dll: third_party/lsfg, PS5SX2's port as it is, and
     # gpu/vk/lsfg, its three files changed for Longshot, found first: their names are the same)
@@ -225,7 +302,11 @@ def main():
     p.add_argument("--kit", action="store_true",
                    help="only what is not made from the game, compiled for ps5/builder/make_kit.py: no game is needed")
     a = p.parse_args()
-    for need, what in ((None if a.kit else os.path.join(GEN, "a64_table.c"), "the lifted game (nx2/lift.py --standalone --write)"),
+    if a.kit:
+        kit_dirs()
+    for need, what in ((None if a.kit else os.path.join(GEN, "table.c"),
+                        "the lifted game (longshot-builder image, then dev lift " + " ".join(LIFT_OPTIONS) + ")"),
+                       (RUST_LIB, "the game's Rust for the console (ps5/tools/build-rust.sh)"),
                        (os.path.join(SDK, "bin", "prospero-lld"), "the PS5 payload SDK (PS5_PAYLOAD_SDK)"),
                        (os.path.join(VULKAN, "tools", "radv-link.sh"), "PS5_Vulkan (PS5_VULKAN)"),
                        (os.path.join(FFMPEG, "include", "libavcodec", "avcodec.h"), "FFmpeg (ps5/tools/build-ffmpeg.sh)"),
@@ -234,26 +315,11 @@ def main():
         if need and not os.path.exists(need):
             sys.exit("ps5/build.py: missing %s: %s" % (what, need))
     os.makedirs(os.path.join(OUT, "obj"), exist_ok=True)
-    rt64 = rtgen.write(os.path.join(OUT, "rt64"))
     gen_dir = os.path.join(OUT, "gen")
     # (the start-up screen shows the title's console icon, the one on the home screen, not the PC build's logo)
     logo_rgba.write(os.path.join(gen_dir, "longshot_logo.h"), os.path.join(ROOT, "ps5", "sce_sys", "icon0.png"))
     ui_fonts.write(os.path.join(gen_dir, "ui_fonts.cpp"))
-    if a.kit and not os.path.exists(os.path.join(GEN, "a64_suyu.h")):
-        # (no lift here: rt64/a64.h, which the runtime includes, includes the lift's two headers. a64_suyu.h is a64-kit's own,
-        # made from suyu's translator and not from a game (a64_rtgen.py); a64_fpx.h is the lift's fast-path helpers, static
-        # inline: one for each pair of operations the game uses, which only lifted code calls, after the ones every lift
-        # has. With those alone the runtime compiles to the same objects; a call of one that is not there stops the compile
-        # (host_fl's -Werror=implicit-function-declaration) instead of failing the player's link)
-        GEN = os.path.join(OUT, "kit-gen")
-        sys.path.insert(0, os.path.join(kit.KIT, "lift"))
-        import a64_rtgen
-        os.makedirs(GEN, exist_ok=True)
-        a64_rtgen.write(GEN)
-        import a64_lift
-        with open(os.path.join(GEN, "a64_fpx.h"), "w", newline="\n") as f:
-            f.write(a64_lift.fpx_header(set()))   # (the helpers every lift has, a64_vset64 among them: host/oot_fov.c)
-    jobs = jobs_for(rt64, gen_dir)
+    jobs = jobs_for(gen_dir)
     if a.kit:
         jobs = [j for j in jobs if not os.path.basename(j[1]).startswith("game_")]
     # the longest first (the lifted chunks), so no long compile is left alone at the end
@@ -277,12 +343,12 @@ def main():
             f.write("\n".join(sorted(j[1] for j in jobs)) + "\n")
         return 0
     with open(os.path.join(OUT, "objects.txt"), "w") as f:
-        f.write("\n".join(j[1] for j in jobs) + "\n")
+        f.write("\n".join([j[1] for j in jobs] + [RUST_LIB]) + "\n")
     if a.compile_only:
         return 0
     env = dict(os.environ, PS5_PAYLOAD_SDK=SDK, PS5_VULKAN=VULKAN, PS5_FFMPEG=FFMPEG)
     linked = subprocess.run(["bash", os.path.join(ROOT, "ps5", "tools", "link.sh"), OUT,
-                             os.path.join(kit.WORK, "sa", "image", "image.bin")], env=env).returncode
+                             os.path.join(WORK, "image", "image.bin")], env=env).returncode
     if not linked and HAS_MIHAWKGEN:   # (the network beside the game: /app0/framegen/network.fgw, vk_framegen.cpp)
         title_id = json.load(open(os.path.join(ROOT, "ps5", "sce_sys", "param.json")))["titleId"]   # (link.sh's dist/<titleId>)
         os.makedirs(os.path.join(ROOT, "dist", title_id, "framegen"), exist_ok=True)

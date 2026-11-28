@@ -8,12 +8,18 @@ python -I -B tests/test_upscaler_rows.py [--cxx g++]
 import argparse
 import re
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))   # (python -I leaves the check's own folder off the path)
+from srccut import block
 
 RUN_ALL_ARGS = ["--cxx", "{cxx}"]
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tests"))
+from menu_model_fixture import built_menu, menu_text, module_rows  # noqa: E402
 
 
 def function(source, start):
@@ -29,19 +35,28 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cxx", default="g++")
     args = parser.parse_args()
-    menu = (ROOT / "gpu" / "vk" / "vk_menu.cpp").read_text(encoding="utf-8")
+    # (vk_menu.cpp and its modules' rows as table lines, #1633: the frame rows are gpu/vk/menu/framegen.cpp's)
+    menu = menu_text(ROOT) if (ROOT / "gpu" / "vk" / "menu").is_dir() else \
+        (ROOT / "gpu" / "vk" / "vk_menu.cpp").read_text(encoding="utf-8")
     # the picture's way, top to bottom: the output, what fills it, the 3D's size and its sharpening (Resolution and
-    # upscaling); then the frame rows, Reflex with them (Frame generation and latency); then the window (Screen)
+    # upscaling); then the frame rows, Reflex with them (Frame generation and latency); then the window (Screen). (Frame
+    # pacing is the Debug tab's, not in this picture.) The rows are the modules' (#1633), placed by after/before: their order
+    # is the Graphics tab's as the menu builds it, not the sources' text
     order = ['"Output resolution", &opts.output_res', '"Upscaler", &opts.dlss', '"DLSS model", &opts.dlss_model',
              '"Render resolution", &opts.resolution', '"Sharpness", &opts.sharpness',
              '"Frame generation", &opts.framegen', '"Frame generation by", &opts.framegen_by',
-             '"Frame pacing", &opts.pace', '"NVIDIA Reflex", &opts.reflex',
-             '"Window scaling filter", &opts.upscale']
+             '"NVIDIA Reflex", &opts.reflex', '"Window scaling filter", &opts.upscale']
     at = [menu.find(row) for row in order]
     if -1 in at:
         raise SystemExit("vk_menu.cpp: a scaling row is missing: " + order[at.index(-1)])
-    if at != sorted(at):
-        raise SystemExit("vk_menu.cpp: the scaling rows are not in the picture's order")
+    pages, _ = built_menu(args.cxx)
+    graphics = [item.label for item in pages.get("graphics", []) if not item.heading]
+    labels = [row.split('"')[1] for row in order]
+    if any(label not in graphics for label in labels):
+        raise SystemExit("the menu as built: a scaling row is not on the Graphics tab: " +
+                         next(label for label in labels if label not in graphics))
+    if [graphics.index(label) for label in labels] != sorted(graphics.index(label) for label in labels):
+        raise SystemExit("the menu as built: the scaling rows are not in the picture's order")
     if '"NVIDIA DLSS", &opts.' in menu or '"AMD FSR 4", &opts.' in menu:
         raise SystemExit("vk_menu.cpp: DLSS or FSR has a row of its own beside the Upscaler")
     # saved options: the renamed rows keep their keys (data, so read from the source)
@@ -50,28 +65,36 @@ def main():
         if not re.search(r"&%s\)\s*return\s*\"%s\"" % (re.escape(value), name), key):
             raise SystemExit("ini_key: %s is not saved as %s (an options file from before would lose it)" % (value, name))
     # the menu's rules are upscaler_rows.h's, checked by behaviour in test_upscaler_rows.cpp: here only that the menu uses them
-    # (the Upscaler by engine, Native on the Render resolution row: render_fixed, step_engine, step_render)
+    # (the Upscaler by engine, Native on the Render resolution row: render_fixed, step_engine, step_render). The rows are the
+    # modules' (#1633): what fixes or hides one is its own locked() and shown(), which row_fixed and row_shown ask
+    rows = {r.get("value"): r for r in module_rows(ROOT)}
     uses = {
-        "row_fixed": ("ur::upscaler_fixed(", "ur::render_fixed(", "ur::model_fixed("),
-        "row_shown": ("ur::upscaler_shown(upscalers_available())", "ur::model_shown(dlss_why() == DLSS_OK)"),
-        "set_row": ("ur::step_engine(", "ur::step_render(", "ur::snap_render(", "row_fixed("),
+        ("&opts.dlss", "locked"): "ur::upscaler_fixed(", ("&opts.resolution", "locked"): "ur::render_fixed(",
+        ("&opts.dlss_model", "locked"): "ur::model_fixed(",
+        ("&opts.dlss", "shown"): "ur::upscaler_shown(upscalers_available())",
+        ("&opts.dlss_model", "shown"): "ur::model_shown(dlss_why() == DLSS_OK, upscaler())",
     }
-    for name, calls in uses.items():
-        body = function(menu, "%s %s(" % ("void" if name == "set_row" else "bool", name))
-        for call in calls:
-            if call not in body:
-                raise SystemExit("%s does not use %s (upscaler_rows.h)" % (name, call))
+    for (value, hook), call in uses.items():
+        if call not in rows.get(value, {}).get(hook, ""):
+            raise SystemExit("the %s row's %s() does not use %s (upscaler_rows.h)" % (value, hook, call))
+    if "module_locked(value)" not in function(menu, "bool row_fixed("):
+        raise SystemExit("row_fixed does not ask a module's row's own locked() (module_locked)")
+    if "rows[i].setting->shown()" not in function(menu, "bool row_shown(int i) {"):
+        raise SystemExit("row_shown does not ask a module's row's own shown()")
+    for call in ("ur::step_engine(", "ur::step_fixed_render(", "ur::apply_fixed_stop(", "row_fixed("):
+        if call not in function(menu, "void set_row("):
+            raise SystemExit("set_row does not use %s (upscaler_rows.h)" % call)
     # a row for what this PC cannot run is hidden, not shown with a "Not available here" line: Reflex and Anti-Lag 2
     # where the driver lacks them (the Upscaler and the DLSS model above), and HDR's levels while HDR is off
-    shown = function(menu, "bool row_shown(int i) {")
-    for call in ("v != &opts.reflex || reflex_available()", "v != &opts.antilag || antilag_available()",
-                 "(v != &opts.hdr_white && v != &opts.hdr_peak && v != &opts.hdr_contrast) || opts.hdr != 0"):
-        if call not in shown:
-            raise SystemExit("row_shown: %s is not there (a row for what is not available here, or HDR's levels with HDR "
-                             "off, would show)" % call)
+    for value, call in (("&opts.reflex", "reflex_available()"), ("&opts.antilag", "antilag_available()"),
+                        ("&opts.hdr_white", "opts.hdr != 0"), ("&opts.hdr_peak", "opts.hdr != 0"),
+                        ("&opts.hdr_contrast", "opts.hdr != 0")):
+        if call not in rows.get(value, {}).get("shown", ""):
+            raise SystemExit("the %s row's shown() does not ask %s (a row for what is not available here, or HDR's levels "
+                             "with HDR off, would show)" % (value, call))
     if "Not available here" in menu:
         raise SystemExit("vk_menu.cpp: a row still says Not available here: hide it in row_shown instead")
-    fixed = function(menu, "bool row_fixed(")
+    fixed = function(menu, "bool row_fixed(") + "".join(rows.get(v, {}).get("locked", "") for v in ("&opts.reflex", "&opts.antilag"))
     if "reflex_available()" in fixed or "antilag_available()" in fixed:
         raise SystemExit("row_fixed: Reflex or Anti-Lag 2 is fixed where it does not run, when row_shown hides it")
     # every place that walks a tab's rows asks row_shown, so the keys, the pad, the mouse, the scrolling and the help all
@@ -84,9 +107,13 @@ def main():
     # the help: a row's own, then a line for the value chosen (Row::hint). The Upscaler's says why DLSS is not offered, and
     # DLSS's values ask for more Sharpness (it looks softer than the game's own)
     upscaler = function(menu, "const char* hn_upscaler(int v, int variant) {")
+    # (DLSS's reasons are dlss_why_text's, which Frame generation by says too: hn_upscaler names them through it)
+    if "dlss_why_text(d)" not in upscaler:
+        raise SystemExit("hn_upscaler: the help no longer says why DLSS is not offered (dlss_why_text)")
+    reasons = function(menu, "const char* dlss_why_text(int why) {") + upscaler
     for why in ("not in this build", "RX_VK_DLSS=0", "NVIDIA RTX GPU", "newer NVIDIA driver", "runtime was not found",
                 "(int)dlss_why()", "RX_VK_FSR4=0", "AMD's files were not found", "no FSR 4 for this GPU", "(int)fsr4_why()"):
-        if why not in upscaler:
+        if why not in reasons:
             raise SystemExit("hn_upscaler: the help no longer says why DLSS or FSR is not offered (%s)" % why)
     if upscaler.count("Sharpness to") < 2:
         raise SystemExit("hn_upscaler: NVIDIA DLSS and DLAA do not say to set Sharpness to around 80%")
@@ -108,7 +135,7 @@ def main():
     # the Window scaling filter's sizes: only from the game's frames. The start-up screen is drawn at the window's size
     # (present_image with no source): taken as the picture's, the row read "Not needed" while the output was another size
     replay = (ROOT / "gpu" / "vk" / "vk_replay.cpp").read_text(encoding="utf-8")
-    present = function(replay, "void present_image(")
+    present = function(replay, "void present_image_with_trial(VkImage src, uint32_t sw, uint32_t sh, const int crop[4], VkImageView view, bool source_srgb, bool allow_scale, OutputTrialSource trial) {")
     note = present.index("menu_note_present_sizes(")
     if "if (src) {" not in present[:note] or present.rindex("if (src) {", 0, note) < present.rindex("\n    }", 0, note):
         raise SystemExit("present_image: the start-up screen's frames (no src) count as the game's picture for the filter row")
@@ -118,6 +145,15 @@ def main():
         raise SystemExit("vk_dlss.cpp: DLSS's feature is not made again for another DLSS model")
     if "upscaler_rows::dlss_preset(opts.dlss_model" not in function(dlss, "unsigned wanted_preset() {"):
         raise SystemExit("vk_dlss.cpp: the DLSS model row (and RX_VK_DLSS_PRESET over it) is not the preset asked for")
+    # (the K row's CNN preset E on a card under 7 GB: DLSS, the row's text, its help and the bug report by the one rule,
+    # upscaler_rows.h cnn_for_vram, checked by behaviour in test_upscaler_rows.cpp)
+    if "upscaler_rows::dlss_preset(opts.dlss_model, env, device_vram_bytes())" not in block(dlss, "unsigned wanted_preset() {"):
+        raise SystemExit("vk_dlss.cpp wanted_preset: the card's memory is not given to dlss_preset (no CNN preset E under 7 GB)")
+    for name in ("const char* tx_dlss_model(int v) {", "const char* hn_dlss_model(int v, int variant) {",
+                 "bool report_default_depends_on_pc(const Row& r) {"):
+        if "ur::cnn_for_vram(" not in block(menu, name) or "device_vram_bytes()" not in block(menu, name):
+            raise SystemExit("vk_menu.cpp %s: a card under 7 GB is not shown the CNN preset E that DLSS draws with"
+                             % name.split("(")[0].split()[-1])
     temporal = (ROOT / "gpu" / "vk" / "vk_temporal.cpp").read_text(encoding="utf-8")
     mode = function(temporal, "int temporal_mode() {")
     if "dlss_why() != DLSS_OK" not in mode or "fsr4_why() != FSR_OK" not in mode:
@@ -140,9 +176,12 @@ def main():
     if "fsr3_engine()" not in function(temporal, "Engine& engine_of("):
         raise SystemExit("engine_of has no slot for FSR 3.1's engine")
     # The chain's depth is reversed for FSR 3.1 (the prep's bit 3, from fsr_flip): the frame says so, for whatever else reads it
-    upscale = function(temporal, "bool temporal_upscale(")
-    if "(fsr_flip ? 8 : 0)" not in upscale or "f.depth_reversed = fsr_flip;" not in upscale:
-        raise SystemExit("temporal_upscale reverses the depth without saying so in the frame (TemporalFrame::depth_reversed)")
+    # (the engine's draw is draw_engine's, which temporal_upscale calls)
+    if "return draw_engine(" not in function(temporal, "bool temporal_upscale("):
+        raise SystemExit("temporal_upscale does not draw its engine through draw_engine")
+    engine = function(temporal, "bool draw_engine(")
+    if "(fsr_flip ? 8 : 0)" not in engine or "f.depth_reversed = fsr_flip;" not in engine:
+        raise SystemExit("draw_engine reverses the depth without saying so in the frame (TemporalFrame::depth_reversed)")
     # DLSS Frame Generation (NGX) copies the chain's depth: it must hand NGX the depth convention the frame says
     dlss = (ROOT / "gpu" / "vk" / "vk_dlss.cpp").read_text(encoding="utf-8")
     if "g.depth_reversed = f.depth_reversed;" not in dlss or "o.depthInverted = g.depth_reversed;" not in dlss:
@@ -166,7 +205,10 @@ def main():
     upscale = function(temporal, "bool temporal_upscale(")
     if "temporal_off() && stretch(" not in upscale:
         raise SystemExit("temporal_upscale: the Upscaler's Off does not stretch in place of the game's network")
-    stretch = function(temporal, "bool stretch(")
+    # (its recording is stretch_record's, which DLAA before the bloom shares)
+    stretch = function(temporal, "bool stretch(") + function(temporal, "bool stretch_record(")
+    if "stretch_record(cmd, in_view, out, out_view, ow, oh)" not in function(temporal, "bool stretch("):
+        raise SystemExit("stretch does not record through stretch_record")
     for need in ("s.linear, in_view", "s.out_layout", "c.valid", "in->width != c.width",
                  "!temporal_colour_pair(in->format, out->format)", "rgba ? s.stretch_rgba : s.out"):
         if need not in stretch:
@@ -174,7 +216,8 @@ def main():
     if "!temporal_wanted() && !temporal_off()" not in function(temporal, "void temporal_note_scene_draw("):
         raise SystemExit("temporal_note_scene_draw: no scene camera with Off, so the fixed shares' networks are never stretched")
     draw = (ROOT / "gpu" / "vk" / "vk_draw.cpp").read_text(encoding="utf-8")
-    if "(!temporal_wanted() && !temporal_off())" not in function(draw, "bool temporal_stand_in("):
+    # (and with no engine, frame generation's inputs alone: temporal_fg_inputs)
+    if "(!temporal_wanted() && !temporal_off() && !temporal_fg_inputs())" not in function(draw, "bool temporal_stand_in("):
         raise SystemExit("temporal_stand_in: the game's network runs with Off")
     if "(temporal_wanted() || temporal_off() || fsr3_inputs::wanted()) && temporal_rejected_network(" not in function(draw, "bool upscale_stub("):
         raise SystemExit("upscale_stub: a network that did not translate is not stretched with Off, or not offered to FSR 3.1")
@@ -184,7 +227,8 @@ def main():
         raise SystemExit("temporal_rejected_network: FSR 3.1 is not offered a network that did not translate (before the "
                          "temporal upscaler, as fsr3_stand_in comes before temporal_stand_in): its fixed Render resolution "
                          "steps are a plain stretch on cards that leave those networks out (issue #1829)")
-    if "upscalers_available()" not in function(menu, "void set_row(") or "upscalers_available()" not in function(menu, "bool row_fixed("):
+    # (fixed by the Upscaler row's own locked(), which row_fixed asks: checked above)
+    if "upscalers_available()" not in function(menu, "void set_row(") or "upscalers_available()" not in rows["&opts.dlss"]["locked"]:
         raise SystemExit("the Upscaler row does not step over (or fix on) what runs here")
     with tempfile.TemporaryDirectory(prefix="upscaler-rows-") as tmp:
         exe = Path(tmp) / "upscaler-rows"

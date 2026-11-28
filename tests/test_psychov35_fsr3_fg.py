@@ -39,7 +39,7 @@ def main():
  fg=1;tone=true;assert(colour_pair(97,97)==enabled);assert(colour_pair(122,122));
  assert(!colour_pair(97,122) && !colour_pair(122,97) && !colour_pair(44,44));
  tone=false;assert(!colour_pair(97,97));tone=true;fg=0;assert(!colour_pair(97,97));
- fg=1;for(int multiplier:{0,1,3,8}){opts.framegen=multiplier;assert(!colour_pair(97,97));}
+ fg=1;for(int multiplier:{0,1,3,8}){opts.framegen=multiplier;assert(colour_pair(97,97)==enabled);}
 '''
     if 'void colour_constants(' in fi:
         color = '\n'.join(block(fi, s)+';' for s in ['struct Constants {', 'struct OfConstants {'])
@@ -49,8 +49,10 @@ def main():
         color += '\n'+block(fi, 'void colour_constants(')
         start = fi.index('    const float max_luminance = in.native_pq')
         end = fi.index('    const int32_t rw =', start)
-        color += '\nstruct {bool first_frame=true,native_pq=false;float max_luminance=1;uint64_t sequence=0;} g;\n'
-        color += 'struct Input {bool reset=false,native_pq=false;float max_luminance=1;uint64_t sequence=1;};\n'
+        # (present: a HUD-less colour of the frame, Inputs::present; VK_NULL_HANDLE when the frame has its HUD)
+        color += '\n#define VK_NULL_HANDLE nullptr\n'
+        color += 'struct {bool first_frame=true,native_pq=false,hudless=false;float max_luminance=1;uint64_t sequence=0;} g;\n'
+        color += 'struct Input {bool reset=false,native_pq=false;float max_luminance=1;uint64_t sequence=1;const void* present=nullptr;};\n'
         color += 'bool reset_for(const Input& in){'+fi[start:end]+'return reset;}\n'
         begin = fi.index('    if (in.native_pq &&')
         finish = fi.index('    if (!prepare(', begin)
@@ -77,7 +79,11 @@ void color_cases(){
  ++in.sequence;assert(!reset_for(in));++in.sequence;in.max_luminance=4000;assert(reset_for(in));
  ++in.sequence;assert(!reset_for(in));++in.sequence;in.native_pq=false;assert(reset_for(in));
  ++in.sequence;in.max_luminance=7000;assert(!reset_for(in)); // SDR ignores HDR peak.
- in.sequence+=2;assert(reset_for(in));++in.sequence;in.reset=true;assert(reset_for(in));
+ in.sequence+=2;assert(reset_for(in));
+ // (a HUD-less source after one with the HUD, and back: not the same kind of colour)
+ ++in.sequence;in.present=&in;assert(reset_for(in));++in.sequence;assert(!reset_for(in));
+ ++in.sequence;in.present=nullptr;assert(reset_for(in));++in.sequence;assert(!reset_for(in));
+ ++in.sequence;in.reset=true;assert(reset_for(in));
 }
 '''
     else:
@@ -131,7 +137,7 @@ int main(int argc,char**){
         subprocess.run([str(exe), 'enabled'], check=True)
         subprocess.run([str(exe)], check=True)
     if 'void colour_constants(' in fi:
-        generate = block(fi, 'bool generate(')
+        generate = block(fi, 'uint32_t generate(')
         assert 'colour_constants(k, of, in.native_pq, max_luminance);' in generate
         assert generate.index('colour_constants(k, of,') < generate.index('// This evaluation owns its constants')
     print('FSR FG: actual camera admission, both SDK colour blocks and encoding/peak/sequence resets pass')

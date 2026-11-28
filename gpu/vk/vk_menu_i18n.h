@@ -5,6 +5,8 @@
 #pragma once
 
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace mkwvk::i18n {
 
@@ -22,7 +24,7 @@ const char* lang_name(int index);
 /// menu's Auto follows it until the next start
 const std::string& game_language();
 
-/// The game's languages, as nx2/make_game.py LANGUAGES lists them (language.txt's codes), each by its own name
+/// The game's languages, as longshot-builder LANGUAGES lists them (language.txt's codes), each by its own name
 int game_lang_count();
 const char* game_lang_code(int index);
 const char* game_lang_name(int index);
@@ -32,6 +34,10 @@ int game_lang_index();
 /// language.txt's code line set to that language (its comments kept): the game reads it at its next start. False when the
 /// file could not be written (it is then as it was). The menu's Auto stays on game_language() until the restart
 bool set_game_language(int index);
+/// The languages' names the Game language and Menu language rows showed (game_lang_name, lang_name) since the last call, as
+/// {code, name}: those with letters past Latin (Русский, 日本語, 한국어, 简体中文 ...), each once. vk_imgui.cpp merges in a font
+/// of their letters when the menu's fonts lack them, whatever language the menu is in
+std::vector<std::pair<std::string, std::string>> names_shown_since();
 
 /// A text as the menu shows it: s itself in English or when the table lacks it, else its translation. A text made from one
 /// of the table's printf formats ("%d of %d") is translated through it. The pointer stays good for the process's life

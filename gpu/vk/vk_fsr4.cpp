@@ -18,6 +18,9 @@
 #include "vk_internal.h"
 #include "vk_temporal.h"
 
+#include "fsr4_models.h"
+#include "compat/longshot_env.h"
+
 #ifdef LONGSHOT_FSR
 #include <chrono>
 #include <condition_variable>
@@ -36,8 +39,11 @@
 #endif
 
 #include "fsr4_tune.h"
+#include "menu/output.h"
+#include "upscaler_rows.h"
 #include "spirv_unroll.h"
 #include "vk_gprof.h"
+#include "vk_menu.h"
 #include "vk_paths.h"
 #include "vk_texture.h"
 
@@ -51,8 +57,12 @@
 namespace mkwvk {
 
 extern std::atomic<bool> present_native_pq;   // (vk_replay.cpp do_present: the game presents its own HDR10 picture, Native)
-VkResult shared_compute_pipeline(const VkComputePipelineCreateInfo* ci, VkPipeline* out);   // (vk_draw.cpp: through the pipeline cache kept across runs)
-void pipeline_cache_save_play();   // (vk_draw.cpp)
+// (vk_draw.cpp: a pipeline cache of FSR 4's own in cache/, apart from the translator's files; a pipeline built through it)
+VkPipelineCache own_pipeline_cache(const char* name, size_t* read, bool* refused);
+bool own_pipeline_cache_save(VkPipelineCache cache, const char* name, size_t* saved);
+VkResult own_cache_compute_pipeline(VkPipelineCache cache, const VkComputePipelineCreateInfo* ci, VkPipeline* out);
+VkResult own_cache_sdk_pipelines(PFN_vkCreateComputePipelines create, VkDevice device, VkPipelineCache cache, uint32_t count,
+                                 const VkComputePipelineCreateInfo* infos, const VkAllocationCallbacks* allocator, VkPipeline* pipelines);
 
 namespace {
 int env_switch(const char* name) {   // (-1: unset)
@@ -61,6 +71,13 @@ int env_switch(const char* name) {   // (-1: unset)
 }
 // (what is known of FSR on this device: -1 not yet, else an FsrWhy. Set when AMD's library has been asked)
 std::atomic<int> g_why{-1};
+// (the menu's live value, the env switch's fallback; the hook's selection is set from this before each context)
+std::atomic<int> g_model{FSR4_MODEL_AUTO};
+std::atomic<bool> g_lite_available{false};
+std::atomic<bool> g_lite_failed{false};
+// (AMD's library lists no FSR 4 for this GPU and the hooked Lite provider stands in: every context is Lite's, whatever
+// the row says, and there is nothing to choose. RX_VK_FSR4_STANDIN=0: FSR 4 is not offered there, as before)
+std::atomic<bool> g_standin{false};
 }  // namespace
 
 FsrWhy fsr4_why() {
@@ -69,6 +86,31 @@ FsrWhy fsr4_why() {
     if (env_off) return FSR_ENV_OFF;
     const int w = g_why.load(std::memory_order_relaxed);
     return w < 0 ? FSR_OK : (FsrWhy)w;
+}
+
+int fsr4_model_env() {
+    static const int env = [] {
+        const char* e = getenv("RX_VK_FSR4_MODEL");
+        const int v = fsr4_models::parse_model_env(e);
+        if (e && *e && v < 0) logf("vk: AMD FSR 4: RX_VK_FSR4_MODEL=%s is not auto|lite; using Auto", e);
+        return e && *e && v < 0 ? (int)FSR4_MODEL_AUTO : v;
+    }();
+    return env;
+}
+
+Fsr4Model fsr4_model() {
+    if (!fsr4_built()) return FSR4_MODEL_AUTO;
+    const int env = fsr4_model_env();
+    if (env >= 0) return (Fsr4Model)env;
+    return (Fsr4Model)g_model.load(std::memory_order_relaxed);
+}
+
+bool fsr4_lite_available() {
+    return fsr4_built() && g_lite_available.load(std::memory_order_relaxed);
+}
+
+void fsr4_set_model(Fsr4Model model) {
+    g_model.store((int)model, std::memory_order_relaxed);
 }
 
 #ifdef LONGSHOT_FSR
@@ -113,10 +155,14 @@ struct Context {
     ffxContext context = nullptr;
     uint32_t width = 0, height = 0;   // (its output, which is also the most the render size can be)
     uint64_t memory = 0;              // (what AMD's library says it holds)
+    bool memory_known = false;
     // (made for the game's native HDR (present_native_pq): its scene colour goes past 1 there, and the LDR context, given
     // the colour clamped to 1, cut every highlight at the paper white. Then it takes linear light, HDR, with AMD's own
     // exposure, and the chain does not clamp it: hdr())
     bool hdr = false;
+    Fsr4Model model = FSR4_MODEL_AUTO;      // (the requested model: the context key)
+    Fsr4Model effective = FSR4_MODEL_AUTO;  // (what AMD made: Auto when Lite fell back)
+    bool tuned = false;
     ~Context() {
         if (context) lib().destroy(&context, nullptr);
     }
@@ -129,6 +175,7 @@ struct State {
     std::chrono::steady_clock::time_point last{};
     uint64_t evals = 0;
     int told_resets = 0;
+    bool retry_evaluation = false;
 };
 State& st() {
     static State& s = *new State;   // (never destroyed: lib()'s note)
@@ -145,15 +192,8 @@ void on_message(uint32_t type, const wchar_t* message) {
 std::vector<std::string> library_dirs() {
     std::vector<std::string> d;
     if (const char* e = getenv("RX_VK_FSR_DIR"); e && *e) d.emplace_back(e);
-    char exe[MAX_PATH];
-    DWORD n = GetModuleFileNameA(nullptr, exe, MAX_PATH);
-    if (n && n < MAX_PATH) {
-        std::string s(exe, n);
-        d.push_back(s.substr(0, s.find_last_of("\\/")));
-    }
-    n = game_module_path(exe, MAX_PATH);
-    if (n && n < MAX_PATH) {
-        std::string s(exe, n);
+    if (const std::string s = exe_module_string(); !s.empty()) d.push_back(s.substr(0, s.find_last_of("\\/")));
+    if (std::string s = game_module_string(); !s.empty()) {
         s = s.substr(0, s.find_last_of("\\/"));
         if (d.empty() || d.back() != s) d.push_back(s);
     }
@@ -168,6 +208,35 @@ void* symbol(const char* name) {
 #endif
 }
 
+#ifdef _WIN32
+/// The upscaler library beside the loader in `dir`, when its file is one whose layout is known (fsr4_models::load_known:
+/// its SHA-256), with what the scan found in it. Before the loader is asked anything, so the loader's own load of that
+/// name finds this module.
+fsr4_models::KnownModule probe_models(const std::string& dir) {
+    const auto t0 = std::chrono::steady_clock::now();
+    fsr4_models::KnownModule known = fsr4_models::load_known(dir);
+    const double scan_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    logf("vk: AMD FSR 4: models: GPU %s (vendor 0x%04x, device 0x%04x)",
+         dev.props.deviceName, dev.props.vendorID, dev.props.deviceID);
+    logf("vk: AMD FSR 4: models: %s (%.1f ms)", known.note.c_str(), scan_ms);
+    if (!known.library) return known;
+    const auto& m = known.scan;
+    if (m.result.providers.empty()) {
+        logf("vk: AMD FSR 4: models: %s: %s", m.name.c_str(), m.result.reason && *m.result.reason ? m.result.reason : "no providers");
+        return known;
+    }
+    logf("vk: AMD FSR 4: models: %s at %p (%zu bytes): %zu provider(s), shape %s, Lite %s, registry %s",
+         m.name.c_str(), (void*)m.base, m.size, m.result.providers.size(),
+         m.result.shape_ok ? "ok" : "not understood", m.result.lite_present ? "yes" : "no",
+         m.result.registry_found ? "found" : "not found");
+    for (const auto& p : m.result.providers)
+        logf("vk: AMD FSR 4: models: %s (%s) vtable %p IsSupported %p instance %p",
+             fsr4_models::model_name(p.model), p.class_name ? p.class_name : "?",
+             (void*)p.vtable, (void*)p.is_supported, p.instance);
+    return known;
+}
+#endif
+
 /// AMD's passes tuned as the library makes them (fsr4_tune.h: measured gains, outputs bit for bit AMD's on Adrenalin 26.10.1):
 /// the device functions it is handed are ours where it makes and destroys buffers, layouts, shader modules and compute
 /// pipelines, writes descriptors and records binds and dispatches. At once: the network's layers 64 lanes wide, and the
@@ -175,7 +244,7 @@ void* symbol(const char* name) {
 /// buffer instead. Later: the smaller layers with their loops unrolled from the library's own code (spirv_unroll.h, its
 /// weights then constants in the code), built one at a time on a thread of their own and bound in place of the library's once
 /// made (about a minute each the first time, the pipeline cache after). On an RX 6700 XT at 720p -> 1440p: 8.97 ms -> 4.04 ms.
-/// RX_VK_FSR4_TUNE=0: as AMD made them; RX_VK_FSR4_UNROLL=0: no unrolled layers. On AMD's GPUs only.
+/// RX_VK_FSR4_TUNE=0: as AMD made them. On AMD's GPUs only.
 /// The tail is kept per buffer: a pipeline reads it only in the buffer it was rewritten against, while that buffer lives and
 /// every binding of it seen takes the tail in (offset 0, the whole buffer). Otherwise (the buffer destroyed, a binding that
 /// leaves the tail out, or none seen through the functions watched here) AMD's own shader is built and bound in its place,
@@ -266,7 +335,13 @@ struct TailPipe {
 };
 std::unordered_map<VkPipeline, TailPipe> tail_pipes;
 std::atomic<int> tail_count{0};
-std::unordered_map<VkCommandBuffer, VkPipeline> bound;   // (the library's pipeline as it bound it)
+/// (a command buffer's last compute bind: the library's pipeline, and whether its unrolled one was bound in its place.
+/// cmd_dispatch goes by what was bound: a job may publish the unrolled one between the bind and the dispatch)
+struct Bind {
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    bool unrolled = false;
+};
+std::unordered_map<VkCommandBuffer, Bind> bound;
 int layers64 = 0;
 
 // (the unrolled pipelines: made by jobs, bound in the library's place; a job whose pipeline was destroyed meanwhile drops
@@ -287,17 +362,17 @@ Jobs& jobs() {
     return j;
 }
 std::atomic<bool> closing{false};   // (the window closed: no job starts, the one building leaves what it made)
+std::atomic<bool> suppressed{false};   // (the new context is built with AMD's shaders: the create hooks pass through)
 constexpr size_t kUnrollWords = 120000;              // (a layer unrolled to more than this is left rolled)
 constexpr uint64_t kBuildHeadroom = 8ull << 30;     // (memory to spare before a build starts)
 
 bool on() {
-    static const bool v = env_switch("RX_VK_FSR4_TUNE") != 0 && dev.props.vendorID == 0x1002;
+    static const bool v = dev.policy.fsr4_tune;   // (device_policy.h: AMD's GPUs, unless the switch says off)
     return v;
 }
-bool unroll_on() {
-    static const bool v = env_switch("RX_VK_FSR4_UNROLL") != 0;
-    return v;
-}
+/// The context being made is not tuned (forced Lite on a full-model card): create_buffer, create_shader_module and
+/// create_compute_pipelines pass through. cmd_dispatch is not gated: an older Auto context's tail is still served
+void suppress(bool on) { suppressed.store(on, std::memory_order_relaxed); }
 /// What the system can still commit: Windows' commit charge left (RAM and page file), Linux's available memory and free swap.
 /// True when unknown
 bool build_headroom(uint64_t* avail) {
@@ -333,6 +408,7 @@ void forget_locked(VkBuffer b) {
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL create_buffer(VkDevice d, const VkBufferCreateInfo* ci, const VkAllocationCallbacks* a, VkBuffer* b) {
+    if (suppressed.load(std::memory_order_relaxed)) return real_cb(d, ci, a, b);
     VkBufferCreateInfo c = *ci;
     const bool grow = (ci->usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) && ci->size > (64ull << 20);
     // (the tail is written with vkCmdUpdateBuffer: its buffer a transfer's destination, whatever the library asked)
@@ -534,6 +610,7 @@ bool make_layout(VkDevice d, const LayoutCopy& lc, VkPipelineLayout* layout, std
 
 VKAPI_ATTR VkResult VKAPI_CALL create_shader_module(VkDevice d, const VkShaderModuleCreateInfo* ci, const VkAllocationCallbacks* a,
                                                    VkShaderModule* m) {
+    if (suppressed.load(std::memory_order_relaxed)) return real_csm(d, ci, a, m);
     const uint32_t* code = ci->pCode;
     const size_t words = ci->codeSize / 4;
     const std::string entry = fsr4_tune::entry_name(code, words);
@@ -610,6 +687,33 @@ VkPipeline make_plain(const Plain& p) {
     return made;
 }
 
+/// The unrolled layers' pipeline cache (cache/longshot_fsr4_pipelines.bin): kept apart from the translator's pipeline cache,
+/// whose files a new translator drops (pcache_stamp.h), so that an update keeps them: the launcher moves cache/ into the new
+/// build's folder whole. Before it, an update that changed the translator built them cold again at its first FSR 4 frame, about 50
+/// s and 3 GB of memory each on an RX 6700 XT. Made at the first build; written after a layer's build when its data grew: the
+/// driver may hand a layer over at once from its own disk cache, which a game folder of another path (an update's) does not
+/// share, so a quick build is no sign that the file holds it
+constexpr const char* kOwnCacheFile = "longshot_fsr4_pipelines.bin";
+std::mutex own_cache_save_mu;
+size_t own_cache_saved = 0;   // (the bytes last read or written: own_cache, build_unrolled)
+VkPipelineCache own_cache() {
+    static std::mutex m;
+    static VkPipelineCache cache = VK_NULL_HANDLE;
+    static bool made = false;
+    std::lock_guard lk(m);
+    if (made) return cache;
+    made = true;
+    size_t read = 0;
+    bool refused = false;
+    cache = own_pipeline_cache(kOwnCacheFile, &read, &refused);
+    own_cache_saved = read;
+    logf("vk: AMD FSR 4: the unrolled layers' pipeline cache: %s", read ? "read" : refused ? "made by another driver or GPU: starts empty" : "starts empty");
+    return cache;
+}
+bool save_own_cache() {
+    std::lock_guard lk(own_cache_save_mu);
+    return own_pipeline_cache_save(own_cache(), kOwnCacheFile, &own_cache_saved);
+}
 /// A job: the layer unrolled and built with copies of its layouts; bound in the library's pipeline's place when made. Its
 /// thread counted in jobs().running from before it starts (fsr4_close waits for it)
 void build_unrolled(VkPipeline original, std::shared_ptr<const std::vector<uint32_t>> code, std::string name, VkComputePipelineCreateInfo ci,
@@ -640,12 +744,8 @@ void build_unrolled(VkPipeline original, std::shared_ptr<const std::vector<uint3
     int left = -1;
     const bool ok = spirv_unroll::unroll_all(code->data(), code->size(), unrolled, kUnrollWords, 64, &left) && left == 0;
     VkPipeline made = VK_NULL_HANDLE;
-    uint64_t avail = 0;
-    const bool room = ok && !closing && build_headroom(&avail);
-    if (ok && !room && !closing)
-        logf("vk: AMD FSR 4: %s: not unrolled now: %llu MB of memory to spare, %llu wanted (the next start tries again)",
-             name.c_str(), (unsigned long long)(avail >> 20), (unsigned long long)(kBuildHeadroom >> 20));
-    if (room) {
+    bool cached = false;   // (taken from the cache, not compiled)
+    if (ok && !closing) {
         VkShaderModuleCreateInfo mci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         mci.codeSize = unrolled.size() * 4, mci.pCode = unrolled.data();
         VkShaderModule module = VK_NULL_HANDLE;
@@ -656,13 +756,38 @@ void build_unrolled(VkPipeline original, std::shared_ptr<const std::vector<uint3
             ci.stage.pSpecializationInfo = nullptr;   // (only layers without one are taken)
             ci.basePipelineHandle = VK_NULL_HANDLE, ci.basePipelineIndex = -1;
             ci.flags &= ~(VkPipelineCreateFlags)VK_PIPELINE_CREATE_DERIVATIVE_BIT;
-            // (through the pipeline cache kept across runs, as FSR 3.1's: built once, loaded after. A failure is not tried again:
-            // the library's pipeline stays)
-            const VkResult rr = shared_compute_pipeline(&ci, &made);
+            // (through its own pipeline cache, kept across runs and updates: built once, loaded after. Asked of the caches
+            // first, with no compile: a layer built before costs nothing then, and the memory a compile wants is not asked
+            // for it. Before, a PC with less than kBuildHeadroom to spare at the first FSR 4 frame (a 16 GB one, often) ran
+            // without the unrolled layers even when their pipelines were in the caches. A failure is not tried again: the
+            // library's pipeline stays)
+            VkResult rr = VK_PIPELINE_COMPILE_REQUIRED;
+            if (dev.vk13.pipelineCreationCacheControl) {
+                VkComputePipelineCreateInfo ask = ci;
+                ask.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+                rr = own_cache_compute_pipeline(own_cache(), &ask, &made);
+                cached = rr == VK_SUCCESS && made;
+                if (!cached) made = VK_NULL_HANDLE, rr = VK_PIPELINE_COMPILE_REQUIRED;
+            }
+            uint64_t avail = 0;
+            if (!cached && !closing) {
+                if (build_headroom(&avail)) {
+                    rr = own_cache_compute_pipeline(own_cache(), &ci, &made);
+                } else {
+                    logf("vk: AMD FSR 4: %s: not unrolled now: %llu MB of memory to spare, %llu wanted (the next start tries again)",
+                         name.c_str(), (unsigned long long)(avail >> 20), (unsigned long long)(kBuildHeadroom >> 20));
+                    rr = VK_PIPELINE_COMPILE_REQUIRED;
+                }
+            }
             // (the window closed while the driver built it: fsr4_close may have stopped waiting, and the process be ending.
-            // Nothing more is touched; the pipeline cache's save at the close has what the driver made)
+            // Nothing more is touched, its cache not written either: the next start finds it in the driver's own disk cache, or
+            // builds it again, and writes the file then)
             if (closing) return;
-            if (rr != VK_SUCCESS) made = VK_NULL_HANDLE, logf("vk: AMD FSR 4: %s: its unrolled pipeline was not built (%d): AMD's stays", name.c_str(), (int)rr);
+            if (rr != VK_SUCCESS) {
+                made = VK_NULL_HANDLE;
+                if (rr != VK_PIPELINE_COMPILE_REQUIRED)
+                    logf("vk: AMD FSR 4: %s: its unrolled pipeline was not built (%d): AMD's stays", name.c_str(), (int)rr);
+            }
             real_dsm(dev.device, module, nullptr);
         }
     }
@@ -681,9 +806,10 @@ void build_unrolled(VkPipeline original, std::shared_ptr<const std::vector<uint3
         }
     }
     // (each one kept as soon as it is built, whether or not the game closes normally: a build of a minute is not done again)
-    if (made && s > 1.0) pipeline_cache_save_play();
-    if (made) logf("vk: AMD FSR 4: tuned %s: its loops unrolled (%zu -> %zu words), bound in its place from now (%.1f s to build)",
-                   name.c_str(), code->size(), unrolled.size(), s);
+    if (made && !save_own_cache())
+        logf("vk: AMD FSR 4: %s: its unrolled pipeline could not be saved (the next start builds it again)", name.c_str());
+    if (made) logf("vk: AMD FSR 4: tuned %s: its loops unrolled (%zu -> %zu words), bound in its place from now (%.1f s %s)",
+                   name.c_str(), code->size(), unrolled.size(), s, cached ? "from the caches" : "to build");
     else if (!ok) logf("vk: AMD FSR 4: %s left rolled (%d loops kept: unrolled whole it would pass %zu words, or they cannot be)",
                        name.c_str(), left, kUnrollWords);
 }
@@ -691,6 +817,7 @@ void build_unrolled(VkPipeline original, std::shared_ptr<const std::vector<uint3
 VKAPI_ATTR VkResult VKAPI_CALL create_compute_pipelines(VkDevice d, VkPipelineCache cache, uint32_t n,
                                                        const VkComputePipelineCreateInfo* ci, const VkAllocationCallbacks* a,
                                                        VkPipeline* p) {
+    if (suppressed.load(std::memory_order_relaxed)) return real_ccp(d, cache, n, ci, a, p);
     std::vector<VkComputePipelineCreateInfo> v(ci, ci + n);
     std::vector<VkPipelineShaderStageRequiredSubgroupSizeCreateInfo> lanes(n);
     std::vector<uint8_t> kind(n, 0);
@@ -744,7 +871,10 @@ VKAPI_ATTR VkResult VKAPI_CALL create_compute_pipelines(VkDevice d, VkPipelineCa
             layers64++;
         }
     }
-    const VkResult r = real_ccp(d, cache, n, v.data(), a, p);
+    // Keep the SDK's ordinary pipelines in the same cache as the optimized variants.
+    const VkPipelineCache pipeline_cache = cache ? cache : own_cache();
+    const VkResult r = own_cache_sdk_pipelines(real_ccp, d, pipeline_cache, n, v.data(), a, p);
+    if (r == VK_ERROR_DEVICE_LOST) device_lost("FSR 4 pipeline creation");
     for (VkShaderModule m : own)
         if (m) real_dsm(d, m, nullptr);
     if (r != VK_SUCCESS) return r;
@@ -759,7 +889,7 @@ VKAPI_ATTR VkResult VKAPI_CALL create_compute_pipelines(VkDevice d, VkPipelineCa
         // (a layer with weight tables, from the library's own code: unrolled, its weights become constants in the code, which
         // is where the gain is. One without tables gains nothing: pass 3, 0.07 ms either way. Only one whose creation carried
         // nothing else: no specialization, no other structures)
-        if (!(kind[i] & 1) || !(kind[i] & 2) || !unroll_on() || closing || ci[i].stage.pSpecializationInfo || lanes[i].pNext || ci[i].pNext) continue;
+        if (!(kind[i] & 1) || !(kind[i] & 2) || closing || ci[i].stage.pSpecializationInfo || lanes[i].pNext || ci[i].pNext) continue;
         // (copies of its layouts, made now while the library's are alive: identically defined, so compatible with its sets)
         LayoutCopy lc;
         VkPipelineLayout layout = VK_NULL_HANDLE;
@@ -793,8 +923,8 @@ VKAPI_ATTR void VKAPI_CALL cmd_bind_pipeline(VkCommandBuffer cb, VkPipelineBindP
     if (bp == VK_PIPELINE_BIND_POINT_COMPUTE && (tail_count.load(std::memory_order_relaxed) || better_count.load(std::memory_order_relaxed))) {
         std::lock_guard lk(mu);
         if (bound.size() > 256) bound.clear();   // (command buffers of the renderer's, made and freed: only the last bind matters)
-        bound[cb] = pl;
         auto b = better.find(pl);
+        bound[cb] = {pl, b != better.end()};
         if (b != better.end()) pl = b->second;
     }
     real_bind(cb, bp, pl);
@@ -809,8 +939,8 @@ VKAPI_ATTR void VKAPI_CALL cmd_dispatch(VkCommandBuffer cb, uint32_t x, uint32_t
         {
             std::lock_guard lk(mu);
             auto b = bound.find(cb);
-            auto t = b == bound.end() ? tail_pipes.end() : tail_pipes.find(b->second);
-            if (t != tail_pipes.end() && !better.count(b->second)) {
+            auto t = b == bound.end() ? tail_pipes.end() : tail_pipes.find(b->second.pipeline);
+            if (t != tail_pipes.end() && !b->second.unrolled) {
                 auto g = bigs.find(t->second.gen);
                 if (g != bigs.end() && g->second.bound == 1) {
                     Big& big = g->second;
@@ -830,7 +960,7 @@ VKAPI_ATTR void VKAPI_CALL cmd_dispatch(VkCommandBuffer cb, uint32_t x, uint32_t
                                              : g->second.bound == 0 ? "its storage buffer was not seen bound (a way of binding not checked here)"
                                                                     : "its storage buffer is bound without the tail");
                     if (t->second.twin) use = t->second.twin;
-                    else if (!t->second.twin_failed) make = t->second.plain, original = b->second;
+                    else if (!t->second.twin_failed) make = t->second.plain, original = b->second.pipeline;
                 }
             }
         }
@@ -855,28 +985,38 @@ VKAPI_ATTR void VKAPI_CALL cmd_dispatch(VkCommandBuffer cb, uint32_t x, uint32_t
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL device_proc(VkDevice d, const char* name) {
     PFN_vkVoidFunction f = vkGetDeviceProcAddr(d, name);
     if (!f || !name) return f;
-    if (!strcmp(name, "vkCreateBuffer")) return real_cb = (PFN_vkCreateBuffer)f, (PFN_vkVoidFunction)&create_buffer;
-    if (!strcmp(name, "vkDestroyBuffer")) return real_db = (PFN_vkDestroyBuffer)f, (PFN_vkVoidFunction)&destroy_buffer;
-    if (!strcmp(name, "vkGetBufferDeviceAddress")) return real_bda = (PFN_vkGetBufferDeviceAddress)f, (PFN_vkVoidFunction)&buffer_address;
+    if (!strcmp(name, "vkCreateBuffer")) return (PFN_vkVoidFunction)&create_buffer;
+    if (!strcmp(name, "vkDestroyBuffer")) return (PFN_vkVoidFunction)&destroy_buffer;
+    if (!strcmp(name, "vkGetBufferDeviceAddress")) return (PFN_vkVoidFunction)&buffer_address;
     if (!strcmp(name, "vkGetBufferDeviceAddressKHR"))
-        return real_bda_khr = (PFN_vkGetBufferDeviceAddress)f, (PFN_vkVoidFunction)&buffer_address_khr;
-    if (!strcmp(name, "vkUpdateDescriptorSets")) return real_uds = (PFN_vkUpdateDescriptorSets)f, (PFN_vkVoidFunction)&update_sets;
-    if (!strcmp(name, "vkCmdPushDescriptorSetKHR")) return real_push = (PFN_vkCmdPushDescriptorSetKHR)f, (PFN_vkVoidFunction)&push_set;
-    if (!strcmp(name, "vkCmdPushDescriptorSet")) return real_push14 = (PFN_vkCmdPushDescriptorSetKHR)f, (PFN_vkVoidFunction)&push_set14;
-    if (!strcmp(name, "vkGetDescriptorEXT")) return real_gd = (PFN_vkGetDescriptorEXT)f, (PFN_vkVoidFunction)&get_descriptor;
-    if (!strcmp(name, "vkCreateShaderModule")) return real_csm = (PFN_vkCreateShaderModule)f, (PFN_vkVoidFunction)&create_shader_module;
-    if (!strcmp(name, "vkDestroyShaderModule")) return real_dsm = (PFN_vkDestroyShaderModule)f, (PFN_vkVoidFunction)&destroy_shader_module;
+        return (PFN_vkVoidFunction)&buffer_address_khr;
+    if (!strcmp(name, "vkUpdateDescriptorSets")) return (PFN_vkVoidFunction)&update_sets;
+    if (!strcmp(name, "vkCmdPushDescriptorSetKHR")) return (PFN_vkVoidFunction)&push_set;
+    if (!strcmp(name, "vkCmdPushDescriptorSet")) return (PFN_vkVoidFunction)&push_set14;
+    if (!strcmp(name, "vkGetDescriptorEXT")) return (PFN_vkVoidFunction)&get_descriptor;
+    if (!strcmp(name, "vkCreateShaderModule")) return (PFN_vkVoidFunction)&create_shader_module;
+    if (!strcmp(name, "vkDestroyShaderModule")) return (PFN_vkVoidFunction)&destroy_shader_module;
     if (!strcmp(name, "vkCreateComputePipelines"))
-        return real_ccp = (PFN_vkCreateComputePipelines)f, (PFN_vkVoidFunction)&create_compute_pipelines;
+        return (PFN_vkVoidFunction)&create_compute_pipelines;
     if (!strcmp(name, "vkCreateDescriptorSetLayout"))
-        return real_cdsl = (PFN_vkCreateDescriptorSetLayout)f, (PFN_vkVoidFunction)&create_set_layout;
-    if (!strcmp(name, "vkCreatePipelineLayout")) return real_cpl = (PFN_vkCreatePipelineLayout)f, (PFN_vkVoidFunction)&create_pipeline_layout;
-    if (!strcmp(name, "vkDestroyPipeline")) return real_dp = (PFN_vkDestroyPipeline)f, (PFN_vkVoidFunction)&destroy_pipeline;
-    if (!strcmp(name, "vkCmdBindPipeline")) return real_bind = (PFN_vkCmdBindPipeline)f, (PFN_vkVoidFunction)&cmd_bind_pipeline;
-    if (!strcmp(name, "vkCmdDispatch")) return real_dispatch = (PFN_vkCmdDispatch)f, (PFN_vkVoidFunction)&cmd_dispatch;
+        return (PFN_vkVoidFunction)&create_set_layout;
+    if (!strcmp(name, "vkCreatePipelineLayout")) return (PFN_vkVoidFunction)&create_pipeline_layout;
+    if (!strcmp(name, "vkDestroyPipeline")) return (PFN_vkVoidFunction)&destroy_pipeline;
+    if (!strcmp(name, "vkCmdBindPipeline")) return (PFN_vkVoidFunction)&cmd_bind_pipeline;
+    if (!strcmp(name, "vkCmdDispatch")) return (PFN_vkVoidFunction)&cmd_dispatch;
     return f;
 }
-void prepare_device() {   // (what the hooks call that the library may never ask for)
+void prepare_device() {   // (initialized before AMD can start any tuning work)
+    real_cb = (PFN_vkCreateBuffer)vkGetDeviceProcAddr(dev.device, "vkCreateBuffer");
+    real_db = (PFN_vkDestroyBuffer)vkGetDeviceProcAddr(dev.device, "vkDestroyBuffer");
+    real_bda = (PFN_vkGetBufferDeviceAddress)vkGetDeviceProcAddr(dev.device, "vkGetBufferDeviceAddress");
+    real_bda_khr = (PFN_vkGetBufferDeviceAddress)vkGetDeviceProcAddr(dev.device, "vkGetBufferDeviceAddressKHR");
+    real_uds = (PFN_vkUpdateDescriptorSets)vkGetDeviceProcAddr(dev.device, "vkUpdateDescriptorSets");
+    real_push = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(dev.device, "vkCmdPushDescriptorSetKHR");
+    real_push14 = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(dev.device, "vkCmdPushDescriptorSet");
+    real_gd = (PFN_vkGetDescriptorEXT)vkGetDeviceProcAddr(dev.device, "vkGetDescriptorEXT");
+    real_bind = (PFN_vkCmdBindPipeline)vkGetDeviceProcAddr(dev.device, "vkCmdBindPipeline");
+    real_dispatch = (PFN_vkCmdDispatch)vkGetDeviceProcAddr(dev.device, "vkCmdDispatch");
     real_update = (PFN_vkCmdUpdateBuffer)vkGetDeviceProcAddr(dev.device, "vkCmdUpdateBuffer");
     real_barrier = (PFN_vkCmdPipelineBarrier)vkGetDeviceProcAddr(dev.device, "vkCmdPipelineBarrier");
     real_dp = (PFN_vkDestroyPipeline)vkGetDeviceProcAddr(dev.device, "vkDestroyPipeline");
@@ -910,7 +1050,7 @@ bool load() {
         g_why = why;
         return false;
     };
-    std::string where;
+    std::string where, found_dir;
     for (const std::string& dir : library_dirs()) {
         where += (where.empty() ? "" : ", ") + dir;
 #ifdef _WIN32
@@ -929,6 +1069,7 @@ bool load() {
 #endif
         if (l.lib) {
             logf("vk: AMD FSR 4: %s", path.c_str());
+            found_dir = dir;
             break;
         }
     }
@@ -949,6 +1090,15 @@ bool load() {
         tune::prepare_device();
         l.device_context.vkDeviceProcAddr = &tune::device_proc;
     }
+#ifdef _WIN32
+    // (the model hook, for the one upscaler library whose layout is known, before the loader loads that name itself)
+    const fsr4_models::KnownModule known = probe_models(found_dir);
+    const bool hooked = known.library && !known.scan.result.providers.empty() &&
+                        fsr4_models::install(known.scan.base, known.scan.result, known.library);
+    if (known.library && !hooked) logf("vk: AMD FSR 4: models: its providers were not hooked; AMD's own choice of model");
+#else
+    (void)found_dir;
+#endif
     // (the library lists every upscaler this device can run: the newest 4.x is taken explicitly, so an FSR 3.1 provider never
     // stands in silently)
     ffxQueryDescGetVersions versions{};
@@ -969,17 +1119,50 @@ bool load() {
         logf("vk: AMD FSR 4: the upscalers could not be listed");
         return no(FSR_NO_MODEL);
     }
+#ifdef _WIN32
+    // (the loader has loaded its upscaler by now: the hook answers only while that is the module that was checked)
+    if (hooked && !fsr4_models::known_module_is_loaders(known))
+        logf("vk: AMD FSR 4: models: the loader uses another copy of %s: the hook answers as AMD does", known.scan.name.c_str());
+#endif
     std::string listed;
     unsigned best[3] = {0, 0, 0};
-    for (uint64_t i = 0; i < count; i++) {
-        const char* name = names[i] ? names[i] : "";
-        listed += (listed.empty() ? "" : ", ") + std::string(name);
-        unsigned v[3] = {0, 0, 0};
-        sscanf(name, "%u.%u.%u", &v[0], &v[1], &v[2]);
-        // (the first of equal versions: a Vulkan FSR 4 build lists its Auto, which picks the GPU's model, before INT8 and FP8)
-        if (v[0] == 4 && (!l.version_id || v[1] > best[1] || (v[1] == best[1] && v[2] > best[2]))) {
-            std::memcpy(best, v, sizeof best);
-            l.version_id = ids[i];
+    const auto pick_newest = [&] {
+        listed.clear();
+        std::memset(best, 0, sizeof best);
+        l.version_id = 0;
+        for (uint64_t i = 0; i < count; i++) {
+            const char* name = names[i] ? names[i] : "";
+            listed += (listed.empty() ? "" : ", ") + std::string(name);
+            unsigned v[3] = {0, 0, 0};
+            sscanf(name, "%u.%u.%u", &v[0], &v[1], &v[2]);
+            // (the first of equal versions: a Vulkan FSR 4 build lists its Auto, which picks the GPU's model, before INT8 and FP8)
+            if (v[0] == 4 && (!l.version_id || v[1] > best[1] || (v[1] == best[1] && v[2] > best[2]))) {
+                std::memcpy(best, v, sizeof best);
+                l.version_id = ids[i];
+            }
+        }
+    };
+    pick_newest();
+    // (no FSR 4 for this GPU in AMD's own list: a GPU of another maker, or a Radeon AMD names for no model. Where the Lite
+    // provider is hooked it stands in, and the list is asked again with it answering. RX_VK_FSR4_STANDIN=0 leaves this out)
+    static const bool standin_allowed = env_on_or("RX_VK_FSR4_STANDIN", 1);
+    if (!l.version_id && standin_allowed && fsr4_models::hook_installed() && fsr4_models::has_model(fsr4_models::MODEL_LITE)) {
+        const std::string amds = listed;
+        fsr4_models::set_model(fsr4_models::SELECT_LITE);
+        count = 0;
+        versions.versionIds = nullptr, versions.versionNames = nullptr;
+        if (l.query(nullptr, &versions.header) == FFX_API_RETURN_OK && count) {
+            ids.assign(count, 0), names.assign(count, nullptr);
+            versions.versionIds = ids.data(), versions.versionNames = names.data();
+            if (l.query(nullptr, &versions.header) == FFX_API_RETURN_OK) pick_newest();
+        }
+        if (l.version_id) {
+            g_standin = true;
+            logf("vk: AMD FSR 4: AMD lists no FSR 4 model for this GPU (it has: %s): INT8 Lite stands in "
+                 "(RX_VK_FSR4_STANDIN=0 leaves FSR 4 off here)", amds.c_str());
+        } else {
+            fsr4_models::set_model(fsr4_models::SELECT_AUTO);
+            listed = amds;
         }
     }
     if (!l.version_id) {
@@ -987,6 +1170,15 @@ bool load() {
         return no(FSR_NO_MODEL);
     }
     logf("vk: AMD FSR 4: upscalers %s; using %u.%u.%u", listed.c_str(), best[0], best[1], best[2]);
+    // (a model to choose only where AMD's own pick runs too: an AMD GPU that is not on the stand-in)
+    g_lite_available = dev.props.vendorID == 0x1002 && !g_standin && fsr4_models::hook_installed() &&
+                       fsr4_models::has_model(fsr4_models::MODEL_LITE);
+    if (g_lite_available)
+        logf("vk: AMD FSR 4: model: Lite is available (RX_VK_FSR4_MODEL=lite selects it)");
+    else if (g_standin)
+        logf("vk: AMD FSR 4: model: INT8 Lite is the only one here; the FSR 4 model row is not shown");
+    else if (fsr4_models::has_model(fsr4_models::MODEL_LITE))
+        logf("vk: AMD FSR 4: model: Lite is hooked, and offered on AMD GPUs only; Auto");
     l.ok = true;
     g_why = FSR_OK;
     return true;
@@ -994,9 +1186,31 @@ bool load() {
 
 /// A context for outputs of w x h, any render size up to that (the game's dynamic resolution and the Render resolution row
 /// change it every so often: one context takes them all)
-std::shared_ptr<Context> make_context(uint32_t w, uint32_t h, bool hdr) {
+std::shared_ptr<Context> make_context(uint32_t w, uint32_t h, bool hdr, Fsr4Model want) {
     Library& l = lib();
     auto c = std::make_shared<Context>();
+    c->model = want;
+    Fsr4Model effective = want;
+    if (effective == FSR4_MODEL_LITE && !g_lite_available.load(std::memory_order_relaxed)) {
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true))
+            logf("vk: AMD FSR 4: Lite was asked for but no Lite provider is hooked; using Auto");
+        effective = FSR4_MODEL_AUTO;
+    }
+    if (effective == FSR4_MODEL_LITE && g_lite_failed.load(std::memory_order_relaxed)) {
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true))
+            logf("vk: AMD FSR 4: Lite failed earlier in this run; using Auto");
+        effective = FSR4_MODEL_AUTO;
+    }
+    const bool standin = g_standin.load(std::memory_order_relaxed);
+    if (standin) effective = FSR4_MODEL_AUTO;   // (nothing to choose: the row's value changes nothing, and no retry as Auto)
+    c->effective = effective;
+    const bool lite = effective == FSR4_MODEL_LITE || standin;
+    const bool suppress = lite && fsr4_models::native_model() != fsr4_models::MODEL_LITE;
+    tune::suppress(suppress);
+    fsr4_models::set_model(lite ? fsr4_models::SELECT_LITE : fsr4_models::SELECT_AUTO);
+    c->tuned = tune::on() && !suppress;
     c->backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
     c->backend.deviceContext = l.device_context;
     c->version.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
@@ -1023,11 +1237,21 @@ std::shared_ptr<Context> make_context(uint32_t w, uint32_t h, bool hdr) {
     c->upscale.maxUpscaleSize = {w, h};
     c->upscale.fpMessage = &on_message;
     const auto t0 = std::chrono::steady_clock::now();
-    const ffxReturnCode_t r = l.create(&c->context, &c->upscale.header, nullptr);
+    const auto create = [&](ffxContext* out) { return l.create(out, &c->upscale.header, nullptr); };
+    const auto destroy = [&](ffxContext* out) { l.destroy(out, nullptr); };
+    ffxReturnCode_t r = fsr4_models::create_attempt(c->context, (ffxReturnCode_t)FFX_API_RETURN_OK, create, destroy);
+    if ((r != FFX_API_RETURN_OK || !c->context) && effective == FSR4_MODEL_LITE && !g_lite_failed.exchange(true)) {
+        logf("vk: AMD FSR 4: AMD's library refused the Lite model; using Auto");
+        effective = FSR4_MODEL_AUTO;
+        c->effective = effective;
+        tune::suppress(false);
+        fsr4_models::set_model(fsr4_models::SELECT_AUTO);
+        c->tuned = tune::on();
+        r = fsr4_models::create_attempt(c->context, (ffxReturnCode_t)FFX_API_RETURN_OK, create, destroy);
+    }
     const double made_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (r != FFX_API_RETURN_OK || !c->context) {
         logf("vk: AMD FSR 4: its upscaler was not made (%d) for %ux%u", (int)r, w, h);
-        c->context = nullptr;
         return nullptr;
     }
     c->width = w, c->height = h, c->hdr = hdr;
@@ -1035,13 +1259,20 @@ std::shared_ptr<Context> make_context(uint32_t w, uint32_t h, bool hdr) {
     ffxQueryDescUpscaleGetGPUMemoryUsage mem{};
     mem.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE;
     mem.gpuMemoryUsageUpscaler = &usage;
-    if (l.query(&c->context, &mem.header) == FFX_API_RETURN_OK) c->memory = usage.totalUsageInBytes;
+    c->memory_known = l.query(&c->context, &mem.header) == FFX_API_RETURN_OK;
+    if (c->memory_known) c->memory = usage.totalUsageInBytes;
     ffxQueryGetProviderVersion provider{};
     provider.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
     const bool known = l.query(&c->context, &provider.header) == FFX_API_RETURN_OK && provider.versionName;
-    logf("vk: AMD FSR 4: FSR %s made for outputs of %ux%u (frame %llu, %.1f ms of CPU; its own %llu MB)%s",
+    const bool forced = effective == FSR4_MODEL_LITE && fsr4_models::native_model() != fsr4_models::MODEL_LITE;
+    logf("vk: AMD FSR 4: model: %s%s",
+         standin ? "Lite (INT8, standing in: AMD lists no FSR 4 model for this GPU)"
+                 : effective == FSR4_MODEL_LITE ? (forced ? "Lite (INT8, forced)" : "Lite (INT8, native)") : "Auto (AMD's)",
+         c->tuned ? ", tuned" : ", AMD's shaders");
+    const std::string memory = c->memory_known ? std::to_string(c->memory >> 20) + " MB" : "unavailable";
+    logf("vk: AMD FSR 4: FSR %s made for outputs of %ux%u (frame %llu, %.1f ms of CPU; its own %s)%s",
          known ? provider.versionName : "?", w, h, (unsigned long long)texture_frame_no(), made_ms,
-         (unsigned long long)(c->memory >> 20), hdr ? ", HDR colour, linear (the game's native HDR)" : "");
+         memory.c_str(), hdr ? ", HDR colour, linear (the game's native HDR)" : "");
     return c;
 }
 
@@ -1111,18 +1342,36 @@ void release() {
 int prepare(VkCommandBuffer, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh, bool /*native_aa*/,
             uint32_t* in_w, uint32_t* in_h, const char** why) {
     State& s = st();
+    const Fsr4Model want = fsr4_model();
     int made = 1;
     // (the game's native HDR: Context::hdr. What the game presents, not the option and the swapchain: with Native picked and
     // the game's picture not PQ, the scene is LDR. RX_VK_FSR4_HDR=0: the LDR context and the clamped colour with Native too)
     static const bool hdr_allowed = env_switch("RX_VK_FSR4_HDR") != 0;
     const bool hdr = hdr_allowed && present_native_pq.load(std::memory_order_relaxed);
-    if (!s.context || s.context->width != ow || s.context->height != oh || s.context->hdr != hdr) {
+    if (!s.context || s.context->width != ow || s.context->height != oh || s.context->hdr != hdr ||
+        s.context->model != want) {
         if (s.context && s.context->hdr != hdr) logf("vk: AMD FSR 4: made again: the game's native HDR turned %s", hdr ? "on" : "off");
-        release();
-        s.context = make_context(ow, oh, hdr);
-        if (!s.context) return *why = "its upscaler was not made", -1;
-        s.in_w = s.in_h = 0;
-        made = 2;
+        const bool compatible = s.context && s.context->width == ow && s.context->height == oh && s.context->hdr == hdr;
+        auto replacement = make_context(ow, oh, hdr, want);
+        if (s.context && replacement && s.context->model != want) {
+            const auto reported = [](const Context& c) {
+                return c.memory_known ? std::to_string(c.memory >> 20) + " MB" : std::string("unavailable");
+            };
+            const std::string before = reported(*s.context), after = reported(*replacement);
+            logf("vk: AMD FSR 4: model switch overlap on frame %llu: previous %s, replacement %s (SDK reported)",
+                 (unsigned long long)texture_frame_no(), before.c_str(), after.c_str());
+        }
+        if (compatible && (!replacement || (want == FSR4_MODEL_LITE && replacement->effective == FSR4_MODEL_AUTO &&
+                                             s.context->effective == FSR4_MODEL_AUTO))) {
+            s.context->model = want;   // (keep the working context without retrying the same change every frame)
+            logf("vk: AMD FSR 4: model change failed; keeping the previous context");
+        } else {
+            release();
+            s.context = std::move(replacement);
+            if (!s.context) return *why = "its upscaler was not made", -1;
+            s.in_w = s.in_h = 0;
+            made = 2;
+        }
     }
     // (the inputs as large as the largest render size this context has had, never past the output: a fixed share keeps
     // images of its own size, and the game's dynamic resolution only makes them again when it goes past them)
@@ -1133,6 +1382,7 @@ int prepare(VkCommandBuffer, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh,
 
 bool evaluate(VkCommandBuffer cmd, const TemporalFrame& f) {
     State& s = st();
+    s.retry_evaluation = false;
     Library& l = lib();
 #ifndef _WIN32
     TemporalImage exposure{};
@@ -1178,7 +1428,7 @@ bool evaluate(VkCommandBuffer cmd, const TemporalFrame& f) {
         GprofSpan timed(cmd, "fsr4 ffxDispatch (AMD's passes)");   // (RX_VK_PASS_TIMING=1: AMD's own GPU time, named)
         ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);   // (ffxDispatch records into cmd itself: what this thread recorded through vk_work.h reaches cmd first)
         r = l.dispatch(&s.context->context, &d.header);
-        note_work();   // (AMD's dispatches: full_barrier must not take the next barrier for a repeat of the one before them)
+        note_other_work();   // (AMD's dispatches: full_barrier must not take the next barrier for a repeat of the one before them)
     }
 
     const VkImageMemoryBarrier2 out[4] = {barrier(f.color.image, VK_ACCESS_2_SHADER_READ_BIT, any, R, G),
@@ -1188,6 +1438,11 @@ bool evaluate(VkCommandBuffer cmd, const TemporalFrame& f) {
     barriers(cmd, out, 4);
     if (r != FFX_API_RETURN_OK) {
         logf("vk: AMD FSR 4: its dispatch failed (%d)", (int)r);
+        if (s.context->effective == FSR4_MODEL_LITE && !g_lite_failed.exchange(true)) {
+            logf("vk: AMD FSR 4: the Lite model's dispatch failed; using Auto");
+            release();   // (the next prepare makes an Auto context; the saved value stays Lite)
+            s.retry_evaluation = true;
+        }
         return false;
     }
     // (the first evaluation, and the first resets: a camera cut each)
@@ -1208,7 +1463,79 @@ bool hdr() {
     return s.context && s.context->hdr;
 }
 
-const TemporalEngine kEngine{"AMD FSR 4", "FSR", start, prepare, evaluate, release, memory, hdr};
+// Preparation runs before the game has a scene, so give the SDK cleared inputs in the usual formats.
+struct PrepareFrame {
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VmaAllocation allocations[4]{};
+    TemporalFrame frame;
+
+    ~PrepareFrame() {
+        if (pool) vkDestroyCommandPool(dev.device, pool, nullptr);
+        const TemporalImage* images[] = {&frame.color, &frame.depth, &frame.motion, &frame.output};
+        for (size_t i = 0; i < std::size(images); i++)
+            if (images[i]->image) destroy_image(images[i]->image, allocations[i]);
+    }
+
+    bool record(VkCommandBuffer cmd, uint32_t ow, uint32_t oh) {
+        TemporalImage* images[] = {&frame.color, &frame.depth, &frame.motion, &frame.output};
+        constexpr VkFormat formats[] = {VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R32_SFLOAT,
+                                        VK_FORMAT_R16G16_SFLOAT, VK_FORMAT_R16G16B16A16_SFLOAT};
+        for (size_t i = 0; i < std::size(images); i++) {
+            TemporalImage& im = *images[i];
+            const bool output = i == 3;
+            VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            ci.imageType = VK_IMAGE_TYPE_2D, ci.format = formats[i];
+            ci.extent = {output ? ow : frame.render_w, output ? oh : frame.render_h, 1};
+            ci.mipLevels = ci.arrayLayers = 1;
+            ci.samples = VK_SAMPLE_COUNT_1_BIT;
+            ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            if (output) ci.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+            if (!create_image(ci, im.image, allocations[i])) return false;
+            im.format = ci.format, im.width = ci.extent.width, im.height = ci.extent.height;
+            const auto to_clear = barrier(im.image, 0, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                          VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+            barriers(cmd, &to_clear, 1);
+            const VkClearColorValue clear{{i == 1 ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f}};
+            const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vkCmdClearColorImage(cmd, im.image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+        }
+        return true;
+    }
+};
+
+bool prepare_result(VkResult result) {
+    if (result == VK_ERROR_DEVICE_LOST) device_lost("FSR 4 preparation");
+    return result == VK_SUCCESS;
+}
+
+bool prepare_frame(uint32_t ow, uint32_t oh) {
+    PrepareFrame work;
+    const int scale = temporal_mode() == upscaler_rows::FSR4_AA ? 10000 : resolution_scale();
+    game_size(scale > 0 ? scale / 10000.0f : 2.0f / 3.0f, work.frame.render_w, work.frame.render_h);
+    work.frame.reset = true;
+    VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pi.queueFamilyIndex = dev.queue_family;
+    if (!prepare_result(vkCreateCommandPool(dev.device, &pi, nullptr, &work.pool))) return false;
+    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = work.pool, ai.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (!prepare_result(vkAllocateCommandBuffers(dev.device, &ai, &cmd))) return false;
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (!prepare_result(vkBeginCommandBuffer(cmd, &bi)) || !work.record(cmd, ow, oh) ||
+        !evaluate(cmd, work.frame) || !prepare_result(vkEndCommandBuffer(cmd))) return false;
+    VkCommandBufferSubmitInfo cb{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+    cb.commandBuffer = cmd;
+    VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+    si.commandBufferInfoCount = 1, si.pCommandBufferInfos = &cb;
+    if (!prepare_result(vkQueueSubmit2(dev.queue, 1, &si, VK_NULL_HANDLE))) return false;
+    // Without completion, neither the command pool nor the SDK context can be freed.
+    if (vkQueueWaitIdle(dev.queue) != VK_SUCCESS) device_lost("FSR 4 preparation queue did not complete");
+    return true;
+}
+
+bool retry_evaluation() { return st().retry_evaluation; }
+const TemporalEngine kEngine{"AMD FSR 4", "FSR", start, prepare, evaluate, release, memory, hdr, false, false, retry_evaluation};
 
 }  // namespace
 
@@ -1218,6 +1545,36 @@ const TemporalEngine* fsr4_engine() { return &kEngine; }
 void fsr4_probe() {
     if (fsr4_why() != FSR_OK || g_why.load(std::memory_order_relaxed) >= 0 || !dev.device) return;
     load();
+}
+
+void fsr4_prepare_shaders() {
+    if (!load() || !tune::on()) return;
+    const auto [width, height] = shown_output();
+    if (!width || !height) return;
+    // Native HDR can still present SDR scenes. Warm both SDK contexts when that mode is selected.
+    const bool native_hdr = opts.hdr == 2 && env_switch("RX_VK_FSR4_HDR") != 0;
+    for (int mode = 0; mode <= (int)native_hdr; mode++) {
+        prepare_compiled();
+        const char* label = mode ? "Native HDR" : "SDR";
+        logf("vk: AMD FSR 4: preparing %s pipelines before gameplay (%ux%u)", label, width, height);
+        State& s = st();
+        // (the model the player picked, as prepare asks for each frame: its pipelines are the ones the game will use)
+        s.context = make_context(width, height, mode != 0, fsr4_model());
+        const bool ok = s.context && prepare_frame(width, height);
+        // The preparation process is about to exit. Let the existing workers finish and save their variants first.
+        auto& jobs = tune::jobs();
+        {
+            std::unique_lock lk(jobs.mu);
+            jobs.cv.wait(lk, [&jobs] { return jobs.running == 0; });
+        }
+        const int optimized = tune::better_count.load();
+        s.context.reset();
+        const bool saved = tune::save_own_cache();
+        if (ok && saved)
+            logf("vk: AMD FSR 4: %s pipeline preparation finished (%d optimized layers ready)", label, optimized);
+        else
+            logf("vk: AMD FSR 4: %s pipeline preparation could not %s", label, ok ? "save the cache" : "run the warm-up frame");
+    }
 }
 
 void fsr4_close() { tune::close(); }
@@ -1238,6 +1595,7 @@ bool fsr4_wants_descriptor_buffer() {
 bool fsr4_built() { return false; }
 const TemporalEngine* fsr4_engine() { return nullptr; }
 void fsr4_probe() {}
+void fsr4_prepare_shaders() {}
 void fsr4_close() {}
 bool fsr4_wants_descriptor_buffer() { return false; }
 

@@ -30,6 +30,7 @@
   .launcher-version { margin: .9rem 0 0; font-size: var(--text-sm); }
   .launcher-version [data-launcher-version] { font-weight: 600; color: var(--sl-color-white); }
   .download-buttons a[aria-disabled='true'] { opacity: .65; cursor: default; }
+  .download-buttons a[hidden] { display: none; }
   .launcher-channel:not([hidden]) { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem .5rem; margin: 1.2rem 0 0; }
   .launcher-channel > :is(span, label) { margin-block: 0; }  /* (not the content's flow spacing between them) */
   .launcher-channel > span { margin-right: .25rem; font-weight: 600; font-size: var(--text-sm); color: var(--sl-color-white); }

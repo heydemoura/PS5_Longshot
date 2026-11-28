@@ -21,12 +21,13 @@ test('installation hub retains source sections and links', () => {
 });
 
 test('the launcher download buttons get a channel picker, hidden until a script runs it', async () => {
-  const source = await readFile(new URL('../../docs/getting-started.md', import.meta.url), 'utf8');
+  const source = await readFile(new URL('../../docs/user/getting-started.md', import.meta.url), 'utf8');
   const page = source.replace(/https:\/\/longshot\.magicbean\.dev\//g, '/');
   const formatted = formatInstallHub(page);
   assert.equal((formatted.match(/data-launcher-channel /g) || []).length, 1);
   assert.match(formatted, /<div class="launcher-channel" role="radiogroup" aria-labelledby="launcher-channel-label" data-launcher-channel hidden>[\s\S]*<\/p>\n<\/div>\n<p class="launcher-version">[\s\S]*<\/p>\n<div class="download-buttons">/);
   assert.match(formatted, /data-launcher-version role="status"/);
+  assert.match(formatted, /This is the launcher's own version\. The game it builds is numbered as a Longshot version/);
   assert(!formatted.includes('See all versions'));
   for (const c of launcherChannels) assert(formatted.includes(`value="${c.value}"`), `Missing channel: ${c.name}`);
   assert.equal((formatted.match(/ checked>/g) || []).length, 0);
@@ -39,14 +40,14 @@ test('the launcher download buttons get a channel picker, hidden until a script 
 
 test('a channel moves the launcher links, and only them', () => {
   assert.equal(launcherHref('/download/launcher/windows', 'nightly'), '/download/launcher/nightly/windows');
-  assert.equal(launcherHref('/download/launcher/nightly/windows-portable', 'rc'), '/download/launcher/rc/windows-portable');
-  assert.equal(launcherHref('/download/launcher/rc/linux', ''), '/download/launcher/linux');
-  assert.equal(launcherHref('/download', 'rc'), '/download');
-  assert.equal(launcherHref('/download/launcher/nightly', 'rc'), '/download/launcher/nightly');
+  assert.equal(launcherHref('/download/launcher/nightly/windows-portable', 'stable'), '/download/launcher/stable/windows-portable');
+  assert.equal(launcherHref('/download/launcher/stable/linux', ''), '/download/launcher/linux');
+  assert.equal(launcherHref('/download', 'stable'), '/download');
+  assert.equal(launcherHref('/download/launcher/nightly', 'stable'), '/download/launcher/nightly');
 });
 
 test('symptom cards keep every line of the help page, its anchors and the old topic anchors', async () => {
-  const source = await readFile(new URL('../../docs/common-issues.md', import.meta.url), 'utf8');
+  const source = await readFile(new URL('../../docs/user/common-issues.md', import.meta.url), 'utf8');
   const page = source.replace(/^# .+\n/m, '');
   const formatted = formatCommonIssues(page);
   const groups = sectionsAt(page, 2).slice(1, -1);

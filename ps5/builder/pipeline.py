@@ -5,15 +5,17 @@
 The kit (ps5/builder/make_kit.py) holds everything of the title that is not made from the game, compiled already. This
 adds the game's part, on this PC and from the player's own copy:
 
-  1. the game's program is read out of the game file (its exefs: about 50 MB, not the game's 25 GB);
-  2. it is translated to C (the kit's lifter, nx2/lift.py);
-  3. the C is compiled for the console (clang);
-  4. it is linked with the kit's objects and libraries (ld.lld) and made the console's executable (ps5-native-tool);
+  1. the game's program is read out of the game file (its exefs: about 50 MB, not the game's 25 GB) and laid out as
+     the image the title loads (longshot-builder image);
+  2. it is translated to LLVM IR for the console's guest window (longshot-builder dev lift, the kit's LIFT options);
+  3. the IR is compiled for the console (clang);
+  4. it is linked with the kit's objects and libraries, the game's Rust among them (ld.lld), and made the console's
+     executable (ps5-native-tool);
   5. the title folder is laid out: <out>/<title id>, to copy to /data/homebrew on the console.
 
 Nothing made here may be shared: eboot.bin and image.bin are made from the game.
 
-The tools: clang, ld.lld, llvm-nm and ps5-native-tool, looked for in --tools, in LONGSHOT_PS5_TOOLS, in a tools/bin folder
+The tools: longshot-builder (upstream's builder, built for this PC), clang, ld.lld, llvm-nm and ps5-native-tool, looked for in --tools, in LONGSHOT_PS5_TOOLS, in a tools/bin folder
 beside the kit, then on PATH. Lines starting with "@@" are for the window (ps5/builder/app.py): "@@step <n> <of> <name>",
 "@@progress <done> <total>", "@@done <folder>", "@@error <text>".
 """
@@ -39,7 +41,7 @@ MODELS = {
     "base": {"name": "PS5 / PS5 Slim", "attribute3": 0x140040, "env": {"RX_VK_TEX_MAX_DIM": "512"}},
     "pro": {"name": "PS5 Pro", "attribute3": 0x8540040, "env": {}},
 }
-STEPS = ["Reading the game's program", "Translating it to C", "Compiling for the console", "Linking", "Making the title folder",
+STEPS = ["Reading the game's program", "Translating it", "Compiling for the console", "Linking", "Making the title folder",
          "Listing the game's shaders"]
 
 
@@ -97,24 +99,18 @@ def available_gb():
     return None
 
 
-# The build's memory (measured on Zelda's real game with the kit's tools, the processes' PSS summed). The translation in one
-# process: 1.85 GB at its peak (nx2/compact_bodies.py; 5.05 GB before). Each further process is a forked copy that comes to own
-# ~0.5-0.7 GB of it (Python's reference counts write to the shared pages: the instruction texts every worker reads), and with
-# several there is one more beside them (chunks.start_side): 7 took 5.6 GB (11.7 GB before, with 8). The compile: mem_need, Gate
-MIN_MEMORY_GB = 2     # (--memory's least: the translation in one process; compiles of ~0.9 GB, one at a time)
+# The build's memory. The translation (longshot-builder dev lift) discovers the game's functions in one process and writes
+# the units with --jobs threads; its need by the number of threads was not measured on a player's PC yet, so within
+# --memory it is one thread for each 2 GB, one at the least. The compile: mem_need, Gate
+MIN_MEMORY_GB = 2     # (--memory's least)
 MIN_FREE_GB = 4       # (below this free at the start, a note)
-# (on Windows the workers are new processes holding the emit's tables and their run's functions: up to 395 MB each, measured in
-# nx2/chunks.py file_jobs)
-LIFT_ONE_GB, LIFT_MORE_GB = 2.0, (0.5 if os.name == "nt" else 0.75)
 
 
 def lift_processes(memory_gb):
-    """The translation's processes within memory_gb (0: the lifter's own rule, by the memory free): n workers and the side process
-    beside them, each LIFT_MORE_GB, over the one process's LIFT_ONE_GB; one where two would not fit"""
+    """The translation's threads within memory_gb (0: the cores less one)"""
     if not memory_gb:
-        return 0
-    n = int((memory_gb - LIFT_ONE_GB) / LIFT_MORE_GB) - 1
-    return max(1, min((os.cpu_count() or 2) - 1, n)) if n >= 2 else 1
+        return max(1, (os.cpu_count() or 2) - 1)
+    return max(1, min((os.cpu_count() or 2) - 1, int(memory_gb / 2)))
 
 
 def default_jobs():
@@ -134,37 +130,36 @@ def run(cmd, env=None, cwd=None, what=None):
         raise Stop("%s failed (exit %d):\n%s" % (what or os.path.basename(cmd[0]), p.returncode, "\n".join(tail[-12:])))
 
 
-def python_env(kit, work):
-    src = os.path.join(kit, "src")
-    env = dict(os.environ, OOT_WORK=os.path.join(work, "lift"), PYTHONDONTWRITEBYTECODE="1", PYTHONUTF8="1")
+def builder_env():
+    env = dict(os.environ)
     env.pop("PYTHONPATH", None)
-    return src, env
+    return env
 
 
-def read_game(kit, work, game):
+def read_game(kit, work, game, builder):
+    """The game's program and its image, by upstream's builder: <work>/lift/exefs and <work>/lift/image"""
     step(1)
-    exefs = os.path.join(work, "game", "exefs")
-    if os.path.isdir(game):
-        for d in (game, os.path.join(game, "exefs")):
-            if os.path.exists(os.path.join(d, "main")):
-                return d
-        raise Stop("no exefs (a file named main) in %s" % game)
-    if not os.path.isfile(game):
+    lift_dir = os.path.join(work, "lift")
+    if not os.path.exists(game):
         raise Stop("the game file was not found: %s" % game)
-    stamp = "%d %d" % (os.path.getsize(game), int(os.path.getmtime(game)))
-    mark = os.path.join(work, "game", ".from")
-    if os.path.exists(os.path.join(exefs, "main")) and os.path.exists(mark) and open(mark).read() == stamp:
+    if os.path.isdir(game) and not os.path.exists(os.path.join(game, "exefs", "main")):
+        raise Stop("no exefs (a file named main) in %s: give the .nup, or a dump's folder with exefs/ and romfs/" % game)
+    stamp = "%s %d %d" % (os.path.abspath(game), os.path.getsize(game) if os.path.isfile(game) else 0, int(os.path.getmtime(game)))
+    mark = os.path.join(lift_dir, ".from")
+    image = os.path.join(lift_dir, "image", "image.bin")
+    if os.path.exists(image) and os.path.exists(os.path.join(lift_dir, "exefs", "main")) and os.path.exists(mark) and \
+            open(mark).read() == stamp:
         say("read already, from this file")
-        return exefs
-    src, env = python_env(kit, work)
-    shutil.rmtree(os.path.join(work, "game"), ignore_errors=True)
-    os.makedirs(os.path.join(work, "game"))
-    run([sys.executable, "-I", "-u", os.path.join(src, "nx2", "nup.py"), game, "--only", "exefs", "--extract",
-         os.path.join(work, "game")], env=env, what="reading the game file")
-    if not os.path.exists(os.path.join(exefs, "main")):
-        raise Stop("the game file gave no program (exefs/main): is it the supported game and version?")
-    open(mark, "w").write(stamp)
-    return exefs
+        return lift_dir
+    os.makedirs(lift_dir, exist_ok=True)
+    # (--out: the game folder a PC build would make; here only where the builder keeps its lock)
+    run([builder, "image", "--game", game, "--work", lift_dir, "--out", os.path.join(work, "pc-out"), "--root",
+         os.path.join(kit, "src")], env=builder_env(), what="reading the game file")
+    if not os.path.exists(image) or not os.path.exists(os.path.join(lift_dir, "exefs", "main")):
+        raise Stop("the game file gave no program (exefs/main) or no image: is it the supported game and version?")
+    with open(mark, "w") as f:
+        f.write(stamp)
+    return lift_dir
 
 
 def tree_key(*dirs):
@@ -177,84 +172,38 @@ def tree_key(*dirs):
     return h.hexdigest()
 
 
-def lift(kit, work, exefs, lift_jobs):
+def lift(kit, info, work, lift_dir, builder, lift_jobs):
+    """The translation: <work>/lift/gen (the units of LLVM IR, table.c, imports.c, image.c and the runtime in rt/). The
+    builder keeps its own key (gen/lift.key): a second build with the same game and kit writes nothing"""
     step(2)
-    src, env = python_env(kit, work)
-    gen = os.path.join(work, "lift", "sa", "gen")
-    with open(os.path.join(exefs, "main"), "rb") as f:
-        key = hashlib.sha1(f.read()).hexdigest() + " " + json.load(open(os.path.join(kit, "kit.json")))["revisions"]["PS5_Longshot"]
-    mark = os.path.join(work, "lift", ".done")
-    if os.path.exists(mark) and open(mark).read() == key and os.path.exists(os.path.join(gen, "a64_table.c")):
-        say("translated already, from this program with this kit")
-        return gen
-    if os.path.exists(mark):
-        os.remove(mark)
-    os.makedirs(os.path.join(work, "lift", "image"), exist_ok=True)
-    if lift_jobs:
-        env["LONGSHOT_LIFT_JOBS"] = str(lift_jobs)
-    run([sys.executable, "-I", "-u", os.path.join(src, "nx2", "lift.py"), "--standalone", "--write", "--exefs", exefs,
-         "--work", os.path.join(work, "lift")], env=env, what="the translation")
-    if not os.path.exists(os.path.join(gen, "a64_table.c")) or not os.path.exists(os.path.join(work, "lift", "sa", "image", "image.bin")):
+    gen = os.path.join(lift_dir, "gen")
+    run([builder, "dev", "lift", "--work", lift_dir, "--repo", os.path.join(kit, "src"), "--exefs", os.path.join(lift_dir, "exefs")] +
+        info["lift_options"] + ["--jobs", str(lift_jobs)], env=builder_env(), what="the translation")
+    if not os.path.exists(os.path.join(gen, "table.c")) or not any(f.endswith(".ll") for f in os.listdir(gen)):
         raise Stop("the translation ended without its files: if it was stopped for want of memory, close other programs "
                    "and build again")
-    open(mark, "w").write(key)
+    # (the kit's objects were compiled against this file, with no game: a lift that chose otherwise would link and not run)
+    mine, kits = os.path.join(gen, "rt", "a64_config.h"), os.path.join(kit, "rt", "a64_config.h")
+    if open(mine, "rb").read() != open(kits, "rb").read():
+        raise Stop("the translation's choices (gen/rt/a64_config.h) are not the kit's: the builder and the kit are of "
+                   "different versions")
     return gen
 
 
-# The compile's memory. What one compile takes at its peak, a little over (nx2/build.py mem_need's rule, measured again here with the
-# kit's clang 23 for the PS5 at -O1): 0.4 GB + 50 MB per MB of C + 250 MB per MB of its largest function. The lift's chunks are
-# ~24 MB of small functions (1.6-1.7 GB each); a few hold one giant function, and code_028.c's 10 MB one took 4.3 GB alone, more
-# than many PCs had free. So:
-#   - the giants are compiled cut into pieces (nx2/split_giants.py, as the PC build has done since issue 418's time: 721 MB, and
-#     faster, for that file);
-#   - a chunk whose need is past what one compile may take (MEMORY_CAP: --memory, else the memory free at the start) is compiled
-#     as parts cut at its functions' heads (each part: the chunk's head, its declarations, then a run of its functions; nothing
-#     else stands between the lifted functions, so each part is complete C and the objects together are the chunk's);
-#   - a compile starts only when its need fits: within --memory with those running, else in the memory free now less what the
-#     running ones may still take and RESERVE_MB (one always runs).
+# The compile's memory. A unit of the lift is LLVM IR already cut by the lifter to a cost (a few MB to ~26 MB of text):
+# what one takes at its peak is counted as 400 MB + 60 MB per MB of IR, a little over what the largest took here
+# (pipeline.py --check does not measure it; README.md has the figures). A compile starts only when its need fits: within
+# --memory with those running, else in the memory free now less what the running ones may still take and RESERVE_MB (one
+# always runs).
 RESERVE_MB = 1536
-MIN_PART_MB = 900   # (the least a part is cut to: 0.4 GB + ~10 MB of C)
-SELF_MB = 400       # (this process, with a part's texts in hand, and the estimates' slack: 2 x 1.4 GB measured 3.08 GB with 300)
+SELF_MB = 400       # (this process, and the estimates' slack)
 COMPILED = "game_%s.o"
 
 
-def mem_need(text):
-    """A lifted C text's compile peak in MB (after split_giants: its pieces are functions of their own)"""
-    import lifted_c
-    starts = [m.start() for m in lifted_c.HEAD_BYTES.finditer(text)]
-    i = text.find(b"\nstatic __attribute__((noinline)) uintptr_t s_")
-    while i >= 0:
-        starts.append(i)
-        i = text.find(b"\nstatic __attribute__((noinline)) uintptr_t s_", i + 1)
-    starts = sorted(starts) + [len(text)]
-    largest = max([b - a for a, b in zip(starts, starts[1:])] or [0])
-    return int(400 + 50 * len(text) / (1 << 20) + 250 * largest / (1 << 20))
-
-
-def cut_parts(text, cap_mb, giant_bytes):
-    """Where to cut text (a lifted chunk, as the lift wrote it) so that each part's need is within cap_mb where the functions allow:
-    [(start, end, need)], each part being the head (all before the first function) and text[start:end], a run of whole functions.
-    A function of giant_bytes or more is counted at its pieces' size (split_giants cuts it as the part is compiled).
-    [(0, len(text), need)]: compiled whole"""
-    import lifted_c
-    marks = [m.start() for m in lifted_c.HEAD_BYTES.finditer(text)]
-    head = marks[0] if marks else 0
-    bounds = marks + [len(text)]
-    sizes = [y - x for x, y in zip(bounds, bounds[1:])]
-    counted = [n if n < giant_bytes else 64 << 10 for n in sizes]
-    need = lambda nbytes, largest: int(400 + 50 * (head + nbytes) / (1 << 20) + 250 * largest / (1 << 20))
-    whole = need(sum(sizes), max(counted or [0]))
-    if len(marks) < 2 or not cap_mb or whole <= cap_mb:
-        return [(0, len(text), whole)]
-    parts, first, nbytes, largest = [], 0, 0, 0
-    for i, (n, c) in enumerate(zip(sizes, counted)):
-        if i > first and need(nbytes + n, max(largest, c)) > cap_mb:
-            parts.append((marks[first], marks[i], need(nbytes, largest)))
-            first, nbytes, largest = i, 0, 0
-        nbytes += n
-        largest = max(largest, c)
-    parts.append((marks[first], len(text), need(nbytes, largest)))
-    return parts
+def mem_need(path):
+    """A file's compile peak in MB: a unit of IR by its size, the lift's C the same way (table.c, 16 MB, took 589 MB)"""
+    mb = os.path.getsize(path) / (1 << 20)
+    return int(400 + (60 if path.endswith(".ll") else 15) * mb)
 
 
 class Gate:
@@ -308,83 +257,47 @@ def rss_mb(proc):
         return 0
 
 
-def make_part(nx2, path, lo, hi, out):
-    """(--make-part, a process of its own) the C a chunk's compile job compiles, written to out: its part (the chunk's head and
-    text[lo:hi], a run of its functions; hi -1: the whole chunk) with its giants split"""
-    sys.path.insert(0, nx2)
-    import lifted_c
-    import split_giants
-    with open(path, "rb") as f:
-        text = f.read()
-    if lo or hi >= 0:
-        m = lifted_c.HEAD_BYTES.search(text)
-        text = text[:m.start() if m else 0] + text[lo:hi if hi >= 0 else len(text)]
-    split, st = split_giants.split_text(text.decode("utf-8"), split_giants.PIECE_KB)
-    with open(out, "wb") as f:
-        f.write(split.encode("utf-8") if st["functions_split"] else text)
-
-
 def compile_game(kit, info, work, gen, clang, jobs, memory_gb=0):
     step(3)
-    src, env = python_env(kit, work)
-    sys.path.insert(0, os.path.join(src, "nx2"))
-    import split_giants
-    rt64 = os.path.join(work, "rt64")
-    # (the 64-bit guest window's runtime header and a64_rt.c: nx2/rtgen.py, as ps5/build.py makes them)
-    run([sys.executable, "-I", "-c", "import sys; sys.path.insert(0, sys.argv[1]); import rtgen; rtgen.write(sys.argv[2])",
-         os.path.join(src, "nx2"), rt64], env=env, what="the runtime header")
-    place = lambda a: a.replace("{kit}", kit).replace("{rt64}", rt64).replace("{gen}", gen)
-    flags = [place(a) for a in info["target_flags"] + info["game_flags"]]
-    chunks = sorted(f for f in os.listdir(gen) if f.startswith("code_") and f.endswith(".c"))
-    others = [os.path.join(gen, f) for f in info["game_files"]] + [os.path.join(rt64, "a64_rt.c")]
+    place = lambda a: a.replace("{kit}", kit).replace("{gen}", gen)
+    target = [place(a) for a in info["target_flags"]]
+    c_flags = target + [place(a) for a in info["game_flags"]]
+    ir_flags = target + info["ir_flags"]
+    hot_flags = target + [info["hot_opt"] if a == "-O1" else a for a in info["ir_flags"]]
+    units = sorted(f for f in os.listdir(gen) if f.startswith("lifted_") and f.endswith(".ll"))
     obj_dir = os.path.join(work, "obj")
-    cut_dir = os.path.join(work, "cut")   # (the compiled copies of the chunks: giants split, parts cut; removed after each)
     os.makedirs(obj_dir, exist_ok=True)
-    os.makedirs(cut_dir, exist_ok=True)
     version = subprocess.run([clang, "--version"], capture_output=True, text=True).stdout.splitlines()[0]
-    # (within --memory: the compiles' share is what this process leaves, and the parts are cut to half of it, so two run at once:
-    # a part's fixed 0.4 GB makes smaller ones slower in all. Else a chunk is cut only where it does not fit in the memory free)
-    limit = max(MIN_PART_MB, memory_gb * 1024 - SELF_MB) if memory_gb else 0
-    free = available_gb()
-    cap = max(MIN_PART_MB, int(limit / 2 if limit else (free * 1024 - RESERVE_MB if free else 0))) if (limit or free) else 0
+    limit = max(900, memory_gb * 1024 - SELF_MB) if memory_gb else 0
     heads = hashlib.sha1()
-    for d in (rt64, os.path.join(kit, "src", "third_party", "a64-kit", "rt"), os.path.join(kit, "src", "nx2", "rt"), gen):
-        for f in sorted(os.listdir(d)):
-            if f.endswith(".h"):
-                heads.update(f.encode() + open(os.path.join(d, f), "rb").read())
-    base = hashlib.sha1((" ".join(info["target_flags"] + info["game_flags"]) + version + split_giants.flag()).encode() +
+    for f in sorted(os.listdir(os.path.join(gen, "rt"))):
+        if f.endswith(".h"):
+            heads.update(f.encode() + open(os.path.join(gen, "rt", f), "rb").read())
+    base = hashlib.sha1((" ".join(info["target_flags"] + info["game_flags"] + info["ir_flags"] + [info["hot_opt"]]) + version).encode() +
                         heads.digest()).hexdigest()
 
-    # (each job: (name, its file, (start, end) of a chunk's part or None for a file compiled as it is, its need). Only offsets are
-    # held: a part is read from its chunk when it is compiled, so this process holds no more than the compiles' own texts)
-    jobs_list = []
-    for c in chunks:
-        with open(os.path.join(gen, c), "rb") as f:
-            text = f.read()
-        parts = cut_parts(text, cap, split_giants.MIN_KB * 1024)
-        for i, (lo, hi, need) in enumerate(parts):
-            jobs_list.append((c[:-2] + ("" if len(parts) == 1 else "_p%d" % i), os.path.join(gen, c),
-                              (lo, hi) if len(parts) > 1 else (0, None), need))
-        del text
-    for s in others:
-        # (the lift's other files: a64_table.c, 16 MB, took 589 MB; the rest ~50 MB)
-        jobs_list.append((os.path.basename(s)[:-2], s, None, int(400 + 15 * os.path.getsize(s) / (1 << 20))))
+    # (each job: (name, its file, its flags, its need))
+    jobs_list = [(u[:-3], os.path.join(gen, u), hot_flags if u.startswith("lifted_hot_") else ir_flags,
+                  mem_need(os.path.join(gen, u))) for u in units]
+    for rel in info["game_files"]:
+        path = os.path.join(gen, *rel.split("/"))
+        jobs_list.append((os.path.basename(rel)[:-2], path, c_flags, mem_need(path)))
     biggest = max(n for _, _, _, n in jobs_list)
-    say("compiler: %s; %d files (%d chunks), up to %d at once%s; the largest compile takes ~%.1f GB" % (
-        version, len(jobs_list), len(chunks), jobs, " within %.1f GB" % memory_gb if memory_gb else " as the free memory allows",
+    say("compiler: %s; %d files (%d units of the translation), up to %d at once%s; the largest compile takes ~%.1f GB" % (
+        version, len(jobs_list), len(units), jobs, " within %.1f GB" % memory_gb if memory_gb else " as the free memory allows",
         biggest / 1024))
     gate = Gate(limit)
-    for f in os.listdir(obj_dir):   # (objects of an earlier build's other cut: not this build's)
+    for f in os.listdir(obj_dir):   # (objects of an earlier build's other units: not this build's)
         if f.endswith(".o") and f[:-2] not in {COMPILED[:-2] % n for n, _, _, _ in jobs_list}:
             for g in (f, f + ".key"):
                 if os.path.exists(os.path.join(obj_dir, g)):
                     os.remove(os.path.join(obj_dir, g))
 
     def one(job):
-        name, path, span, need = job
+        name, path, flags, need = job
         obj = os.path.join(obj_dir, COMPILED % name)
         h = hashlib.sha1(base.encode())
-        h.update(repr(span).encode())
+        h.update(" ".join(flags).encode())
         with open(path, "rb") as f:
             for block in iter(lambda: f.read(1 << 20), b""):
                 h.update(block)
@@ -392,22 +305,13 @@ def compile_game(kit, info, work, gen, clang, jobs, memory_gb=0):
         if os.path.exists(obj) and os.path.exists(stamp) and open(stamp).read() == key:
             return obj, None
         lease = gate.enter(need)
-        copy = None
         try:
-            if span is not None:   # (made by a process of its own: cutting a giant's lines takes this one's memory for good)
-                copy = os.path.join(cut_dir, name + ".c")
-                r = subprocess.run([sys.executable, "-I", os.path.abspath(__file__), "--make-part", os.path.join(src, "nx2"), path,
-                                    str(span[0]), str(-1 if span[1] is None else span[1]), copy], capture_output=True, text=True)
-                if r.returncode:
-                    return obj, "%s: making its copy failed (exit %d)\n%s" % (name, r.returncode, (r.stdout + r.stderr)[-3000:])
-            p = subprocess.Popen([clang] + flags + ["-c", copy or path, "-o", obj], stdout=subprocess.PIPE,
+            p = subprocess.Popen([clang] + flags + ["-c", path, "-o", obj], stdout=subprocess.PIPE,
                                  stderr=subprocess.STDOUT, text=True, errors="replace")
             gate.started(lease, p)
             out, _ = p.communicate()
         finally:
             gate.leave(lease)
-            if copy and os.path.exists(copy):
-                os.remove(copy)
         if p.returncode:
             return obj, "%s: exit %d\n%s" % (name, p.returncode, out[-3000:])
         open(stamp, "w").write(key)
@@ -461,6 +365,8 @@ def link(kit, info, work, objects, lld, nm):
              "--version-script", os.path.join(out, "local.map"), "--exclude-libs=ALL", "--gc-sections", "-e", "_start",
              "-Map=" + os.path.join(out, "longshot.map"), "-o", elf, os.path.join(kit, "obj", "app_crt.o")] +
             [os.path.join(kit, "obj", n) for n in info["objects"]] + sorted(objects) +
+            # (the game's Rust, longshot-rs, built for the console with emulated thread-local storage: the kit's)
+            [os.path.join(kit, "lib", "liblongshot_rs.a")] +
             [os.path.join(kit, "lib", n) for n in ("libavcodec.a", "libswscale.a", "libavutil.a", "libdav1d.a", "libzstd.a")] +
             stubs + [place(a) for a in lk["inputs"]] + ["--as-needed"] +
             sorted(os.path.join(sdk_lib, f) for f in os.listdir(sdk_lib) if f.endswith(".so")) + ["--hash-style=gnu"])
@@ -498,7 +404,7 @@ def title(kit, info, work, elf, native, out, model):
     run([native, "self", "--sign", "--in", new, "--out", os.path.join(app, "eboot.bin"), "--magic", "0x1D3D154F"], what="signing")
     run([native, "self", "--inspect", "--file", os.path.join(app, "eboot.bin")], what="the check of eboot.bin")
     shutil.copytree(os.path.join(kit, "title"), app, dirs_exist_ok=True)
-    shutil.copy2(os.path.join(work, "lift", "sa", "image", "image.bin"), os.path.join(app, "image.bin"))
+    shutil.copy2(os.path.join(work, "lift", "image", "image.bin"), os.path.join(app, "image.bin"))
     # ---- the console's profile ----
     profile = MODELS[model]
     param = os.path.join(app, "sce_sys", "param.json")
@@ -526,7 +432,8 @@ def check(a):
     missing = [n for n in info["objects"] if not os.path.exists(os.path.join(kit, "obj", n))]
     if missing:
         raise Stop("the kit lacks %d of its objects (%s)" % (len(missing), missing[0]))
-    clang, lld, nm, native = (find_tool(n, kit, a.tools) for n in ("clang", "ld.lld", "llvm-nm", "ps5-native-tool"))
+    builder, clang, lld, nm, native = (find_tool(n, kit, a.tools) for n in
+                                       ("longshot-builder", "clang", "ld.lld", "llvm-nm", "ps5-native-tool"))
     for tool, args in ((clang, ["--version"]), (lld, ["--version"]), (nm, ["--version"])):
         r = subprocess.run([tool] + args, capture_output=True, text=True)
         if r.returncode:
@@ -536,24 +443,15 @@ def check(a):
     if "ps5-native-tool" not in r.stdout + r.stderr:
         raise Stop("%s does not run: %s" % (native, (r.stdout + r.stderr)[-300:]))
     say("ps5-native-tool: runs")
-    src, env = python_env(kit, a.work or ".")
-    code = ("import sys, os; k = sys.argv[1]; sys.path[:0] = [os.path.join(k, 'nx2'), os.path.join(k, 'third_party', 'a64-kit', 'lift'), "
-            "os.path.join(k, 'third_party', 'a64-kit', 'tools')]\n"
-            "import numpy, capstone, lz4, zstandard, unicorn\n"
-            "import a64emit\n"
-            "text = a64emit.translate([(0x10000, 0x91000420)])[0][0]\n"
-            "assert 'c->x[0]' in text, text\n"
-            "print('lifter: its packages and its helper library load; ADD X0, X1, #1 ->', text.strip())\n"
-            # (the game file's reader, as a build starts it: its imports, and the library a ZBIC-compressed main is unpacked
-            # with, which must be there ready: a player has no compiler to build it with)
-            "import nup, unpack, zbic\n"
-            "assert os.path.exists(zbic.DLL), 'the ZBIC library is not in the kit: ' + zbic.DLL\n"
-            "assert zbic.lib().zbic_content_size(b'ZBIC', 4) < 0\n"
-            # (and reads what it writes: ps5/builder/zbic_check.c. A library that did not stopped every Linux build of v0.1.1)
-            "r = zbic.lib().zbic_selftest()\n"
-            "assert r == 0, 'the ZBIC library does not unpack its own frames (zbic_selftest %d): ' % r + zbic.DLL\n"
-            "print('game file reader: loads, and its ZBIC library unpacks what it packs')\n")
-    run([sys.executable, "-I", "-c", code, src], env=env, what="the lifter's parts")
+    # (the translator: upstream's builder, built for this PC; one instruction decoded says it runs here)
+    r = subprocess.run([builder, "dev", "decode", "91000420"], capture_output=True, text=True, env=builder_env())
+    if r.returncode or "91000420" not in r.stdout + r.stderr:
+        raise Stop("%s does not run (exit %d): %s" % (builder, r.returncode, (r.stdout + r.stderr)[-300:]))
+    say("longshot-builder: runs; " + (r.stdout + r.stderr).strip().splitlines()[0])
+    for need in (os.path.join("lib", "liblongshot_rs.a"), os.path.join("rt", "a64_config.h"), os.path.join("src", "host"),
+                 os.path.join("src", "game")):
+        if not os.path.exists(os.path.join(kit, need)):
+            raise Stop("the kit lacks %s" % need)
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
         c = os.path.join(tmp, "check.c")
@@ -571,54 +469,48 @@ def check(a):
     say("@@done check")
 
 
-def shader_lists(kit, work, game, app):
+def shader_lists(kit, work, game, app, builder, jobs):
     """(ps5/builder/shader_lists.py) the game's shader list and the pipeline state list in the title folder: the console's first
     start builds the pipelines before play, in a launch of its own, so play does not compile them (each compile leaves memory
-    the base console runs out of, issues #4 and #24). Made from the .nup alone: a folder given instead has no romfs to read"""
+    the base console runs out of, issues #4 and #24)"""
     step(6)
-    if not os.path.isfile(game):
-        say("note: no .nup given, so no shader lists: the game compiles its shaders as it plays")
-        return
-    src, env = python_env(kit, work)
-    run([sys.executable, "-I", "-u", os.path.join(HERE, "shader_lists.py"), "--src", src, "--nup", game, "--work", work,
-         "--out", app], env=env, what="listing the game's shaders")
+    run([sys.executable, "-I", "-u", os.path.join(HERE, "shader_lists.py"), "--builder", builder, "--src", os.path.join(kit, "src"),
+         "--game", game, "--work", work, "--out", app, "--jobs", str(jobs)], env=builder_env(), what="listing the game's shaders")
 
 
 def build(a):
     kit = find_kit(a.kit)
     info = json.load(open(os.path.join(kit, "kit.json")))
-    clang, lld, nm, native = (find_tool(n, kit, a.tools) for n in ("clang", "ld.lld", "llvm-nm", "ps5-native-tool"))
+    builder, clang, lld, nm, native = (find_tool(n, kit, a.tools) for n in
+                                       ("longshot-builder", "clang", "ld.lld", "llvm-nm", "ps5-native-tool"))
     out = os.path.abspath(a.out)
     work = os.path.abspath(a.work or os.path.join(out, "longshot-ps5-work"))
     os.makedirs(work, exist_ok=True)
     free = shutil.disk_usage(work).free / 2**30
     say("Longshot PS5 Builder: kit %s (%s); work folder %s (%.0f GB free)" % (info["longshot"], info["title_id"], work, free))
-    if free < 6:
-        raise Stop("the work folder's disk has %.1f GB free: the build wants 6 GB" % free)
+    if free < 12:   # (the translation's units are ~6 GB of text, their objects ~1.5 GB)
+        raise Stop("the work folder's disk has %.1f GB free: the build wants 12 GB" % free)
     gb = available_gb()
     if a.memory:
         say("memory: the build keeps to about %.1f GB%s" % (a.memory, "" if gb is None else " (%.1f GB is free now)" % gb))
     elif gb is not None and gb < MIN_FREE_GB:
         say("note: %.1f GB of memory is free; the build wants about %.0f GB at the least. Close other programs if it stops."
             % (gb, MIN_FREE_GB))
-    exefs = read_game(kit, work, a.game)
-    gen = lift(kit, work, exefs, a.lift_jobs or lift_processes(a.memory))
+    game = os.path.abspath(a.game)
+    lift_dir = read_game(kit, work, game, builder)
+    gen = lift(kit, info, work, lift_dir, builder, a.lift_jobs or lift_processes(a.memory))
     objects = compile_game(kit, info, work, gen, clang, a.jobs or default_jobs(), a.memory)
     elf = link(kit, info, work, objects, lld, nm)
     app = title(kit, info, work, elf, native, out, a.model)
-    shader_lists(kit, work, a.game, app)
+    shader_lists(kit, work, game, app, builder, a.jobs or default_jobs())
     say("@@done " + app)
     return app
 
 
 def main():
-    if sys.argv[1:2] == ["--make-part"]:
-        nx2, path, lo, hi, out = sys.argv[2:7]
-        make_part(nx2, path, int(lo), int(hi), out)
-        return 0
     ap = argparse.ArgumentParser(description="Longshot PS5 Builder: the PS5 title folder from your own game file")
     ap.add_argument("--check", action="store_true", help="check the builder's own parts on this PC (no game is needed), and stop")
-    ap.add_argument("--game", help="the game: a .nup file, or a folder with its exefs")
+    ap.add_argument("--game", help="the game: a .nup file, or an unpacked dump's folder (exefs/ and romfs/)")
     ap.add_argument("--out", help="where the title folder goes")
     ap.add_argument("--model", choices=sorted(MODELS),
                     help="the console the folder is for: base (PS5 and PS5 Slim) or pro (PS5 Pro)")
@@ -626,7 +518,7 @@ def main():
     ap.add_argument("--tools")
     ap.add_argument("--work", help="the build's own files (default: <out>/longshot-ps5-work); kept, so a second build is short")
     ap.add_argument("--jobs", type=int, default=0, help="compiles at once (default: by the cores and the memory free)")
-    ap.add_argument("--lift-jobs", type=int, default=0, help="the translation's processes (default: the lifter's own rule)")
+    ap.add_argument("--lift-jobs", type=int, default=0, help="the translation's threads (default: the cores less one)")
     ap.add_argument("--memory", type=float, default=0,
                     help="GB of memory the build may use (default: as much as is free). Lower is slower; %.0f at the least"
                     % MIN_MEMORY_GB)

@@ -6,11 +6,15 @@
 #include "hos_paths.h"
 #include "hos_wide_size.h"
 #include "options_path.h"
+#ifndef LONGSHOT_ENV_H   /* (env_on: the switches' one rule) */
+#include "../gpu/vk/compat/longshot_env.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <windows.h>   /* (the exe's folder; the browser build: the Microsoft C runtime's time functions) */
+#include "hos_atomic_file.h"   /* (language.txt's first write is whole or not at all) */
 
 static int64_t boot_ns;
 
@@ -97,14 +101,16 @@ static const char *desired_language(void) {
                 break;
             }
             fclose(f);
-        } else if ((f = fopen(path, "w")) != NULL) {
+        } else {   /* (written whole or not at all: half a template has no language line) */
+            char text[4096];
 #ifdef __PROSPERO__
-            fputs(ps5_template_head, f);
+            size_t n = (size_t)snprintf(text, sizeof text, "%s", ps5_template_head);
 #else
-            fputs(pc_template_head, f);
+            size_t n = (size_t)snprintf(text, sizeof text, "%s", pc_template_head);
 #endif
-            for (size_t i = 0; i < sizeof languages / sizeof *languages; i++) fprintf(f, "# %-8s %s\n", languages[i].code, languages[i].name);
-            fclose(f);
+            for (size_t i = 0; i < sizeof languages / sizeof *languages && n < sizeof text; i++)
+                n += (size_t)snprintf(text + n, sizeof text - n, "# %-8s %s\n", languages[i].code, languages[i].name);
+            if (n < sizeof text) hos_atomic_write(path, text, n);
         }
     }
 #ifdef __PROSPERO__
@@ -164,7 +170,10 @@ int hos_ini_option(const char *key, int otherwise) {   /* (longshot: the Insert 
 }
 static int handheld(void) {
     static int v = -1;
-    if (v < 0) v = getenv("HOS_HANDHELD") ? atoi(getenv("HOS_HANDHELD")) != 0 : ini_option("handheld_profile", 0) != 0;
+    if (v < 0) {
+        const char *e = getenv("HOS_HANDHELD");
+        v = e ? !env_value_off(e) : ini_option("handheld_profile", 0) != 0;
+    }
     return v;
 }
 /* (longshot) The Insert menu's Output resolution (output_res=, HOS_OUTPUT_RES over it), docked only: a size, "<width>x<height>",
@@ -173,7 +182,7 @@ static int handheld(void) {
    else is the game's own size, said in the log. The menu offers 2048x1152 and the screen's display modes (gpu/vk/display_modes.h;
    where they are not known 1920x1080, 2560x1440, 3840x2160, 5120x1440 and 5120x2880), and any other size as its own choice. The numbers it saved before are read as their sizes: 0 the game's
    2048 x 1152, 1 2560 x 1440, 2 3840 x 2160, 3 1920 x 1080, 4 5120 x 1440, 5 5120 x 2880. The game's frame is its display size
-   (2560 x 1440 as shipped; nx2/oot_patches.py apply_output_size asks hos_output_size) times its graphics scale
+   (2560 x 1440 as shipped; the output size patch, builder/crates/edits/src/patches.rs, asks hos_output_size) times its graphics scale
    (GetCurrentGraphicsScale's tier: 0 x1, 1 x0.8, 2 x0.667). The tier is not the operation mode: the console's library maps
    the system's graphics scaling parameter (10, 20, 30) to it, and 0 is the full picture. 2048x1152 asks for tier 1, the game's
    own reduced size (what every run drew before, from x0 left at the call before's answer); each other size, and none chosen
@@ -230,11 +239,11 @@ uint32_t hos_output_size(int height) {
     if (!output_mode()) return height ? 1440 : 2560;
     return height ? output_h : output_w;
 }
-/* (longshot) The render targets' GPU pool (nx2/oot_patches.py), 0x13100000 bytes as shipped, for 2560 x 1440: a 3840x2160 3D at
+/* (longshot) The render targets' GPU pool (builder/crates/edits/src/patches.rs), 0x13100000 bytes as shipped, for 2560 x 1440: a 3840x2160 3D at
    the 4K output ran out of it. Scaled with the output's pixels, or the widescreen picture's when it has more (host/hos_main.c:
    hos_wide_out, the output's height at the screen's shape: 7680 x 2160 for a 32:9 screen at the 4K output, twice the pixels the pool
-   was scaled for, and the game crashed as Kokiri Forest loaded, a null pointer or "texture handle ids -1", issue 1031);
-   Castle Town's guard-house conversation/camera test crashed with 305 MB at 2560 x 1440 and passed with 512 MB.
+   was scaled for, or the game crashes as Kokiri Forest loads, a null pointer or "texture handle ids -1");
+   Castle Town's guard-house conversation/camera crashes with 305 MB at 2560 x 1440 and passes with 512 MB.
    Keep at least 512 MB by default; larger scaled pools and an explicit HOS_RT_POOL_MB=<MB> still win. An output with more pixels
    than 3840 x 2160 (a size of the player's own, up to 5120 x 2880's pixels: hos_output_parse) keeps its pool to 900 MB:
    5120 x 2880 scales to 1220 MB, and 1220 and 1000 MB both failed the game's own reservation at boot; at 900 MB it boots and
@@ -271,7 +280,11 @@ HLE(_ZN2nn2oe44SetPerformanceModeChangedNotificationEnabledEb) {}
 HLE(_ZN2nn2oe28SetResumeNotificationEnabledEb) {}
 HLE(_ZN2nn2oe38SetUserInactivityDetectionTimeExtendedEb) {}
 /* No system notifications ever arrive: TryPop says none, Pop waits forever (as it would on a quiet console). */
-HLE(_ZN2nn2oe25TryPopNotificationMessageEPj) { RET(0); }
+extern void nvn_output_preview_poll(Ctx *c);
+HLE(_ZN2nn2oe25TryPopNotificationMessageEPj) {
+    nvn_output_preview_poll(c);
+    RET(0);
+}
 HLE(_ZN2nn2oe22PopNotificationMessageEv) { for (;;) hos_sleep_ns(1000000000LL); }
 
 /* ---- nn::account: one user ------------------------------------------------------------------------------------ */
@@ -327,7 +340,9 @@ HLE(_ZN2nn4time19StandardSteadyClock3nowEv) { RET((uint64_t)(hos_now_ns() / 1000
 static void socket_poll(Ctx *c) {
     const uint64_t fds = ARG(0), n = ARG(1);
     const int timeout = (int)ARG(2);
-    for (uint64_t i = 0; fds && i < n && i < 4096; i++) *(uint16_t *)GP(fds + 8 * i + 6) = 0;   /* revents */
+    const uint64_t m = n < 4096 ? n : 4096;
+    if (fds && hos_guest_range(fds, 8 * m))   /* (longshot: the descriptors in guest memory) */
+        for (uint64_t i = 0; i < m; i++) *(uint16_t *)GP(fds + 8 * i + 6) = 0;   /* revents */
     if (timeout != 0) {
         const int away = hos_vcore_away();
         hos_sleep_ns((int64_t)(timeout < 0 || timeout > 50 ? 50 : timeout) * 1000000);

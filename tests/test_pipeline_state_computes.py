@@ -1,9 +1,9 @@
 """The pipeline state list's compute records: the compute programs play dispatched, named by their compute stage's code key in a
 version 2 record of kind kCompute (vk_draw.cpp StateRec2), in the same lists, with the same tools, as the pipelines.
 
-- nx2/pipeline_states.py: the record's layout, what describe and the merge make of it (each program once, with version 1 lists
+- scripts/pipeline_states.py: the record's layout, what describe and the merge make of it (each program once, with version 1 lists
   too), the checks (a compute record that holds more than its key, a kind no build knows, more compute programs than the release's check
-  allows: it stops and says so, nothing is dropped), the tour's and a contributed source, and nx2/make_game.py shipping them beside the game;
+  allows: it stops and says so, nothing is dropped), the tour's and a contributed source (the builder ships them beside the game: builder/crates/build-assets);
 - a list someone sent (add, --check): taken only when it is exactly a list. Refused, and nothing written: one cut short, one with
   a kind no build knows or a compute record that holds more than its key, one that names more compute programs than the
   game has, one larger than a list is (as a file, or once unpacked), an xz file cut short or with more after it, a list of
@@ -36,7 +36,7 @@ from pathlib import Path
 RUN_ALL_ARGS = ["--cxx", "{cxx}"]
 
 ROOT = Path(__file__).resolve().parents[1]
-TOOL = ROOT / "nx2" / "pipeline_states.py"
+TOOL = ROOT / "scripts" / "pipeline_states.py"
 K1, K2, K3 = 0x1111222233334444, 0xAAAABBBBCCCCDDDD, 0x0123456789ABCDEF
 
 
@@ -140,18 +140,9 @@ def check_tool(tool, draw):
             raise SystemExit("the sources' merge: %d records, expected the tour's two and the contributed list's new program" % len(recs))
         if tool.read(os.path.join(src, tool.CONTRIB, "someone-played" + tool.EXT)) != [tool.compute_record(K2), c]:
             raise SystemExit("a contributed list keeps its own records, the tour's too (the tour's list is replaced whole)")
-        # make_game ships them beside the game, unpacked, as the game reads them
-        make_game = load("make_game_under_test", ROOT / "nx2" / "make_game.py")
-        game = os.path.join(d, "game")
-        os.makedirs(game)
-        make_game.ROOT = d
+        # (the sources where the repository keeps them: builder/crates/build-assets/src/pipelines.rs ships them beside the game)
         os.makedirs(os.path.join(d, tool.SOURCES[0]))
         os.replace(src, os.path.join(d, *tool.SOURCES))
-        with contextlib.redirect_stdout(io.StringIO()):
-            make_game.ship_state_list(game)
-        shipped = os.path.join(game, "longshot_pipeline_states_shipped.bin")
-        if tool.compute_keys(tool.read(shipped, strict=True)) != [K1, K2] or open(shipped, "rb").read(8) != tool.MAGIC2:
-            raise SystemExit("make_game did not ship the sources' compute programs beside the game")
         # more compute programs than play dispatches: the release's check stops (the game keeps a pipeline ready for each)
         # (several lists that each name fewer, or a source put there by hand: add itself refuses such a list, check_sent)
         src = os.path.join(d, *tool.SOURCES)
@@ -255,17 +246,36 @@ def check_sent(tool):
             raise SystemExit("the sent lists' merge: %d records, programs %s" % (len(recs), tool.compute_keys(recs)))
 
 
+def first_argument(code, at):
+    """The text from at to the first comma outside brackets"""
+    end, depth = at, 0
+    while depth or code[end] not in ",)":
+        depth += (code[end] in "([{") - (code[end] in ")]}")
+        end += 1
+    return " ".join(code[at:end].split())
+
+
 def check_source(draw):
     """precompile_run keeps ready the plan's programs; a compute record is written by state_record_compute alone, at a dispatch"""
     def body_of(signature):
         at = draw.index(signature)
         return draw[at:draw.index("\n}\n", at)]
     pre = body_of("void precompile_run(")
-    for line in ('const ComputePlan plan = computes_plan(getenv("RX_VK_PRECOMPILE_COMPUTES"), !env_on("RX_VK_NO_STATE_LIST"));',
+    for line in ('const ComputePlan plan = env_on("LONGSHOT_PREPARE_ONLY") ? compute_warm_plan()',
                  "if (!plan.all && !plan.none) wanted.insert(plan.keys.begin(), plan.keys.end());",
                  "}, plan.all, true);"):
         if line not in pre:
             raise SystemExit("precompile_run does not take its compute programs from computes_plan: no `%s`" % line)
+    # (every call, however many: precompile_run's, the index's for a preparation left out, ...; and the warm plan's, which takes
+    # its "all" only when precompile_computes_which names nothing)
+    code = re.sub(r"//[^\n]*", "", draw)
+    asked = [first_argument(code, m.end()) for m in re.finditer(r"(?<![\w:])computes_plan\(", code)]
+    which = "precompile_computes_which()"
+    warm = body_of("const ComputePlan& compute_warm_plan() {")
+    if (draw.count('getenv("RX_VK_PRECOMPILE_COMPUTES")') != 1 or asked.count(which) < 2
+            or sorted(set(asked)) != sorted({"const char* which", 'which ? which : "all"', which})
+            or asked.count('which ? which : "all"') != 1 or "const char* which = %s;" % which not in warm):
+        raise SystemExit("a compute plan is made from something other than precompile_computes_which: %s" % asked)
     if "computes_read()" in pre or "state_record_compute(" in pre or "state_record_compute(" in body_of("void state_list_prepare("):
         raise SystemExit("precompile_run reads the learned list past the plan, or the prepare writes compute records")
     calls = [m.start() for m in re.finditer(r"(?<![\w:])state_record_compute\(", draw)]
@@ -284,12 +294,14 @@ def check_source(draw):
 
 FIXTURE_HEAD = r'''
 #define _CRT_SECURE_NO_WARNINGS 1
+#include <algorithm>
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iterator>
 #include <mutex>
 #include <string>
@@ -302,7 +314,12 @@ enum VkFormat : uint32_t { VK_FORMAT_UNDEFINED = 0 };
 typedef uint32_t VkFormatFeatureFlags;
 constexpr uint32_t VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT = 0x80, VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT = 0x200;
 struct VkFormatProperties { uint32_t linearTilingFeatures, optimalTilingFeatures, bufferFeatures; };
-struct { void* physical = (void*)1; } dev;
+constexpr int VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA = 6;
+struct { void* physical = (void*)1; int driver_id = 0; } dev;
+static bool all_mode = false;
+static bool compile_level_all() { return all_mode; }
+static const char* override_computes = nullptr;
+static const char* fixture_getenv(const char*) { return override_computes; }
 // (a device that draws to every format: these records are not about formats)
 static void vkGetPhysicalDeviceFormatProperties(void*, VkFormat, VkFormatProperties* p) {
     p->optimalTilingFeatures = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
@@ -358,6 +375,13 @@ using Keys = std::unordered_set<uint64_t>;
 int main(int argc, char** argv) {
     CHECK(argc == 2);
     folder = argv[1];
+    CHECK(!std::strcmp(precompile_computes_which(), "listed"));
+    all_mode = true;
+    CHECK(precompile_computes_which() == nullptr);
+    dev.driver_id = VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
+    CHECK(!std::strcmp(precompile_computes_which(), "listed"));
+    override_computes = "all", all_mode = false;
+    CHECK(!std::strcmp(precompile_computes_which(), "all"));
     const uint64_t K1 = 0x1111222233334444ull, K2 = 0xAAAABBBBCCCCDDDDull, K3 = 0x0123456789ABCDEFull;
     const char* own = "longshot_pipeline_states.bin";
     const char* shipped = "longshot_pipeline_states_shipped.bin";
@@ -384,7 +408,7 @@ int main(int argc, char** argv) {
         int version = 0;
         CHECK(state_list_read(state_list_path(own), &version).empty() && version == 2);   // (no pipelines in it)
     }
-    {   // (the list the test's Python reads back with nx2/pipeline_states.py)
+    {   // (the list the test's Python reads back with scripts/pipeline_states.py)
         FILE* in = std::fopen(state_list_path(own).c_str(), "rb");
         FILE* out = std::fopen(state_list_path("game_wrote.bin").c_str(), "wb");
         CHECK(in && out);
@@ -463,6 +487,12 @@ int main(int argc, char** argv) {
         CHECK(p.shipped == 3 && p.learned == 2 && p.fresh == 2);
         const ComputePlan q = computes_plan("listed", true);   // (the same once play has dispatched some)
         CHECK(q.keys == p.keys && !q.all && !q.none);
+        ComputePlan reversed;
+        for (auto key : {D, C, B, A}) reversed.keys.insert(key);
+        CHECK(reversed.coverage() == q.coverage());
+        reversed.keys.erase(B);
+        CHECK(reversed.coverage() != q.coverage() && q.coverage() != ComputePlan::every);
+        CHECK(computes_plan("all", true).coverage() == ComputePlan::every);
     }
     {   // the switch for an A/B: the learned ones alone, as before the list named any (and with RX_VK_NO_STATE_LIST)
         const ComputePlan p = computes_plan("learned", true), q = computes_plan(nullptr, false);
@@ -526,8 +556,11 @@ def check_game(tool, draw, cxx):
         "template <class R>\n" + block(draw, "uint64_t state_hash(const R& r)"),
         "@STUBS@",
         block(draw, "std::vector<StateRec> state_list_read("), block(draw, "std::vector<uint64_t> state_list_computes("),
+        block((ROOT / "gpu/vk/draw_key.h").read_text(), "inline uint64_t mix("),
         block(draw, "struct ComputePlan {", True), block(draw, "ComputePlan computes_plan("),
+        block(draw, "const char* precompile_computes_which()").replace("getenv(", "fixture_getenv("),
         "std::mutex state_mu;\nFILE* state_file = nullptr;\nstd::unordered_set<uint64_t> state_seen;",
+        block(draw, "static void cut_part_record(") if "static void cut_part_record(" in draw else "",
         block(draw, "void state_open_locked()"), block(draw, "void state_record_compute(uint64_t key)")))
     head, _, tail = FIXTURE_MAIN.partition("@READERS@")
     fixture = FIXTURE_HEAD + readers.replace("@STUBS@", head) + tail
@@ -590,7 +623,8 @@ static int asks = 0, compiles = 0, destroys = 0, quick_compiles = 0;
 static bool serial = false, quick_row = false;
 static bool serial_builds_on() { return serial; }
 static bool intel_quick_compute() { return quick_row; }
-static void pin_subgroup(decltype(VkComputePipelineCreateInfo::stage)&, unsigned) {}
+static void pin_subgroup(decltype(VkComputePipelineCreateInfo::stage)&, unsigned, unsigned long long) {}
+static void pin_compute(decltype(VkComputePipelineCreateInfo::stage)& st, const Program& p) { pin_subgroup(st, p.workgroup[0], 1ull * p.workgroup[0] * p.workgroup[1] * p.workgroup[2]); }
 static VkResult cached_compute(const VkComputePipelineCreateInfo* ci, VkPipeline* pl) {
     CHECK(ci->stage.module == 0x2468 && ci->layout == 0x1357);
     if (ci->flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT) {

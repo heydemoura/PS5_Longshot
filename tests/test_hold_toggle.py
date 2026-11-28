@@ -12,7 +12,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cc", default="gcc")
     args = parser.parse_args()
-    menu = (ROOT / "host/oot_menu.c").read_text(encoding="utf-8")
+    menu = (ROOT / "game/oot_menu.c").read_text(encoding="utf-8")
     linux_menu = menu[menu.rindex("#else") + len("#else"):menu.rindex("#endif")]
     code = r'''
 #include "host/hold_toggle.h"
@@ -21,6 +21,7 @@ def main():
 typedef struct { int unused; } Ctx;
 static int clears;
 void hos_input_clear_toggles(void) { clears++; }
+static void sprint_menu_tick(uint64_t screen) { (void)screen; }   /* (oot_menu.c's, above its #if: it reads guest memory) */
 // LINUX_MENU
 int main(void) {
     hos_oot_menu_focus(0, 0, 0, 0);

@@ -15,22 +15,22 @@ ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("run_all_changed", ROOT / "tests" / "run_all.py")
 run_all = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(run_all)
-TESTS = sorted(d + "/" + f for d in ("tests", "nx2") for f in os.listdir(ROOT / d) if f.startswith("test_") and f.endswith(".py"))
+TESTS = sorted("tests/" + f for f in os.listdir(ROOT / "tests") if f.startswith("test_") and f.endswith(".py"))
 
 
 class ChangedTests(unittest.TestCase):
     def test_the_checks_that_name_a_changed_file(self):
-        picked, everything = run_all.reads_changed(TESTS, ["nx2/chunks.py"])
+        picked, everything = run_all.reads_changed(TESTS, ["scripts/pipeline_states.py"])
         self.assertFalse(everything)
-        self.assertIn("tests/test_chunk_split.py", picked)
-        self.assertIn("tests/test_parallel_emit.py", picked)
-        self.assertNotIn("tests/test_team_chat.py", picked)
+        self.assertIn("tests/test_pipeline_states.py", picked)
+        self.assertIn("tests/test_pipeline_state_sources.py", picked)
+        self.assertNotIn("tests/test_longshot_saves.py", picked)
         self.assertLess(len(picked), len(TESTS) // 4)
 
     def test_by_name_too_and_not_inside_a_longer_name(self):
-        picked, _ = run_all.reads_changed(TESTS, ["scripts/team_chat.py"])
-        self.assertIn("tests/test_team_chat.py", picked)
-        self.assertFalse(any("team_chat_x" in p for p in picked))
+        picked, _ = run_all.reads_changed(TESTS, ["scripts/longshot_saves.py"])   # (its check names "longshot_saves.py")
+        self.assertIn("tests/test_longshot_saves.py", picked)
+        self.assertFalse(any("longshot_saves_x" in p for p in picked))
 
     def test_a_changed_test_runs_itself(self):
         self.assertEqual(run_all.reads_changed(TESTS, ["tests/test_run_all_changed.py"])[0], ["tests/test_run_all_changed.py"])
@@ -46,7 +46,7 @@ class ChangedTests(unittest.TestCase):
         self.assertEqual(run_all.reads_changed(TESTS, [unnamed])[0], [])
 
     def test_a_module_a_test_imports_by_name(self):
-        self.assertIn("tests/test_parallel_emit.py", run_all.reads_changed(TESTS, ["nx2/chunks.py"])[0])
+        self.assertIn("tests/test_perf_report.py", run_all.reads_changed(TESTS, ["tests/test_perf_report.cpp"])[0])   # (named in it)
 
     def test_the_files_come_from_git_committed_or_not_and_untracked(self):
         answers = {("merge-base", "HEAD", "origin/main"): "abc123\n", ("diff", "--name-only", "abc123"): "nx2/a.py\nnx2/b.py\n",

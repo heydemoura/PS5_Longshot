@@ -1,8 +1,8 @@
 """scripts/coverage/cover.py report and compare count what a run folder says, on any OS.
 
 Writes a made-up run folder (fns.txt, cover.bin in cover_dll.c's format, marks.txt, run.json) and a csize file, then checks
-the report's counts (functions that ran, host bytes, lifted C, the compile cost from nx2/chunks.py's model scaled to
---compiler-s), how many had run by each mark, covered.txt's order, a hot list's cover, and compare's misses between two
+the report's counts (functions that ran, host bytes, lifted C, the compile cost from cover.py's model of the old lifter scaled to
+--compiler-s), how many had run by each mark, covered.txt's order, and compare's misses between two
 runs. Also that cover_dll.c writes the header read_cover reads.
 
 python -I -B tests/test_coverage_report.py
@@ -62,11 +62,48 @@ def main():
         csize = os.path.join(tmp, "csize.txt")
         with open(csize, "w") as f:
             f.writelines("%s %d\n" % (n, c) for n, _, c, _ in FNS)
-        hot = os.path.join(tmp, "hot.txt")
-        with open(hot, "w") as f:
-            f.write("f_80000000\nf_80000100\nf_99999999\n")
 
-        out = cover("report", run_a, "--csize", csize, "--hot", hot, "--compiler-s", "1000")
+        # A valid initial snapshot has known functions, but none has run yet.
+        run_zero = os.path.join(tmp, "zero")
+        write_run(run_zero, [0] * len(FNS), marks=[(1.0, "initial snapshot")])
+        out = cover("report", run_zero, "--csize", csize, "--compiler-s", "1000")
+        expect(out, "Functions that ran: 0 of 5 = 0.0%; their host code 0.0 of 0.0 MB = 0.0%")
+        expect(out, "Their lifted C: 0.0 of 0.3 MB = 0.0%")
+        expect(out, "Their compile cost (the build's model): 0.0% = ~0 of the 1000 -O1 compiler-s")
+        expect(out, "by 'initial snapshot' (1 s): 0 functions, host 0.0 MB, C 0.0 MB")
+        for win in (100, 1000, 10000):
+            expect(out, "Busiest %d ms windows (start s: new functions / host KB / est. -O1 compiler-s): \n" % win)
+        assert "100 ms windows with new functions:" not in out, out
+        expect(out, "New functions per minute: \n")
+        expect(out, "Largest that ran (C KB at first-run s): \n")
+        with open(os.path.join(run_zero, "covered.txt"), "rb") as f:
+            assert f.read() == b""
+        with open(os.path.join(run_zero, "report.txt"), encoding="utf-8") as f:
+            assert f.read() == out
+
+        # Without cost metadata the same zero-call snapshot is still reportable.
+        out = cover("report", run_zero)
+        expect(out, "Functions that ran: 0 of 5 = 0.0%")
+        assert "Their lifted C:" not in out, out
+        with open(os.path.join(run_zero, "covered.txt"), "rb") as f:
+            assert f.read() == b""
+
+        # A single touched window keeps its percentiles and strict >0.1 s threshold.
+        run_one = os.path.join(tmp, "one")
+        write_run(run_one, [100] + [0] * (len(FNS) - 1))
+        one_csize = os.path.join(tmp, "one-csize.txt")
+        with open(one_csize, "w") as f:
+            f.write("f_80000000 1000\n")
+        for compiler_s, median, count in (("0.1", "0.10", 0), ("0.2", "0.20", 1)):
+            out = cover("report", run_one, "--csize", one_csize, "--compiler-s", compiler_s)
+            expect(out, "Functions that ran: 1 of 5 = 20.0%")
+            expect(out, "100 ms windows with new functions: 1; their est. -O1 compile time: median %s s, 99th pct %s s, max %s s; windows over 0.1 s of compiling: %d"
+                   % (median, compiler_s, compiler_s, count))
+            expect(out, "Busiest 100 ms windows (start s: new functions / host KB / est. -O1 compiler-s): 0.1: 1 / 0 / " + compiler_s)
+            with open(os.path.join(run_one, "covered.txt"), encoding="ascii") as f:
+                assert f.read() == "f_80000000 100\n"
+
+        out = cover("report", run_a, "--csize", csize, "--compiler-s", "1000")
         expect(out, "Functions that ran: 3 of 5 = 60.0%; their host code 0.0 of 0.0 MB = 53.3%")
         # (C: 8,000 of 363,000 bytes; the model: s + s*s//350000 per function; f_80000100 alone is 350,000 + 350,000)
         model = lambda s: s + s * s // 350000
@@ -78,7 +115,6 @@ def main():
         expect(out, "by 'title screen' (1 s): 1 functions")
         expect(out, "by 'in play (file loaded)' (20 s): 2 functions")
         expect(out, "New functions per minute: 0:3")
-        expect(out, "hot.txt: 2 functions, 1 ran in this session (50.0% of the list); the list holds 33.3% of what ran")
         with open(os.path.join(run_a, "covered.txt"), encoding="ascii") as f:
             got = [line.split() for line in f]
         assert got == [["f_80000000", "500"], ["f_80000200", "1500"], ["f_80000300", "30000"]], got

@@ -1,6 +1,7 @@
 // The Insert menu's Bug report: what is read and how it is written (vk_bug_report.h). No Vulkan and no menu here:
 // tests/test_bug_report.py compiles this file alone.
 #include "vk_bug_report.h"
+#include "compat/longshot_redact.h"
 
 #include <algorithm>
 #include <atomic>
@@ -50,11 +51,6 @@ constexpr const char* kForm = "https://git.magicbean.dev/MagicBeanDev/Longshot/i
 constexpr size_t kLinkMax = 2000;
 
 bool is_sep(char c) { return c == '/' || c == '\\'; }
-/// (a character a file or folder name has: a name ends at any other)
-bool name_char(char c) {
-    const unsigned char u = (unsigned char)c;
-    return std::isalnum(u) || c == '.' || c == '_' || c == '-' || u >= 0x80;
-}
 bool same_char(char a, char b, bool windows) {
     if (is_sep(a) && is_sep(b)) return windows || a == b;
     return windows ? std::tolower((unsigned char)a) == std::tolower((unsigned char)b) : a == b;
@@ -292,29 +288,9 @@ std::string url_part(const std::string& s) {
 }  // namespace
 
 std::string redact(const std::string& line, const std::string& home, const std::string& user, bool windows) {
-    std::string h = home;
-    while (h.size() > 1 && is_sep(h.back())) h.pop_back();
-    const bool with_home = h.size() > 1;
-    std::string out;
-    out.reserve(line.size());
-    for (size_t i = 0; i < line.size();) {
-        const size_t after_home = i + h.size(), after_user = i + user.size();
-        // (the home folder as a whole: not inside a longer name, not the end of another path)
-        if (with_home && (i == 0 || (!name_char(line[i - 1]) && !is_sep(line[i - 1]))) && matches_at(line, i, h, windows) &&
-            (after_home >= line.size() || !name_char(line[after_home]))) {
-            out += windows ? "%USERPROFILE%" : "~";
-            i = after_home;
-            continue;
-        }
-        // (the user's name as a folder of any path: /run/media/<user>, D:\Users\<user>, /var/home/<user>)
-        if (!user.empty() && i > 0 && is_sep(line[i - 1]) && matches_at(line, i, user, windows) &&
-            (after_user >= line.size() || !name_char(line[after_user]))) {
-            out += "<user>";
-            i = after_user;
-            continue;
-        }
-        out += line[i++];
-    }
+    // (one implementation with the host's log and crash window: compat/longshot_redact.h)
+    std::string out(line.size() * 7 + 1, '\0');
+    out.resize(longshot_redact_line(out.data(), out.size(), line.data(), line.size(), home.c_str(), user.c_str(), windows));
     return out;
 }
 
@@ -344,16 +320,29 @@ std::string cpu_name() {
     return cpu;
 }
 
-std::string system_text() {
+std::string cpu_text() {
     std::string cpu = cpu_name();
     if (cpu.empty()) cpu = "an unknown CPU";
     if (const unsigned n = std::thread::hardware_concurrency()) cpu += " (" + std::to_string(n) + " threads)";
     uint64_t ram = 0;
-    std::string os;
 #ifdef _WIN32
     MEMORYSTATUSEX m{};
     m.dwLength = sizeof m;
     if (GlobalMemoryStatusEx(&m)) ram = m.ullTotalPhys;
+#else
+    {
+        const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGE_SIZE);
+        if (pages > 0 && page > 0) ram = (uint64_t)pages * (uint64_t)page;
+    }
+#endif
+    char gb[32] = "";
+    if (ram) snprintf(gb, sizeof gb, ", %llu GB", (unsigned long long)((ram + (1ull << 29)) >> 30));
+    return cpu + gb;
+}
+
+std::string os_text() {
+    std::string os;
+#ifdef _WIN32
     {   // (RtlGetVersion: GetVersionEx answers as the program's manifest allows)
         typedef LONG(WINAPI * GetVersionFn)(OSVERSIONINFOW*);
         typedef const char*(__cdecl * WineFn)(void);
@@ -372,10 +361,6 @@ std::string system_text() {
         if (const WineFn wine = nt ? (WineFn)(void*)GetProcAddress(nt, "wine_get_version") : nullptr) os += ", Wine " + std::string(wine());
     }
 #else
-    {
-        const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGE_SIZE);
-        if (pages > 0 && page > 0) ram = (uint64_t)pages * (uint64_t)page;
-    }
     for (const char* file : {"/etc/os-release", "/usr/lib/os-release"}) {
         FILE* f = fopen(file, "r");
         if (!f) continue;
@@ -399,10 +384,10 @@ std::string system_text() {
     }
     if (getenv("APPIMAGE")) os += ", the AppImage";
 #endif
-    char gb[32] = "";
-    if (ram) snprintf(gb, sizeof gb, "%llu GB", (unsigned long long)((ram + (1ull << 29)) >> 30));
-    return cpu + ", " + (ram ? std::string(gb) + ", " : std::string()) + os;
+    return os;
 }
+
+std::string system_text() { return cpu_text() + ", " + os_text(); }
 
 void fill_here(Inputs& in) {
     in.system = system_text();
@@ -466,7 +451,7 @@ std::string write(const Inputs& in) {
     const bool asked = in.ask_picture && in.ask_picture(picture_path.c_str(), ticket);
 
     // the logs: this run's, and the run before's (its own after a start from the icon, which moves the last one to .1)
-    const std::string log_dir = in.game_dir + "logs" + sep;   // (the game folder's logs/: host/game_layout.c)
+    const std::string log_dir = in.game_dir + "logs" + sep;   // (the game folder's logs/: game/game_layout.c)
     const std::string g0 = log_dir + "longshot_log.txt", g1 = log_dir + "longshot_log.1.txt";
     const std::string before = same_file(in.current_log, g0, in.windows) ? g1 : exists(g0) ? g0 : g1;
     LogFacts now, last;
