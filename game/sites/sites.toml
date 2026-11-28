@@ -1204,3 +1204,11 @@ at = "after"
 shape = "data"
 thread = "worker"
 args = ["x19:ptr:engine"]
+
+[[site]]
+name = "light.boxAcquired"
+doc = "A box light's pool-acquire callback has returned, with x20 the new light and both pool and light locks still held"
+at = "before"
+shape = "data"
+thread = "worker"
+args = ["x20:ptr:box"]

@@ -1267,3 +1267,14 @@ function = "f_8151eb00"
 offset = 0x4c
 signature_offset = 0x40
 signature = "d10223a1 d10243a2 52800044 aa0003f3"   # (sub x1, x29, #0x88; sub x2, x29, #0x90; mov w4, #2; mov x19, x0)
+
+# The box manager's acquire, after its virtual callback and before either unlock.
+# The exact unlock calls distinguish otherwise identical light-pool routines in
+# this build. The guard checks the object's lock acquisition before that call.
+[[site]]
+name = "light.boxAcquired"
+function = "f_831eaa90"
+offset = 0x80
+signature_offset = 0x7c
+signature = "d63f0100 9100c280 9429de57 91002260 9429de55"
+guards = [{ offset = 0x5c, signature = "9100c280 9429de5c" }]

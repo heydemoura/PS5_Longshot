@@ -237,6 +237,9 @@ HOS_SITE_ENGINE(ui_pictureDraw, "ui.pictureDraw", hos_site_ui_picture_draw)
 HOS_SITE_ENGINE(ui_layoutBuilt, "ui.layoutBuilt", hos_site_ui_layout_built)
 HOS_SITE_ENGINE(ui_listSetup, "ui.listSetup", hos_site_ui_list_setup)
 
+/* Box light pool reuse: game/oot_box_light.c, before a new owner supplies parameters. */
+HOS_SITE_ENGINE(light_boxAcquired, "light.boxAcquired", hos_site_light_box_acquired)
+
 /* The frame's real time at the step divides (inline rules: host/nn_vi.c owns both values) */
 HOS_VALUE(frame_seconds, "frame.seconds", uint32_t, hos_frame_seconds_bits)
 HOS_VALUE(frame_stepObject, "frame.stepObject", uint64_t, hos_step_probe)
