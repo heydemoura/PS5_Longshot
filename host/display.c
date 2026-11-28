@@ -22,6 +22,7 @@ void hos_input_clear_toggles(void);
 void rx_close_asked(void);   /* host/rx_backend.c */
 #include "../gpu/vk/vk_api.h"
 #include "display_pointer.h"
+#include "fullscreen_monitor.h"
 #ifndef LONGSHOT_ENV_H   /* (env_on: the switches' one rule) */
 #include "../gpu/vk/compat/longshot_env.h"
 #endif
@@ -65,6 +66,10 @@ static int esc_had_capture;
 /* the game's own menus: open while one of their screens runs with the mouse (stamped each frame on the
    game's thread), their clicks */
 static int game_menu_open;
+/* (one of them has the mouse, the Insert menu closed: read on the game's thread, where the mouse's side buttons, which no
+   menu takes, stay their controls'. host/nn_hid.c mouse_buttons_arm) */
+static volatile LONG game_menu_mouse;
+int hos_mouse_in_game_menu(void) { return (int)game_menu_mouse; }
 static volatile LONG64 game_menu_seen_ns;
 static HosPointer game_pointer = HOS_POINTER_INIT;
 /* The cursor over the game's window, in play and in the game's menus (not the Insert menu), is shown until the pads or
@@ -128,28 +133,117 @@ static void pointer_update(HWND w, uint32_t pressed, int wheel) {
 static HANDLE renderer_up;
 static int fullscreen;
 static WINDOWPLACEMENT windowed_place;
+static MkwVkMonitor window_monitors[HOS_MONITOR_MAX];
+static HMONITOR window_monitor_handles[HOS_MONITOR_MAX];
+static int window_monitor_count;
+static void
+mouse_capture(HWND w,int on);
+
+/* The monitor driver's DeviceString can be "Generic PnP Monitor" even when EDID supplies a model.
+   Match the target's interface path, never its model name or current enumeration ordinal. */
+static int monitor_friendly_name(const WCHAR *id,char *out,int size) {
+    for (int attempt=0;attempt<3;attempt++) {
+        UINT32 paths=0,modes=0;
+        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS,&paths,&modes)!=ERROR_SUCCESS || !paths) return 0;
+        DISPLAYCONFIG_PATH_INFO *p=calloc(paths,sizeof *p);
+        DISPLAYCONFIG_MODE_INFO *m=calloc(modes?modes:1,sizeof *m);
+        if (!p || !m) { free(p); free(m); return 0; }
+        LONG status=QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS,&paths,p,&modes,m,NULL);
+        if (status==ERROR_INSUFFICIENT_BUFFER) { free(p); free(m); continue; }
+        int found=0;
+        if (status==ERROR_SUCCESS) for (UINT32 i=0;i<paths;i++) {
+            DISPLAYCONFIG_TARGET_DEVICE_NAME target={0};
+            target.header.type=DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+            target.header.size=sizeof target;
+            target.header.adapterId=p[i].targetInfo.adapterId;
+            target.header.id=p[i].targetInfo.id;
+            if (DisplayConfigGetDeviceInfo(&target.header)==ERROR_SUCCESS &&
+                !lstrcmpiW(id,target.monitorDevicePath) && target.monitorFriendlyDeviceName[0]) {
+                found=WideCharToMultiByte(CP_UTF8,0,target.monitorFriendlyDeviceName,-1,out,size,NULL,NULL)!=0;
+                break;
+            }
+        }
+        free(p); free(m);
+        return found;
+    }
+    return 0; /* Display hotplug kept changing the required buffers. */
+}
+
+static BOOL CALLBACK collect_monitor(HMONITOR mon,HDC dc,LPRECT rect,LPARAM data) {
+    (void)dc; (void)rect; (void)data;
+    if (window_monitor_count==HOS_MONITOR_MAX) return FALSE;
+    MONITORINFOEXW mi={0}; DISPLAY_DEVICEW device={0};
+    mi.cbSize=sizeof mi; device.cb=sizeof device;
+    if (!GetMonitorInfoW(mon,(MONITORINFO *)&mi)) return TRUE;
+    /* EDD_GET_DEVICE_INTERFACE_NAME returns a monitor interface path, not DISPLAY1's current ordinal. */
+    if (!EnumDisplayDevicesW(mi.szDevice,0,&device,1) || !device.DeviceID[0]) return TRUE;
+    MkwVkMonitor item={0};
+    if (!WideCharToMultiByte(CP_UTF8,0,device.DeviceID,-1,item.id,sizeof item.id,NULL,NULL)) return TRUE;
+    if (!monitor_friendly_name(device.DeviceID,item.name,sizeof item.name) &&
+        !WideCharToMultiByte(CP_UTF8,0,device.DeviceString,-1,item.name,sizeof item.name,NULL,NULL)) return TRUE;
+    item.width=mi.rcMonitor.right-mi.rcMonitor.left; item.height=mi.rcMonitor.bottom-mi.rcMonitor.top;
+    item.flags=(mi.dwFlags&MONITORINFOF_PRIMARY)?HOS_MONITOR_PRIMARY:0;
+    if (hwnd && mon==MonitorFromWindow(hwnd,MONITOR_DEFAULTTONEAREST)) item.flags|=HOS_MONITOR_CURRENT;
+    window_monitor_handles[window_monitor_count]=mon;
+    window_monitors[window_monitor_count++]=item;
+    return TRUE;
+}
+static void refresh_monitors(void) {
+    window_monitor_count=0;
+    EnumDisplayMonitors(NULL,NULL,collect_monitor,0);
+    hos_monitor_publish(window_monitors,window_monitor_count,hwnd!=NULL);
+}
+void hos_monitor_prepare(void) { hos_monitor_load(); refresh_monitors(); }
+static HMONITOR fullscreen_target(HWND w) {
+    char wanted[512]; hos_monitor_wanted(wanted);
+    int pick=hos_monitor_find(window_monitors,window_monitor_count,wanted);
+    return pick>=0?window_monitor_handles[pick]:MonitorFromWindow(w,MONITOR_DEFAULTTONEAREST);
+}
 
 static void set_fullscreen(HWND w, int on) {
-    if (on == fullscreen) return;
+    if (!on && !fullscreen) return;
     const LONG style = GetWindowLongA(w, GWL_STYLE);
     if (on) {
         MONITORINFO mi;
         mi.cbSize = sizeof mi;
-        windowed_place.length = sizeof windowed_place;
-        if (!GetWindowPlacement(w, &windowed_place) ||
-            !GetMonitorInfoA(MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST), &mi))
+        if (!GetMonitorInfoA(fullscreen_target(w), &mi)) return;
+        RECT current;
+        if (fullscreen && GetWindowRect(w,&current) && EqualRect(&current,&mi.rcMonitor)) return;
+        if (!fullscreen) {
+            windowed_place.length = sizeof windowed_place;
+            if (!GetWindowPlacement(w,&windowed_place)) return;
+        }
+        SetWindowLongA(w,GWL_STYLE,style&~WS_OVERLAPPEDWINDOW);
+        if (GetWindowLongA(w,GWL_STYLE)!=(style&~WS_OVERLAPPEDWINDOW)) {
+            hos_log("display: fullscreen style request failed");
             return;
-        fullscreen = 1;
-        SetWindowLongA(w, GWL_STYLE, style & ~WS_OVERLAPPEDWINDOW);
-        SetWindowPos(w, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
-                     mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        }
+        const int was_fullscreen=fullscreen;
+        fullscreen=1; /* re-entrant WM_DPICHANGED must not apply a windowed suggested rectangle */
+        if (!SetWindowPos(w,HWND_TOP,mi.rcMonitor.left,mi.rcMonitor.top,mi.rcMonitor.right-mi.rcMonitor.left,
+                          mi.rcMonitor.bottom-mi.rcMonitor.top,SWP_NOOWNERZORDER|SWP_FRAMECHANGED)) {
+            SetWindowLongA(w,GWL_STYLE,style);
+            fullscreen=was_fullscreen;
+            hos_log("display: fullscreen monitor request failed (%lu)",(unsigned long)GetLastError());
+            return;
+        }
+        fullscreen=1;
     } else {
-        fullscreen = 0;
         SetWindowLongA(w, GWL_STYLE, style | WS_OVERLAPPEDWINDOW);
-        SetWindowPlacement(w, &windowed_place);
-        SetWindowPos(w, NULL, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        fullscreen=0;
+        if (GetWindowLongA(w,GWL_STYLE)!=(style|WS_OVERLAPPEDWINDOW) || !SetWindowPlacement(w,&windowed_place)) {
+            SetWindowLongA(w,GWL_STYLE,style);
+            fullscreen=1;
+            hos_log("display: restoring window placement failed (%lu)",(unsigned long)GetLastError());
+            return;
+        }
+        fullscreen=0;
+        if (!SetWindowPos(w, NULL, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED))
+            hos_log("display: refreshing restored window frame failed (%lu)",(unsigned long)GetLastError());
     }
+    if (mouse_captured) { mouse_capture(w,0); mouse_capture(w,1); }
+    refresh_monitors();
     hos_log("display: %s", on ? "fullscreen (F11 for a window)" : "windowed");
 }
 
@@ -216,6 +310,7 @@ static void menus_mouse(HWND w, int insert_open, int game_open) {
     const int was = menu_open || game_menu_open, now = insert_open || game_open, game_was = game_menu_open;
     if ((insert_open && !menu_open) || (game_open && !game_was)) hos_input_clear_toggles();
     menu_open = insert_open, game_menu_open = game_open;
+    InterlockedExchange(&game_menu_mouse, game_open && !insert_open);
     /* (hidden till used; a menu back within a second, a moment between its screens, keeps the cursor as it was) */
     static int64_t game_closed_ns;
     if (!game_open && game_was) game_closed_ns = hos_now_ns();
@@ -353,14 +448,23 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (game_menu_open) menus_mouse(w, menu_open, 0);
         return 0;
     case WM_TIMER: {
+        static DWORD monitor_poll;
+        static char previous_monitor[512];
+        char wanted_monitor[512]; hos_monitor_wanted(wanted_monitor);
+        DWORD monitor_now=GetTickCount();
+        if (monitor_now-monitor_poll>=1000 || strcmp(previous_monitor,wanted_monitor)) {
+            monitor_poll=monitor_now; strcpy(previous_monitor,wanted_monitor);
+            refresh_monitors();
+            if (fullscreen) set_fullscreen(w,1); /* selection/hotplug changes, on the window thread */
+        }
         pointer_update(w, 0, 0);
-        /* (longshot, #1532) a controller is not input to Windows: playing with one, the display went off at the power
+        /* (longshot) a controller is not input to Windows: playing with one, the display would go off at the power
            plan's timeout. While the game's window is in front and not minimized, the display's idle timer is reset every
            30 s (ES_DISPLAY_REQUIRED without ES_CONTINUOUS: nothing is held when the game is left or closed).
            HOS_KEEP_DISPLAY=0: Windows' timeout as before */
         static ULONGLONG last_awake;
         static int keep = -1;
-        if (keep < 0) keep = !getenv("HOS_KEEP_DISPLAY") || atoi(getenv("HOS_KEEP_DISPLAY")) != 0;
+        if (keep < 0) keep = env_on_or("HOS_KEEP_DISPLAY", 1);
         const ULONGLONG now = GetTickCount64();
         if (keep && renderer && now - last_awake >= 30000 && GetForegroundWindow() == w && !IsIconic(w)) {
             last_awake = now;
@@ -443,6 +547,7 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (wp == '\r') return 0;
         break;
     case WM_APP + 7:   /* (the Insert menu's row) */
+        refresh_monitors();
         set_fullscreen(w, (int)wp);
         return 0;
     case WM_APP + 12:   /* (longshot: the Insert menu's Paste, MkwVkHost.take_text) */
@@ -557,12 +662,21 @@ static DWORD WINAPI display_main(void *p) {
         SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     else
         ShowWindow(hwnd, SW_SHOW);
-    if (getenv("HOS_FULLSCREEN") && atoi(getenv("HOS_FULLSCREEN"))) set_fullscreen(hwnd, 1);
+    hos_monitor_load();
+    refresh_monitors();
+    if (hos_monitor_start_fullscreen()) set_fullscreen(hwnd, 1);
     RAWINPUTDEVICE rid = {1, 2, 0, hwnd};   /* generic desktop mouse: WM_INPUT while the window is in front */
     RegisterRawInputDevices(&rid, 1, sizeof rid);
     pointer_update(hwnd, 0, 0);
     renderer = rx_start(hwnd);
-    if (!renderer) hos_log("display: no renderer: the window stays black");
+    if (!renderer) {   /* (longshot) the game ends at once, as on Linux (host/posix/display_sdl.c renderer_main): behind a black
+                          window it played on until the player closed it. The window after it reads this line */
+        hos_log("display: the renderer did not start: the game ends, and the window after it says why");
+        hos_log_flush();
+        void hos_crash_clean_end(void);
+        hos_crash_clean_end();
+        ExitProcess(1);
+    }
     SetEvent(renderer_up);
     SetTimer(hwnd, 1, 250, NULL);
     MSG m;
@@ -577,7 +691,7 @@ static DWORD WINAPI display_main(void *p) {
    shaders were being prepared (80 s on a first start) was lost: that run had no ambient light, black foliage and dark characters. The
    game itself goes on starting as it did: held at the start instead, it left holes in the ground */
 void hos_renderer_wait(void) {
-    { const char *e = getenv("HOS_NO_RENDERER_WAIT"); if (e && atoi(e) != 0) return; }   /* (=0: the wait, as without it) */   /* (a test: the game's first GPU work no longer waits for the renderer, as before lighting-fix) */
+    if (env_on("HOS_NO_RENDERER_WAIT")) return;   /* (=0: the wait, as without it) */   /* (a test: the game's first GPU work no longer waits for the renderer, as before lighting-fix) */
     if (renderer_up) WaitForSingleObject(renderer_up, INFINITE);
 }
 

@@ -87,13 +87,30 @@ def tree_digest(*dirs, ext=(".h", ".hpp", ".inc")):
     return h.hexdigest()
 
 
+def uses_rtti(path):
+    """Whether a renderer source classifies a C++ exception by its type (gpu/vk/cxx_escape.h: dynamic_cast, typeid).
+    The console's compiler has RTTI off unless asked; the exception types' own type information is the C++ library's"""
+    text = open(path, encoding="utf-8", errors="replace").read()
+    return '"cxx_escape.h"' in text or '"renderer_guard.h"' in text
+
+
+# (the page marks' table for the console's 64 GiB guest window, HOS_GUEST_SPACE: 16 MB of static data instead of the
+# 512 GB window's 128, and the GPU pages' bitmap 2 MB instead of 16. The lifted game, its runtime and the host all take it)
+DIRTY_PAGES = ["-DA64_DIRTY_PAGES=(1ull<<24)"]
+# (the lifted stores mark their page only where it is a GPU page, by the bitmap (host/mark_bitmap.c): nx2/build.py's
+# RX_MARK_BITMAP, on by default there. RX_MARK_BITMAP=0: every store marks, as before. From ProsperoHookshot 3ed454af,
+# where it measured ~1.2 ms less of the game's own time a frame in Hyrule Field on a PS5; HOS_MARK_BITMAP_ALL=1 at a
+# start is the control: every bit set)
+MARK_BITMAP = [] if os.environ.get("RX_MARK_BITMAP", "").strip().lower() in ("0", "off", "false", "no") else ["-DA64_MARK_BITMAP"]
+
+
 def jobs_for(rt64, gen_dir):
     """(source, object, flags, header digest) of everything the title links"""
     out = []
     game_digest = tree_digest(GEN, rt64, os.path.join(kit.KIT, "rt"), os.path.join(ROOT, "nx2", "rt"))
     game_fl = COMMON + ["-I" + rt64, "-I" + GEN, "-I" + os.path.join(kit.KIT, "rt"), "-I" + os.path.join(ROOT, "nx2", "rt"),
                         "-fno-strict-aliasing", "-mcx16", "-O1", "-mllvm", "-rotation-max-header-size=0", "-mllvm",
-                        "-capture-tracking-max-uses-to-explore=5000", "-DA64_POLLING", "-DA64_WRITE_TRACK"]
+                        "-capture-tracking-max-uses-to-explore=5000", "-DA64_POLLING", "-DA64_WRITE_TRACK"] + DIRTY_PAGES + MARK_BITMAP
     # (no lifted game: --kit's build, which compiles none of it)
     chunks = sorted(f for f in os.listdir(GEN) if f.startswith("code_") and f.endswith(".c")) if os.path.isdir(GEN) else []
     game = [os.path.join(GEN, c) for c in chunks] + \
@@ -103,7 +120,7 @@ def jobs_for(rt64, gen_dir):
 
     # the runtime: host/ as Linux builds it, without SDL's loader (host/ps5/hos_sdl_ps5.c) and the Linux-only files
     host_digest = tree_digest(HOST, rt64, GEN) + tree_digest(os.path.join(VK), ext=("vk_api.h", "dlss_math.h"))
-    host_fl = COMMON + [MKDIR, "-I" + POSIX, "-D_GNU_SOURCE", "-I" + HOST, "-I" + rt64, "-I" + GEN, "-O2", "-mcx16", "-DA64_POLLING",
+    host_fl = COMMON + DIRTY_PAGES + [MKDIR, "-I" + POSIX, "-D_GNU_SOURCE", "-I" + HOST, "-I" + rt64, "-I" + GEN, "-O2", "-mcx16", "-DA64_POLLING",
                         "-DA64_WRITE_TRACK", "-I" + os.path.join(OPUS, "include"), "-I" + os.path.join(FFMPEG, "include"),
                         "-I" + os.path.join(DEPS, "zstd", "include"),
                         "-I" + os.path.join(pkg("vulkanheaders", "v1.4.345"), "include"),
@@ -163,19 +180,23 @@ def jobs_for(rt64, gen_dir):
     # (the start-up screen's logo, gen/longshot_logo.h, is in vk_imgui.cpp's key: a new picture compiles it again)
     logo_h = os.path.join(gen_dir, "longshot_logo.h")
     logo_digest = hashlib.sha1(open(logo_h, "rb").read()).hexdigest() if os.path.exists(logo_h) else ""
+    # (the files that draw with Dear ImGui, as nx2/build.py's imgui_users; the crash window is not built here)
+    IMGUI_USERS = ("vk_imgui.cpp", "vk_menu.cpp", "reshade.cpp")
     for s in upstream.vk_sources():
-        if os.path.basename(s) == "vk_ngx_msvc_rt.cpp":
+        # (vk_crash_window.cpp: the crash helper's window on a PC, drawn through SDL; the console has no such window)
+        if os.path.basename(s) in ("vk_ngx_msvc_rt.cpp", "vk_crash_window.cpp"):
             continue
         rel = os.path.relpath(s, os.path.join(ROOT, "gpu")).replace(os.sep, "_")[:-4]
         lib = os.path.relpath(s, VK).split(os.sep)[0] in ("eden", "sirit")
         fl = vfl + ([shader_stamp] if os.path.basename(s) == "vk_shader.cpp" else []) + \
             ([stamp] if os.path.basename(s) == "vk_menu.cpp" else []) + \
             (lsfg_fl if os.path.basename(s) == "vk_framegen.cpp" else []) + \
-            (imgui_fl if os.path.basename(s) in ("vk_imgui.cpp", "vk_menu.cpp") else []) + \
+            (imgui_fl if os.path.basename(s) in IMGUI_USERS else []) + \
+            (["-frtti"] if uses_rtti(s) else []) + \
             (["-DHOOKSHOT_MIHAWKGEN", "-I" + os.path.join(MIHAWKGEN, "framegen", "include")]
              if HAS_MIHAWKGEN and os.path.basename(s) == "vk_framegen.cpp" else [])
         out.append((s, os.path.join(OUT, "obj", "vk_" + rel + ".o"), fl,
-                    lib_digest if lib else vk_digest + (imgui_digest if os.path.basename(s) in ("vk_imgui.cpp", "vk_menu.cpp") else "") +
+                    lib_digest if lib else vk_digest + (imgui_digest if os.path.basename(s) in IMGUI_USERS else "") +
                     (logo_digest if os.path.basename(s) == "vk_imgui.cpp" else "")))
     # (Lossless Scaling's frame generation from the player's own Lossless.dll: third_party/lsfg, PS5SX2's port as it is, and
     # gpu/vk/lsfg, its three files changed for Longshot, found first: their names are the same)

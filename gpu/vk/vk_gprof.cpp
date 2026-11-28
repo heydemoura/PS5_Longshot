@@ -63,9 +63,8 @@ uint32_t stamp(Stream& st, VkCommandBuffer cmd) {
 
 bool gprof_on() {
     static const bool on = [] {
-        const char* a = getenv("RX_VK_PASS_TIMING");
-        const char* b = getenv("RX_VK_GPU_PROFILE");
-        return (a && atoi(a) != 0) || (b && atoi(b) != 0);
+        const char* a = getenv("RX_VK_PASS_TIMING");   // (its second name, RX_VK_GPU_PROFILE, is gone: switches.def)
+        return a && atoi(a) != 0;
     }();
     return on;
 }
@@ -75,6 +74,17 @@ static int level() {
         return a ? atoi(a) : 1;
     }();
     return v;
+}
+
+bool gprof_glue_on() {
+    static const bool on = gprof_on() && level() >= 3;
+    return on;
+}
+GprofGlue::GprofGlue(VkCommandBuffer c, const char* l) : cmd(c), label(l) {
+    if (gprof_glue_on()) on = gprof_begin(c);
+}
+GprofGlue::~GprofGlue() {
+    if (on) gprof_end(cmd, std::string("glue: ") + label);
 }
 
 void gprof_begin_recording(int slot, VkCommandBuffer cmd, VkCommandBuffer upload) {
@@ -95,7 +105,9 @@ void gprof_begin_recording(int slot, VkCommandBuffer cmd, VkCommandBuffer upload
         st.base = (uint32_t)(slot * 2 + k) * kQ;
         st.spans.clear();
         st.outer = st.run = -1;
-        if (st.dirty) vkCmdResetQueryPool(st.cmd, pool, st.base, st.dirty);   // (an upload command buffer that is not sent resets nothing: its dirty stands)
+        // (not the macro: its glue span would time itself; the recorder's packer, so it stays in order with the commands around
+        // it. An upload command buffer that is not sent resets nothing: its dirty stands)
+        if (st.dirty) ::mkwvk::rec::rx_vkCmdResetQueryPool(st.cmd, pool, st.base, st.dirty);
         st.nq = 0;
     }
 }

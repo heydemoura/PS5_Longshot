@@ -8,9 +8,7 @@ from guest memory over what the GPU drew (Ocarina of Time's HUD button labels bl
 
 First, that every reason texture_written is given in gpu/vk is one NOTED_BY lists, given by one writer, in the file
 NOTED_BY names (see there). Then cuts texture_written, texture_released, texture_dirty and texture_touch's checks and
-first-upload seed out of the source as they are, over a fake GPU mapping and fake page generations, and checks, then again
-with RX_VK_NO_DRAWN_PAGE_MAP=1 (as before: all of the storage at the first check of a virtual-pool texture the GPU wrote
-first):
+first-upload seed out of the source as they are, over a fake GPU mapping and fake page generations, and checks:
 - a texture drawn in a virtual pool and finalized, nothing written since: not uploaded again, also after other pages
   were remapped, when it is drawn and finalized a second time, and when a writer that gives no reason wrote it before
   the pass;
@@ -20,7 +18,7 @@ first):
   one of no size: no page walk, as before. A texture clear's texture has its map from its first upload (resolve() samples
   it before the clear), so what the CPU writes after the clear is taken alone, as before.
 Of texture_touch only those lines run: not its epoch test, gpu_dirty (a GPU buffer's write over the storage),
-RX_VK_REUPLOAD_DIM, upload_seg (a parallel replay's later segment) or the guard of its live check.
+RX_VK_REUPLOAD_DIM or the guard of its live check.
 
 python -I -B tests/test_drawn_page_map.py [--cxx g++] [--source path/to/vk_texture.cpp]
 """
@@ -36,28 +34,21 @@ RUN_ALL_ARGS = ["--cxx", "{cxx}"]
 
 ROOT = Path(__file__).resolve().parents[1]
 ENV_ON_H = ROOT / "gpu" / "vk" / "compat" / "longshot_env.h"
-SWITCH = "RX_VK_NO_DRAWN_PAGE_MAP"
 
-# The reasons texture_written is given, each by one writer: the file it is in, and where that writer's lock is. With a
-# reason, texture_written notes the page map of a virtual-pool texture that has none, and texture_dirty changes the map
-# (page_map, runs, map_sig) there: each of these writers was checked by hand to hold the ParLock of a parallel replay
-# (RX_VK_PARALLEL), or to be its dry pass, which runs on the replay thread before the workers. Another writer given one of
-# these reasons is one more to check: it fails the check until it has a reason of its own here. The writers that give no
-# reason ("?") note none: the upscaler's stand-ins (vk_draw.cpp upscale_stub, temporal_rejected_network), which run without
-# that lock, and the texture clear (vk_xfer.cpp clear_tex), which needs none: resolve() samples its texture first
-# (texture_get(t, true)).
+# The reasons texture_written is given, each by one writer: the file it is in, and where it runs. With a reason,
+# texture_written notes the page map of a virtual-pool texture that has none, and texture_dirty changes the map (page_map,
+# runs, map_sig) there: each of these writers was checked by hand to run on the recording thread, the one that changes the
+# map. Another writer given one of these reasons is one more to check: it fails the check until it has a reason of its own
+# here. The writers that give no reason ("?") note none: the upscaler's stand-ins (vk_draw.cpp upscale_stub,
+# temporal_rejected_network), and the texture clear (vk_xfer.cpp clear_tex), which needs none: resolve() samples its texture
+# first (texture_get(t, true)).
 NOTED_BY = {
-    "a storage image of a draw": ("gpu/vk/vk_draw.cpp", "build_descriptors: a ParLock on the same line"),
-    "a pass's colour target": ("gpu/vk/vk_draw.cpp", "begin_pass: ParLock(marks), left out only when every target is "
-                               "marked this frame (texture_marked: a pass drew it this frame, so its map is noted)"),
+    "a storage image of a draw": ("gpu/vk/vk_draw.cpp", "build_descriptors, on the recording thread"),
+    "a pass's colour target": ("gpu/vk/vk_draw.cpp", "begin_pass, on the recording thread"),
     "a pass's depth target": ("gpu/vk/vk_draw.cpp", "begin_pass: as the colour targets"),
-    "the dry pass (a draw's target)": ("gpu/vk/vk_draw.cpp", "dry_mark_written: the dry pass"),
-    "the dry pass (a draw's depth)": ("gpu/vk/vk_draw.cpp", "dry_mark_written: the dry pass"),
-    "the dry pass (a dispatch's storage image)": ("gpu/vk/vk_draw.cpp", "dry_mark_written: the dry pass"),
-    "a buffer-to-texture copy": ("gpu/vk/vk_xfer.cpp", "copy_b2t: the ParLock of NOP_COPY_B2T and NOP_COPY_T2B "
-                                 "(vk_replay.cpp)"),
-    "a copy into a BC texture": ("gpu/vk/vk_xfer.cpp", "copy_t2t: the ParLock of NOP_COPY_T2T (vk_replay.cpp)"),
-    "a texture-to-texture copy": ("gpu/vk/vk_xfer.cpp", "copy_t2t: the ParLock of NOP_COPY_T2T (vk_replay.cpp)"),
+    "a buffer-to-texture copy": ("gpu/vk/vk_xfer.cpp", "copy_b2t: NOP_COPY_B2T and NOP_COPY_T2B (vk_replay.cpp)"),
+    "a copy into a BC texture": ("gpu/vk/vk_xfer.cpp", "copy_t2t: NOP_COPY_T2T (vk_replay.cpp)"),
+    "a texture-to-texture copy": ("gpu/vk/vk_xfer.cpp", "copy_t2t: NOP_COPY_T2T (vk_replay.cpp)"),
 }
 
 FIXTURE = r'''#include <algorithm>
@@ -90,24 +81,42 @@ struct Texture {   // (the fields the code cut out uses, as gpu/vk/vk_texture.h 
     std::vector<Run> runs;
     uint32_t runs_maps_gen = ~0u;
     bool gpu_written = false, only_cleared = false;
+    uint64_t gpu_draw_value = 0;
     uint32_t gpu_gen = 0;
     bool released = false;
     uint32_t release_gen = 0;
-    uint64_t last_written = 0, first_written = 0, upload_value = 0, upload_seg = 0, bytes = 0;
+    uint64_t last_written = 0, first_written = 0, bytes = 0;
     uint32_t id = 0;
-    uint64_t first_seen = 0;
+    uint64_t first_seen = 0, pool_key = 0, last_value = 0;
 };
-struct nvn_tex { uint64_t gpu = 0; };
-std::unordered_map<uint32_t, std::unique_ptr<Texture>> textures;
+struct nvn_tex { uint64_t gpu = 0; bool output_preview = false; struct { uint64_t size = 0; } L; };
+struct TextureKey {
+    uint64_t gpu;
+    uint32_t id;
+    auto operator<=>(const TextureKey&) const = default;
+};
+std::map<TextureKey, std::unique_ptr<Texture>> textures;
 std::unordered_multimap<uint64_t, Texture*> by_gpu;
-uint64_t frame_no = 1, rec_value = 0;
-thread_local uint64_t tl_seg = 0;
+uint64_t frame_no = 1, rec_value = 0, completed_value = 0;
+std::map<uint64_t, std::pair<uint64_t, uint64_t>> gpu_owned;
+std::vector<Texture*> rendered_targets;
+Texture* present_source = nullptr;
+uint64_t vk_retirement_value() { return rec_value; }
+void destroy_later(Texture&, uint64_t) {}
+void forget_gpu(Texture* texture) {
+    auto [first, last] = by_gpu.equal_range(texture->gpu);
+    for (auto it = first; it != last; ++it)
+        if (it->second == texture) { by_gpu.erase(it); break; }
+}
 void logf(const char*, ...) {}
 enum LogLevel : int { log_error, log_warn, log_info, log_debug, log_trace };   // (the leveled log, vk_internal.h)
 void logf_at(LogLevel, const char*, ...) {}
 void vw_note(Texture&) {}
 void watch_tex(const Texture*, const char*) {}
 void drawn_writeback_note(Texture*) {}
+void note_drawn_storage(Texture*) {}
+struct nvn_tex;
+void reuse_released(const nvn_tex*) {}   // (decoded ASTC used again, gpu/vk/astc_reuse.h: none here)
 
 // (the host's GPU mappings: each 64 KB virtual page's guest address, and their generations. `calls` counts what the code
 // cut out asks of them and of the page generations: a page walk or a memory check)
@@ -220,7 +229,7 @@ Texture* make(uint64_t gpu, uint64_t guest, uint64_t size) {
     for (uint64_t off = 0; gpu >= (1ull << 40) && off < size; off += 0x10000) vpages[gpu + off] = guest + off;
     Texture* p = t.get();
     by_gpu.emplace(gpu, p);
-    textures[p->id] = std::move(t);
+    textures[{gpu, p->id}] = std::move(t);
     return p;
 }
 void finalize(Texture* t) {   // (the game finalizes it: texture_released, as the replay calls it)
@@ -231,8 +240,7 @@ void finalize(Texture* t) {   // (the game finalizes it: texture_released, as th
 }
 }  // namespace
 
-int main(int argc, char**) {
-    const bool old_rule = argc > 1;   // (RX_VK_NO_DRAWN_PAGE_MAP=1)
+int main() {
     const uint64_t vpool = 1ull << 40;
     cpu_write(0x80003000, 0x100);   // (the game wrote some of that memory once, before any of this)
 
@@ -243,11 +251,9 @@ int main(int argc, char**) {
     const bool noted = !label->page_map.empty();
     finalize(label);
     Texture* kept = touch(label);
-    if (old_rule) expect(!kept && dirty == span(0, 0xC000), "as before: a drawn texture, finalized, all of it", &dirty);
-    else expect(kept == label, "a texture the GPU drew in a virtual pool, finalized, nothing written since: not uploaded again",
-                &dirty);
-    expect(old_rule ? !noted : noted,
-           old_rule ? "as before: no page map noted at the GPU's write" : "its page map noted at the GPU's first write");
+    expect(kept == label, "a texture the GPU drew in a virtual pool, finalized, nothing written since: not uploaded again",
+           &dirty);
+    expect(noted, "its page map noted at the GPU's first write");
 
     // The same after other pages were mapped anew (a zone change's): its own as they were
     Texture* icon = make(vpool + 0x1f010000, 0x80010000, 0x8000);
@@ -255,8 +261,7 @@ int main(int argc, char**) {
     finalize(icon);
     vpages[vpool + 0x2f000000] = 0x81000000, maps_now++;
     kept = touch(icon);
-    if (old_rule) expect(!kept && dirty == span(0, 0x8000), "as before: other pages remapped, all of it", &dirty);
-    else expect(kept == icon, "other pages remapped, its own as they were: not uploaded again", &dirty);
+    expect(kept == icon, "other pages remapped, its own as they were: not uploaded again", &dirty);
 
     // What the CPU wrote after the finalize still counts: that page alone
     Texture* rewritten = make(vpool + 0x1f020000, 0x80020000, 0x4000);
@@ -264,9 +269,7 @@ int main(int argc, char**) {
     finalize(rewritten);
     cpu_write(0x80021000, 0x10);
     kept = touch(rewritten);
-    expect(!kept && dirty == (old_rule ? span(0, 0x4000) : span(0x1000, 0x2000)),
-           old_rule ? "as before: written after the finalize, all of it" : "written by the CPU after the finalize: that page",
-           &dirty);
+    expect(!kept && dirty == span(0x1000, 0x2000), "written by the CPU after the finalize: that page", &dirty);
 
     // A page remapped after the finalize: that page alone
     Texture* depth = make(vpool + 0x1f100000, 0x80100000, 0x20000);
@@ -274,25 +277,22 @@ int main(int argc, char**) {
     finalize(depth);
     vpages[vpool + 0x1f110000] = 0x80300000, vmaps_now++;
     kept = touch(depth);
-    expect(!kept && dirty == (old_rule ? span(0, 0x20000) : span(0x10000, 0x20000)),
-           old_rule ? "as before: a page remapped, all of it" : "its second 64 KB page remapped: that page", &dirty);
+    expect(!kept && dirty == span(0x10000, 0x20000), "its second 64 KB page remapped: that page", &dirty);
 
     // RX_VK_CPU_OVER_GPU=1 checks a texture the GPU still owns too: what the CPU wrote since the GPU's write, that page alone
     Texture* target = make(vpool + 0x1f600000, 0x80700000, 0x8000);
     texture_written(target, "the dry pass (a draw's target)");
     cpu_write(0x80704000, 0x10);
     kept = live(target);
-    expect(!kept && dirty == (old_rule ? span(0, 0x8000) : span(0x4000, 0x5000)),
-           old_rule ? "as before: RX_VK_CPU_OVER_GPU=1, the CPU's write over a texture the GPU owns, all of it"
-                    : "RX_VK_CPU_OVER_GPU=1, the CPU's write over a texture the GPU owns: that page", &dirty);
+    expect(!kept && dirty == span(0x4000, 0x5000),
+           "RX_VK_CPU_OVER_GPU=1, the CPU's write over a texture the GPU owns: that page", &dirty);
 
     // Drawn and finalized twice: one page walk, at the first write, and nothing taken either time
     Texture* twice = make(vpool + 0x1f400000, 0x80500000, 0x10000);
     texture_written(twice, "a pass's colour target");
     finalize(twice);
     kept = touch(twice);
-    if (old_rule) expect(!kept && dirty == span(0, 0x10000), "as before: drawn and finalized, all of it", &dirty);
-    else expect(kept == twice, "drawn and finalized: not uploaded again", &dirty);
+    expect(kept == twice, "drawn and finalized: not uploaded again", &dirty);
     int before = calls;
     texture_written(twice, "a pass's colour target");
     expect(calls == before, "drawn again: no second page walk");
@@ -321,11 +321,8 @@ int main(int argc, char**) {
     const bool later_noted = !later->page_map.empty();
     finalize(later);
     kept = touch(later);
-    if (old_rule) expect(!kept && dirty == span(0, 0x10000), "as before: no reason, then a pass, finalized: all of it", &dirty);
-    else expect(kept == later, "written with no reason, then drawn by a pass, finalized: not uploaded again", &dirty);
-    expect(old_rule ? !later_noted : later_noted,
-           old_rule ? "as before: no page map noted at the pass's write" : "written with no reason, then drawn by a pass: "
-                                                                          "its page map noted at the pass's write");
+    expect(kept == later, "written with no reason, then drawn by a pass, finalized: not uploaded again", &dirty);
+    expect(later_noted, "written with no reason, then drawn by a pass: its page map noted at the pass's write");
 
     // A texture clear's texture: resolve() samples it before the clear (texture_get(t, true)), and that first upload noted
     // its map. The clear walks nothing, and what the CPU writes after it (a font cache's letters) is taken alone at the
@@ -358,10 +355,8 @@ int main(int argc, char**) {
     expect(calls == before, "a texture of no size: no page walk");
 
     if (failed) return 1;
-    std::printf("PASS: %s\n", old_rule ? "RX_VK_NO_DRAWN_PAGE_MAP=1: no page map noted at the GPU's write, all of a finalized "
-                                         "texture taken at its first check, as before"
-                                       : "a texture the GPU drew in a virtual pool has its page map noted at that write: after "
-                                         "a finalize, only what was remapped or written since is taken for written");
+    std::printf("PASS: a texture the GPU drew in a virtual pool has its page map noted at that write: after a finalize, only "
+                "what was remapped or written since is taken for written\n");
     return 0;
 }
 '''
@@ -369,7 +364,7 @@ int main(int argc, char**) {
 # texture_touch's lines the fixture runs: its first-upload seed of a virtual-pool texture's page map, the generation and
 # the check of a texture already uploaded, and the check of one the GPU owns
 SEED = "    if (!tex->uploaded && tex->gpu >= (1ull << 40) && tex->page_map.empty()) {"
-SINCE = "    const uint32_t since = "
+SINCE = "    const uint64_t since = "
 CHECK = "    if (tex->uploaded && !gpu_dirty && !texture_dirty(*tex, since, dirty)) return tex;"
 LIVE = "if (!texture_dirty(*tex, std::max(tex->upload_gen, tex->gpu_gen), cpu)) return tex;"
 
@@ -446,8 +441,8 @@ def check_writers():
         raise SystemExit("texture_written is given a reason that is not in tests/test_drawn_page_map.py NOTED_BY:\n" +
                          "".join("  %r (%s)\n" % (r, ", ".join(given[r])) for r in new) +
                          "With a reason it notes a virtual-pool texture's page map, which texture_dirty changes: check that "
-                         "the writer holds the parallel replay's ParLock (or is its dry pass), then add it to NOTED_BY with "
-                         "its file and where that lock is; or give it no reason")
+                         "the writer runs on the recording thread, then add it to NOTED_BY with "
+                         "its file and where it runs; or give it no reason")
     stale = sorted(set(NOTED_BY) - set(given))
     if stale:
         raise SystemExit("NOTED_BY names a reason no writer gives any more: " + ", ".join(repr(r) for r in stale))
@@ -457,8 +452,8 @@ def check_writers():
         raise SystemExit("texture_written is given a reason NOTED_BY has for one writer by another writer too, or in another "
                          "file than NOTED_BY's:\n" +
                          "".join("  %r (%s; NOTED_BY: %s)\n" % (r, ", ".join(given[r]), NOTED_BY[r][0]) for r in shared) +
-                         "Check that each of them holds the parallel replay's ParLock (or is its dry pass), then give the new "
-                         "one a reason of its own in NOTED_BY, with its file and where that lock is; or give it no reason")
+                         "Check that each of them runs on the recording thread, then give the new "
+                         "one a reason of its own in NOTED_BY, with its file and where it runs; or give it no reason")
     print("PASS: the %d reasons texture_written is given are the ones NOTED_BY lists, each by one writer in its file; %d "
           "writers give none" % (len(given), none))
 
@@ -480,7 +475,7 @@ def main():
     touch = cut(src, "Texture* texture_touch(Texture* tex, bool for_sampling) {", "texture_touch")
     code = FIXTURE
     for name, part in (("CUT_MIX", cut(src, "uint64_t mix(uint64_t h, uint64_t v) {", "mix")),
-                       ("CUT_DIRTY", cut(src, "bool texture_dirty(Texture& tex, uint32_t gen, Ranges& out) {", "texture_dirty")),
+                       ("CUT_DIRTY", cut(src, "bool texture_dirty(Texture& tex, uint64_t gen, Ranges& out) {", "texture_dirty")),
                        ("CUT_DECLARATION", declaration),
                        ("CUT_WRITTEN", cut(src, "void texture_written(Texture* tex, const char* why) {", "texture_written")),
                        ("CUT_RELEASED", cut(src, "void texture_released(const nvn_tex* t) {", "texture_released")),
@@ -504,13 +499,12 @@ def main():
         if built.returncode:
             raise SystemExit("FAIL: the code cut out of %s does not build in this test's FIXTURE: if the error names a "
                              "Texture field, a global or a function that code uses, add it to FIXTURE" % a.source.name)
-        env = {k: v for k, v in os.environ.items() if k not in (SWITCH, "RX_VK_LOG_REMAP")}
+        env = {k: v for k, v in os.environ.items() if k != "RX_VK_LOG_REMAP"}
         env["PATH"] = str(Path(cxx).parent) + os.pathsep + env.get("PATH", "")   # (a compiler's runtime DLLs, llvm-mingw's)
-        for extra in ({}, {SWITCH: "1"}):
-            r = subprocess.run([str(exe)] + (["old"] if extra else []), env={**env, **extra}, capture_output=True, text=True)
-            print((r.stdout + r.stderr).strip())
-            if r.returncode:
-                raise SystemExit("FAIL%s: the code cut out of %s" % (" with %s=1" % SWITCH if extra else "", a.source.name))
+        r = subprocess.run([str(exe)], env=env, capture_output=True, text=True)
+        print((r.stdout + r.stderr).strip())
+        if r.returncode:
+            raise SystemExit("FAIL: the code cut out of %s" % a.source.name)
 
 
 if __name__ == "__main__":

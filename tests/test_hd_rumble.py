@@ -330,6 +330,72 @@ int main(void) {
 """
 
 
+RENHDRUM_POLL = r"""
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include "hd_rumble.h"
+#include "vibration.h"
+#define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %%d %%s\n", __LINE__, #x); return 1; } } while (0)
+#define MAX_PADS 8
+%(pads)s
+static uint8_t raw[HD_RUMBLE_PACKET_SIZE], sent[HD_RUMBLE_PACKET_SIZE];
+static int fresh, calls, leaves, accept = 1;
+static int rh_switch_poll(void *pad, int64_t now, uint8_t *packet) {
+    (void)pad;
+    (void)now;
+    if (!fresh) return 0;
+    fresh = 0;
+    memcpy(packet, raw, sizeof raw);
+    return 1;
+}
+static const char *hos_sdl_pad_name(void *pad) { (void)pad; return "controller"; }
+static void hos_log(const char *fmt, ...) { (void)fmt; }
+static int hos_sdl_pad_effect(void *pad, const void *packet, int size) {
+    (void)pad;
+    if (size != (int)sizeof sent) return 0;
+    calls++;
+    memcpy(sent, packet, sizeof sent);
+    return accept;
+}
+static void vib_leave(int i, int64_t now) { (void)i; (void)now; leaves++; }
+%(poll)s
+int main(void) {
+    CHECK(vibration_switch_pro(0x057e, 0x2009, 0, 0));
+    CHECK(!vibration_switch_pro(0x057e, 0x2009, 1, 0));
+    CHECK(!vibration_switch_pro(0x057e, 0x2009, 0, 1));
+    CHECK(!vibration_switch_pro(0x057e, 0x2069, 0, 0));
+    CHECK(!vibration_switch_pro(0x057e, 0x200e, 0, 0));
+    CHECK(!vibration_switch_pro(0x1234, 0x2009, 0, 0));
+
+    const int64_t ms = 1000000;
+    const uint8_t active[4] = {0xa8, 0x89, 0xe3, 0x4d};
+    hd_rumble_packet(HD_RUMBLE_PRO, active, active, raw);
+    pads[0].vib = VIB_RH_SWITCH;
+    CHECK(switch_poll(0, 0, 100) && calls == 0);
+    fresh = 1;
+    CHECK(switch_poll(0, ms, 100) && calls == 1 && !memcmp(raw, sent, sizeof sent));
+    CHECK(switch_poll(0, 40 * ms, 100) && calls == 1);
+    CHECK(switch_poll(0, 41 * ms, 100) && calls == 2);
+    CHECK(switch_poll(0, 42 * ms, 50) && calls == 2);
+    CHECK(switch_poll(0, 56 * ms, 50) && calls == 3 && sent[3] < raw[3]);
+    CHECK(sent[2] == raw[2] && (sent[3] & 1) == (raw[3] & 1) && (sent[4] & 127) == (raw[4] & 127));
+    CHECK(switch_poll(0, 96 * ms, 0) && calls == 4 && hd_rumble_silent(sent));
+    CHECK(switch_poll(0, 150 * ms, 0) && calls == 4);
+
+    pads[1].wireless = 1;
+    fresh = 1;
+    CHECK(switch_poll(1, ms, 100) && calls == 5);
+    CHECK(switch_poll(1, 41 * ms, 100) && calls == 5);   /* the core schedules Bluetooth refreshes */
+    fresh = 1;
+    accept = 0;
+    CHECK(!switch_poll(1, 45 * ms, 100) && calls == 6 && leaves == 1);
+    CHECK(pads[1].vib == VIB_MOTORS && pads[1].hd == HD_RUMBLE_OFF);
+    return 0;
+}
+"""
+
+
 def build_and_run(test, source, extra=()):
     with tempfile.TemporaryDirectory() as d:
         path = os.path.join(d, "hd.c")
@@ -356,17 +422,22 @@ class HdRumbleTests(unittest.TestCase):
                          "poll": function(PAD, "static int hd_poll")}
         build_and_run(self, source, ["-Wno-unused-function", "-D_POSIX_C_SOURCE=200809L"])
 
+    def test_renhdrum_poll(self):
+        source = RENHDRUM_POLL % {"pads": pads_struct(), "poll": function(PAD, "static int switch_poll")}
+        build_and_run(self, source)
+
     def test_wired_in(self):
         poll = function(PAD, "static void pads_poll")
         self.assertIn("hd_open(slot, gc)", poll)
         self.assertIn("hd_rumble_felt(hv[0], felt[0])", poll)   # (the game's amplitudes, made to be felt)
         self.assertIn("hd_rumble_felt(hv[1], felt[1])", poll)
         self.assertLess(poll.index("hd_rumble_felt(hv[0]"), poll.index("hd_rumble_encode(felt[0]"))
-        self.assertIn("hd_rumble_encode(felt[0], strength, side[0])", poll)   # (the menu's Rumble strength, as the motors')
+        self.assertIn("hd_rumble_encode(felt[0], strength, side[0])", poll)   # (the menu's Vibration strength, as the motors')
         self.assertIn("hd_rumble_encode(felt[1], strength, side[1])", poll)
         self.assertIn("hd_rumble_merge(felt[0], felt[1], felt[2])", poll)   # (a single Joy-Con: both sides merged)
         self.assertIn("hd_rumble_encode(felt[2], strength, side[2])", poll)
-        self.assertLess(poll.index("if (hd_poll(i, side, now)) continue;"), poll.index("rumble_due("))
+        # (a Switch pad host/vibration.h gives our HD rumble plays it, and gets the motors only once SDL refuses it)
+        self.assertLess(poll.index("if (pads[i].vib == VIB_HD && hd_poll(i, side, now)) continue;"), poll.index("rumble_due("))
         self.assertIn('getenv("HOS_HD_RUMBLE")', function(PAD, "static void hd_open"))
         self.assertIn("hos_sdl_rumble_hd(dev, v);", function(HID, "static void vibration_send"))
 
