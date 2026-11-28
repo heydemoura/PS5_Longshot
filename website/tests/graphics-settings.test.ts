@@ -154,26 +154,25 @@ test('the registered Simulated turf page row takes its named help; another page 
   }
 });
 
-test('the DLSS 5 rows name their conditions; their registered preset and page rows only', () => {
+test('the DLSS 5 rows name their conditions; the page row only, and the page\'s rows ride on its card', () => {
   const settings = readGraphicsSettings(page, menu).flatMap(group => group.settings);
   const find = name => settings.find(setting => setting.name === name);
   assert.deepEqual(find('DLSS 5').badges, ['With a DLSS 5 file']);
-  assert.deepEqual(find('DLSS 5 preset').badges, ['While DLSS 5 is On']);
+  // (the page's rows, the preset and the model among them, are on the DLSS 5 settings row's line and have no card of their own:
+  // the model's own condition is not the row's, which shows whenever DLSS 5 is On)
   assert.deepEqual(find('DLSS 5 settings').badges, ['While DLSS 5 is On']);
-  // (the DLSS 5 model row: while On, on an RTX 50 with both files; it takes a restart, as the menu's row says)
-  assert.deepEqual(find('DLSS 5 model').badges, ['While DLSS 5 is On', 'RTX 50 with both DLSS 5 files']);
-  assert.equal(find('DLSS 5 model').restart, true);
-  assert.throws(() => readGraphicsSettings(page.replace('. Shown while DLSS 5 is On, and only on an RTX 50 card with both DLSS 5 files (Windows);', '.'), menu),
-    /no condition for DLSS 5 model/);
+  assert.equal(find('DLSS 5 settings').restart, false);
+  assert(!find('DLSS 5 preset') && !find('DLSS 5 model'));
+  for (const named of ['DLSS 5 preset (Default:', 'DLSS 5 model (Auto, NVIDIA, FP16:', 'a change to it waits for the game to start again'])
+    assert(find('DLSS 5 settings').choices.includes(named), named);
   assert.throws(() => readGraphicsSettings(page.replace("Shown only with NVIDIA's `nvngx_dlssnr.dll`", 'With'), menu),
     /no condition for DLSS 5,/);
-  assert.throws(() => readGraphicsSettings(page.replace('. Shown while DLSS 5 is On |', ' |'), menu), /no condition for DLSS 5 preset/);
-  // (gpu/vk/menu/dlss5.cpp registers them: the preset a view of the page's rows, the page row with no option pointer)
-  for (const [from, to, name] of [['.value = &preset_ui', '.value = &other_ui', 'DLSS 5 preset'],
-    ['.opens = "dlss5_settings"', '.opens = "other_page"', 'DLSS 5 settings']]) {
-    assert(menu.includes(from), from);
-    assert.throws(() => readGraphicsSettings(page, menu.replace(from, to)), new RegExp(`coverage mismatch at ${name}`));
-  }
+  assert.throws(() => readGraphicsSettings(page.replace('Opens the DLSS 5 page (shown while DLSS 5 is On;', 'Opens the DLSS 5 page (('), menu),
+    /no condition for DLSS 5 settings/);
+  // (gpu/vk/menu/dlss5.cpp registers it: a page row with no option pointer)
+  const [from, to] = ['.opens = "dlss5_settings"', '.opens = "other_page"'];
+  assert(menu.includes(from), from);
+  assert.throws(() => readGraphicsSettings(page, menu.replace(from, to)), /coverage mismatch at DLSS 5 settings/);
 });
 
 test('the menu table reader joins C strings, reads escapes and skips comments', () => {
@@ -198,7 +197,7 @@ test('cards take the menu\'s help, the source restart flag and the table\'s cond
   assert(settings.every(setting => setting.summary), 'every card has the menu\'s description');
   assert(!settings.some(setting => /Applies after/.test(setting.summary)));
   assert.deepEqual(settings.filter(setting => setting.restart).map(setting => setting.name),
-    ['Aspect ratio', 'Output resolution', 'Custom output size', 'Profile', 'DLSS 5 model', 'GPU device', 'Speaker layout', 'Skip title screen', 'Game language', 'Button prompts']);
+    ['Aspect ratio', 'Output resolution', 'Custom output size', 'Profile', 'GPU device', 'Speaker layout', 'Skip title screen', 'Game language', 'Button prompts']);
   assert.deepEqual(find('NVIDIA Reflex').badges, ['NVIDIA GPUs only']);
   assert.deepEqual(find('HDR tone mapper').badges, ['With HDR on Native']);
   assert(find('HDR contrast').badges.includes('While HDR is on'));

@@ -22,7 +22,6 @@ export const BADGES = [
   { test: /\bshown with NVIDIA DLSS\b/i, label: 'With NVIDIA DLSS', shown: true },
   { test: /\bshown only with NVIDIA's `nvngx_dlssnr\.dll`/i, label: 'With a DLSS 5 file', shown: true },
   { test: /\bshown while DLSS 5 is On\b/i, label: 'While DLSS 5 is On', shown: true },
-  { test: /\bonly on an RTX 50 card with both DLSS 5 files\b/i, label: 'RTX 50 with both DLSS 5 files', shown: true },
   { test: /\bshown while Frame generation is on\b/i, label: 'While Frame generation is on', shown: true },
   { test: /\bshown while Dynamic resolution is Off\b/i, label: 'While Dynamic resolution is Off', shown: true },
   { test: /\bshown unless the Upscaler fixes the render size\b/i, label: 'Unless the Upscaler fixes the render size', shown: true },
